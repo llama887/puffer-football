@@ -8,9 +8,11 @@ import numpy as np
 from gfootball.env import puffer_env
 from gfootball.env import config
 from gfootball.curriculum import (
-    ALIGNMENT_SCHEDULE, ATTACKER_ONLY_LEVELS, KEEPER_LEVELS, TOTAL_LEVELS,
-    curriculum_episode, curriculum_geometry, curriculum_state,
-    keeper_spawn_offset)
+    ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, ALIGNMENT_SCHEDULE,
+    ATTACKER_ONLY_LEVELS, FULL_LATERAL_HALF_WIDTH, KEEPER_LEVELS,
+    NARROW_LATERAL_HALF_WIDTH, SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS,
+    advantage_for_level, curriculum_episode, curriculum_geometry,
+    curriculum_state, keeper_spawn_offset, lateral_half_width)
 
 
 class PufferEnvTest(absltest.TestCase):
@@ -432,6 +434,44 @@ class PufferEnvTest(absltest.TestCase):
       self.assertEqual(truncations.shape, (44,))
     finally:
       env.close()
+
+  def test_level_zero_lateral_band_stays_inside_the_scoreable_region(self):
+    """Level 0 must not spawn the ball where nothing can score from.
+
+    Measured at advantage 1.00: success is 0.98 at |ball_y| 0.088 but 0.13 by
+    0.113, and always-shot is zero beyond 0.079.  The anchor level has to sit
+    inside that, and the band has to widen monotonically after it.
+    """
+    self.assertAlmostEqual(
+        lateral_half_width(1.0), NARROW_LATERAL_HALF_WIDTH)
+    self.assertAlmostEqual(
+        lateral_half_width(0.6), FULL_LATERAL_HALF_WIDTH)
+    self.assertAlmostEqual(
+        lateral_half_width(0.0), FULL_LATERAL_HALF_WIDTH)
+    widths = [lateral_half_width(advantage_for_level(level))
+              for level in range(ADVANTAGE_LEVELS)]
+    self.assertEqual(widths, sorted(widths))
+    self.assertLess(widths[0], 0.10)
+
+    cfg = config.Config({
+        'level': ADVANTAGE_ENV_NAME,
+        'advantage': 1.0,
+        'curriculum_level': 0,
+        'curriculum_levels': ADVANTAGE_LEVELS,
+        'curriculum_evaluation': True,
+        'game_engine_random_seed': 0,
+        'players': ['agent:left_players=11,right_players=11'],
+    })
+    templates = {}
+    for episode in range(2 * SPAWN_TEMPLATE_COUNT):
+      cfg.NewScenario(episode)
+      ball_y = cfg.ScenarioConfig().ball_position[1]
+      self.assertLessEqual(abs(ball_y), NARROW_LATERAL_HALF_WIDTH + 1e-6)
+      templates[int(cfg._values['curriculum_episode_template'])] = ball_y
+    self.assertEqual(len(templates), SPAWN_TEMPLATE_COUNT)
+    # Every template still names a distinct lateral spawn inside the band.
+    self.assertEqual(len(set(round(y, 6) for y in templates.values())),
+                     SPAWN_TEMPLATE_COUNT)
 
 
 if __name__ == '__main__':

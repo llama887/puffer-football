@@ -27,7 +27,8 @@ import math
 import random
 
 from . import *
-from gfootball.curriculum import SPAWN_TEMPLATE_COUNT
+from gfootball.curriculum import (
+    SPAWN_TEMPLATE_COUNT, lateral_half_width)
 
 
 _FORMATION = (
@@ -171,7 +172,9 @@ def build_scenario(builder):
   rng = random.Random(seed + episode)
   phase = 1 / 6 + 2 / 3 * (
       template + (0.5 if evaluation else rng.random())) / SPAWN_TEMPLATE_COUNT
-  template_ball_y = 0.20 * (2 * phase - 1)
+  # phase covers [1/6, 5/6]; rescale it onto [-1, 1] so the band edges are
+  # exactly +/- the half-width for this level.
+  template_ball_y = lateral_half_width(advantage) * (phase - 0.5) * 3.0
 
   direction = 1.0 if attack_right else -1.0
   ball_x = direction * _BALL_DEPTH * advantage

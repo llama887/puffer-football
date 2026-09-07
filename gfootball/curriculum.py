@@ -63,14 +63,40 @@ OPEN_GOAL_KEEPER_OFFSET = 0.36
 # the player count fixed keeps the observation distribution fixed too, which
 # the player-count schedule cannot do.
 #
-# Measured with fixed-action reference policies (96 episodes per point):
+# STALE -- do not trust the table below.  Re-measured at advantage 1.00 with
+# 1024 episodes per policy: always-shot scores 0.316 where the table records
+# 1.00, and uniform scores 0.151 where it records 0.38.  The rest of the row
+# has not been re-derived, so the difficulty calibration that cites it is
+# unverified.
 #   advantage 1.00 0.90 0.80 0.70 0.60 0.55 0.50 0.45 0.40
 #   shot      1.00 0.73 0.52 0.40 0.30 0.16 0.12 0.08 0.00
 #   uniform   0.38 0.21 0.10 0.14 0.08 0.06 0.05 0.02 0.03
-# Smooth and monotone down to 0.45; below that a constant action cannot score
-# at all and progress depends on learned ball advancing.
 ADVANTAGE_ENV_NAME = '11_vs_11_advantage'
 ADVANTAGE_LEVELS = 21
+
+# Lateral ball-spawn band.  Swept at advantage 1.00 over 32 bands, 2048
+# episodes each, self-play with the final policy of run 16794800:
+#   |ball_y|  0.088  0.096  0.104  0.113  0.121
+#   success    0.98   0.82   0.44   0.13   0.03
+# and always-shot is flat zero beyond |ball_y| 0.079.  The falloff is gradual,
+# so scoring from wide is a real skill rather than a broken spawn.  Level 0 was
+# drawing two of its eight templates from beyond the wall, which is why it
+# never cleared the worst-template gate in 604 promotion evaluations.  Start
+# the band inside the region a policy can already score from and open it to the
+# full width by LATERAL_RAMP_END_ADVANTAGE, so the wide shot is a level of its
+# own instead of a hidden precondition on the anchor level.
+NARROW_LATERAL_HALF_WIDTH = 0.05
+FULL_LATERAL_HALF_WIDTH = 2 / 3 * 0.20
+LATERAL_RAMP_END_ADVANTAGE = 0.60
+
+
+def lateral_half_width(advantage):
+  """Half-width of the lateral ball-spawn band at this advantage."""
+  advantage = max(0.0, min(1.0, float(advantage)))
+  progress = min(1.0, max(0.0, (1.0 - advantage) /
+                          (1.0 - LATERAL_RAMP_END_ADVANTAGE)))
+  return (NARROW_LATERAL_HALF_WIDTH +
+          (FULL_LATERAL_HALF_WIDTH - NARROW_LATERAL_HALF_WIDTH) * progress)
 
 
 def advantage_for_level(level, levels=ADVANTAGE_LEVELS):
