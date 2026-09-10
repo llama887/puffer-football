@@ -12,6 +12,7 @@ from collections import defaultdict
 import json
 import math
 import os
+import random
 import time
 
 import numpy as np
@@ -25,12 +26,18 @@ from gfootball.env.puffer_env import make_vector_env
 from gfootball.env import football_action_set
 from gfootball.curriculum import (
     ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, ATTACKER_ONLY_LEVELS,
-    SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS)
+    SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS, curriculum_episode_duration)
 
 
 ACTION_NAMES = tuple(
     str(action) for action in football_action_set.action_set_dict['default'])
 SHOT_ACTION = ACTION_NAMES.index('shot')
+
+# Order must match how train() stacks them; see the minibatch loop.
+MINIBATCH_STAT_NAMES = (
+    'old_approx_kl', 'approx_kl', 'clipfrac', 'importance',
+    'policy_loss', 'value_loss', 'entropy', 'gradient_norm',
+    'minibatch_transitions')
 
 
 def generalized_advantages(values, rewards, terminals, gamma, gae_lambda):
@@ -114,15 +121,44 @@ def promotion_passes(metrics, success_threshold, worst_template_threshold):
       worst_template_threshold)
 
 
+# Steps retained for the logit diagnostics.  A late-curriculum evaluation runs
+# thousands of vector steps; keeping every one was hundreds of megabytes and a
+# device-to-host copy per step, and these are summary statistics.
+PROMOTION_LOGIT_STEPS = 512
+
+
+def promotion_episodes_for_level(level, max_episodes, min_episodes):
+  """Episode budget that keeps evaluation cost roughly level-independent.
+
+  Episode length grows 25x across the curriculum (119 steps at level 0, 3000 at
+  the last), so a fixed episode count makes the promotion evaluation cost 25x
+  more than the training it gates by the time it matters least -- the late
+  levels advance on the timed gate anyway.  Scale the count down as episodes
+  get longer, with a floor that keeps every spawn template sampled.
+  """
+  duration = max(1, curriculum_episode_duration(level))
+  scaled = int(round(max_episodes * curriculum_episode_duration(0) / duration))
+  return max(min(min_episodes, max_episodes), min(max_episodes, scaled))
+
+
 def evaluate_promotion(policy, vecenv, episodes, seed, device):
   """Run policy-only episodes on spawn templates excluded from training."""
   observations, _ = vecenv.reset(seed=seed)
   generator = torch.Generator(device=device).manual_seed(seed)
   state = {'lstm_h': None, 'lstm_c': None, 'done': None}
   rows = []
-  action_counts = torch.zeros(len(ACTION_NAMES), dtype=torch.long)
-  active_logits_rows = []
-  decisions = 0
+  num_actions = len(ACTION_NAMES)
+  # The action array the environment needs is the only host transfer per step.
+  # Everything else accumulates on the device with fixed shapes, so nothing
+  # here forces a synchronisation -- indexing by a boolean mask would, because
+  # the result's size is not known until the device catches up.
+  action_counts = torch.zeros(num_actions, dtype=torch.long, device=device)
+  decisions = torch.zeros((), dtype=torch.long, device=device)
+  # Uniform reservoir over steps, so the diagnostics describe the whole
+  # evaluation rather than only its opening steps.
+  reservoir = []
+  reservoir_rng = random.Random(seed)
+  steps_seen = 0
   was_training = policy.training
   policy.eval()
   try:
@@ -131,14 +167,21 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
       active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
       with torch.no_grad():
         logits, _ = policy.forward_eval(observation_tensor, state)
-        active_logits_rows.append(logits[active].float().cpu())
         actions = torch.multinomial(
             torch.softmax(logits.float(), dim=-1), 1,
             generator=generator).squeeze(-1)
-      active_actions = actions[active].cpu()
-      action_counts += torch.bincount(
-          active_actions, minlength=len(ACTION_NAMES))
-      decisions += active_actions.numel()
+        active_long = active.long()
+        action_counts += (
+            torch.nn.functional.one_hot(actions, num_actions) *
+            active_long.unsqueeze(-1)).sum(0)
+        decisions += active_long.sum()
+        if len(reservoir) < PROMOTION_LOGIT_STEPS:
+          reservoir.append((logits, active))
+        else:
+          slot = reservoir_rng.randrange(steps_seen + 1)
+          if slot < PROMOTION_LOGIT_STEPS:
+            reservoir[slot] = (logits, active)
+        steps_seen += 1
       observations, _, terminals, _, infos = vecenv.step(
           actions.cpu().numpy())
       state['done'] = torch.as_tensor(
@@ -149,7 +192,11 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
   finally:
     policy.train(was_training)
   metrics = promotion_statistics(rows)
-  diagnostics = policy_diagnostics(torch.cat(active_logits_rows))
+  diagnostics = policy_diagnostics(
+      torch.cat([step_logits[step_active]
+                 for step_logits, step_active in reservoir]))
+  action_counts = action_counts.cpu()
+  decisions = max(1, int(decisions.item()))
   metrics.update({
       'promotion_episodes': float(len(rows)),
       'promotion_mean_episode_length': sum(
@@ -345,6 +392,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
     losses['pre_update_explained_variance'] = explained_variance(
         rollout_values[trainable], returns[trainable])
 
+    accumulated_stats = None
     for _ in range(num_minibatches):
       profile('train_copy', epoch)
       order = torch.randperm(num_segments, device=device)
@@ -370,11 +418,12 @@ class FootballPuffeRL(pufferl.PuffeRL):
       log_ratio = new_logprobs - old_logprobs
       ratio = log_ratio.exp()
       with torch.no_grad():
-        losses['old_approx_kl'] += (-log_ratio).mean().item()
-        losses['approx_kl'] += ((ratio - 1) - log_ratio).mean().item()
-        losses['clipfrac'] += (
-            (ratio - 1).abs() > config['clip_coef']).float().mean().item()
-        losses['importance'] += ratio.mean().item()
+        ratio_stats = torch.stack([
+            (-log_ratio).mean(),
+            ((ratio - 1) - log_ratio).mean(),
+            ((ratio - 1).abs() > config['clip_coef']).float().mean(),
+            ratio.mean(),
+        ])
 
       mb_advantages = normalize_advantages(advantages[index][mask])
       policy_loss = torch.max(
@@ -398,17 +447,24 @@ class FootballPuffeRL(pufferl.PuffeRL):
       self.optimizer.step()
       self.optimizer_steps += 1
 
-      losses['policy_loss'] += policy_loss.item()
-      losses['value_loss'] += value_loss.item()
-      losses['entropy'] += entropy_loss.item()
-      losses['gradient_norm'] += gradient_norm.item()
-      losses['minibatch_transitions'] += float(mask.sum().item())
+      # Keep the bookkeeping on the device.  Reading these nine scalars per
+      # minibatch used to force nine synchronisations, and a late-curriculum
+      # epoch runs ~83 minibatches -- the syncs cost more than the arithmetic.
+      with torch.no_grad():
+        minibatch_stats = torch.cat([ratio_stats, torch.stack([
+            policy_loss.detach(),
+            value_loss.detach(),
+            entropy_loss.detach(),
+            gradient_norm.detach(),
+            mask.sum().to(policy_loss.dtype),
+        ])])
+      accumulated_stats = (minibatch_stats if accumulated_stats is None
+                           else accumulated_stats + minibatch_stats)
 
     profile('train_misc', epoch)
-    for name in ('policy_loss', 'value_loss', 'entropy', 'gradient_norm',
-                 'old_approx_kl', 'approx_kl', 'clipfrac', 'importance',
-                 'minibatch_transitions'):
-      losses[name] /= num_minibatches
+    # One synchronisation for the whole epoch's minibatch statistics.
+    losses.update(zip(MINIBATCH_STAT_NAMES,
+                      (accumulated_stats / num_minibatches).tolist()))
 
     if config['anneal_lr']:
       self.scheduler.step()
@@ -436,36 +492,42 @@ class FootballPuffeRL(pufferl.PuffeRL):
     self.last_active_steps = self.active_steps
     self.last_active_log_time = now
 
-    # Post-update health has to replay whole segments: a recurrent critic
-    # scored from a zeroed hidden state is not the critic that acts.
-    with torch.no_grad():
-      index = segment_index[:min(64, num_segments)]
-      sample_mask = trainable[index]
-      post_logits, post_values = self.policy(
-          self.observations[index], {'done': self.terminals[index]})
-      post_logits = post_logits.view(*sample_mask.shape, -1)[sample_mask]
-      for name, value in policy_diagnostics(post_logits).items():
-        losses[name] = value.item()
-      losses['post_update_explained_variance'] = explained_variance(
-          post_values[sample_mask], returns[index][sample_mask])
     losses['explained_variance'] = losses['pre_update_explained_variance']
+    done_training = self.global_step >= config['total_timesteps']
+    # An epoch collects only bptt_horizon env steps, so it comes round many
+    # times a second while the dashboard updates four times a second.  The
+    # diagnostics below are logging-only and the first one is a whole extra
+    # BPTT replay, so pay for them on the epochs that actually log.
+    should_log = (done_training or self.global_step == 0 or
+                  time.time() > self.last_log_time + 0.25)
+    if should_log:
+      # Post-update health has to replay whole segments: a recurrent critic
+      # scored from a zeroed hidden state is not the critic that acts.
+      with torch.no_grad():
+        index = segment_index[:min(64, num_segments)]
+        sample_mask = trainable[index]
+        post_logits, post_values = self.policy(
+            self.observations[index], {'done': self.terminals[index]})
+        post_logits = post_logits.view(*sample_mask.shape, -1)[sample_mask]
+        for name, value in policy_diagnostics(post_logits).items():
+          losses[name] = value.item()
+        losses['post_update_explained_variance'] = explained_variance(
+            post_values[sample_mask], returns[index][sample_mask])
 
-    active_actions = self.actions[active]
-    action_fractions = [
-        (active_actions == index).float().mean().item()
-        for index in range(len(ACTION_NAMES))]
-    for index, name in enumerate(ACTION_NAMES):
-      losses['action_{}_fraction'.format(name)] = action_fractions[index]
-    losses['max_action_fraction'] = max(action_fractions)
-    losses['shot_fraction'] = action_fractions[SHOT_ACTION]
+      # One histogram rather than a comparison-and-sync per action.
+      counts = torch.bincount(self.actions[active].flatten().long(),
+                              minlength=len(ACTION_NAMES)).float()
+      action_fractions = (counts / counts.sum().clamp_min(1)).tolist()
+      for index, name in enumerate(ACTION_NAMES):
+        losses['action_{}_fraction'.format(name)] = action_fractions[index]
+      losses['max_action_fraction'] = max(action_fractions)
+      losses['shot_fraction'] = action_fractions[SHOT_ACTION]
     losses.update(self.promotion_metrics)
 
     profile.end()
     logs = None
     self.epoch += 1
-    done_training = self.global_step >= config['total_timesteps']
-    if (done_training or self.global_step == 0 or
-        time.time() > self.last_log_time + 0.25):
+    if should_log:
       self.losses = losses
       logs = self.mean_and_log()
       self.print_dashboard()
@@ -495,7 +557,7 @@ def _make_promotion_env(args, curriculum_level_value):
       seed=args.seed + 1000000, env_name=args.env_name,
       frame_stack=args.frame_stack,
       curriculum_levels=args.curriculum_levels,
-      curriculum_window=args.promotion_episodes + 1,
+      curriculum_window=args.promotion_episodes + 1,  # never auto-advances
       curriculum_success_threshold=args.curriculum_success_threshold,
       attacker_only_levels=args.attacker_only_levels,
       curriculum_level_value=curriculum_level_value,
@@ -506,6 +568,11 @@ def _make_promotion_env(args, curriculum_level_value):
 def build_parser():
   parser = argparse.ArgumentParser()
   parser.add_argument('--num-workers', type=int, default=30)
+  parser.add_argument('--envs-per-worker', type=int, default=2,
+                      help='matches held per worker; above 1 lets PufferLib '
+                           'collect the next batch while the policy consumes '
+                           'the current one, so one match resetting no longer '
+                           'stalls every other worker')
   parser.add_argument('--total-timesteps', type=int, default=1_000_000_000)
   parser.add_argument('--env-name', default='11_vs_11_curriculum',
                       choices=('11_vs_11_curriculum', ADVANTAGE_ENV_NAME))
@@ -516,7 +583,14 @@ def build_parser():
   parser.add_argument('--curriculum-success-threshold', type=float, default=0.6)
   parser.add_argument('--attacker-only-levels', type=int, default=None)
   parser.add_argument('--promotion-interval', type=int, default=50)
-  parser.add_argument('--promotion-episodes', type=int, default=256)
+  parser.add_argument('--promotion-episodes', type=int, default=256,
+                      help='episodes per promotion evaluation at level 0; '
+                           'scaled down as episodes get longer so evaluation '
+                           'stays a roughly fixed share of wall clock')
+  parser.add_argument('--promotion-min-episodes', type=int, default=64,
+                      help='floor for the scaled episode budget, kept well '
+                           'above the spawn template count so every template '
+                           'is still sampled')
   parser.add_argument('--promotion-workers', type=int, default=30)
   parser.add_argument('--promotion-worst-template-threshold', type=float,
                       default=0.4)
@@ -537,6 +611,13 @@ def build_parser():
   parser.add_argument('--bptt-horizon', type=int, default=32)
   parser.add_argument('--minibatch-segments', type=int, default=16)
   parser.add_argument('--hidden-size', type=int, default=256)
+  parser.add_argument('--compile', action=argparse.BooleanOptionalAction,
+                      default=False,
+                      help='torch.compile the policy.  The BPTT forward is a '
+                           'Python loop over LSTMCell -- bptt_horizon tiny '
+                           'kernel launches per minibatch -- so fusing it is '
+                           'worth a try once the environment is no longer the '
+                           'bottleneck.  Costs a slow first epoch.')
   parser.add_argument('--frame-stack', type=int, default=1, choices=(1, 4))
   parser.add_argument('--sort-players',
                       action=argparse.BooleanOptionalAction, default=True,
@@ -553,8 +634,13 @@ def build_parser():
   return parser
 
 
-def build_config(args, num_agents):
-  """One rollout segment per agent per epoch keeps BPTT aligned with rollout."""
+def build_config(args, agents_per_batch):
+  """One rollout segment per agent per epoch keeps BPTT aligned with rollout.
+
+  `agents_per_batch` is what a single vecenv receive delivers, which is the
+  number of agent rows the rollout buffer has to hold -- not the total number
+  of agents across every match, once workers hold more than one match each.
+  """
   horizon = args.bptt_horizon
   config = _base_config()
   config.update({
@@ -562,11 +648,11 @@ def build_config(args, num_agents):
       'adam_beta2': 0.999,
       'adam_eps': 1e-5,
       'anneal_lr': args.anneal_lr,
-      'batch_size': num_agents * horizon,
+      'batch_size': agents_per_batch * horizon,
       'bptt_horizon': horizon,
       'checkpoint_interval': 200,
       'clip_coef': args.clip_coef,
-      'compile': False,
+      'compile': args.compile,
       'cpu_offload': False,
       'data_dir': os.path.abspath(args.data_dir),
       'device': args.device,
@@ -612,7 +698,8 @@ def main():
   np.random.seed(args.seed)
 
   env = make_vector_env(
-      num_envs=args.num_workers, num_workers=args.num_workers,
+      num_envs=args.num_workers * args.envs_per_worker,
+      num_workers=args.num_workers, envs_per_worker=args.envs_per_worker,
       batch_size=args.num_workers, reserved_cpus=0, seed=args.seed,
       env_name=args.env_name, frame_stack=args.frame_stack,
       curriculum_levels=args.curriculum_levels,
@@ -624,7 +711,7 @@ def main():
   if not 0 <= args.start_level < args.curriculum_levels:
     raise ValueError('start-level must be inside the curriculum')
   env.curriculum_level_value.value = args.start_level
-  config = build_config(args, env.num_agents)
+  config = build_config(args, getattr(env, 'agents_per_batch', env.num_agents))
   print(json.dumps({
       'config': config,
       'curriculum_levels': args.curriculum_levels,
@@ -636,10 +723,13 @@ def main():
       'minibatch_segments': args.minibatch_segments,
       'env_name': args.env_name,
       'num_workers': args.num_workers,
+      'envs_per_worker': args.envs_per_worker,
+      'compile': args.compile,
       'sort_players': args.sort_players,
       'start_level': args.start_level,
       'promotion_interval': args.promotion_interval,
       'promotion_episodes': args.promotion_episodes,
+      'promotion_min_episodes': args.promotion_min_episodes,
       'promotion_workers': args.promotion_workers,
       'promotion_worst_template_threshold': (
           args.promotion_worst_template_threshold),
@@ -664,10 +754,11 @@ def main():
         # vecenv is left mid-flight with outstanding send/recv pairs and the
         # next reset() never completes.
         promotion_env = _make_promotion_env(args, env.curriculum_level_value)
+        episodes = promotion_episodes_for_level(
+            level, args.promotion_episodes, args.promotion_min_episodes)
         try:
           metrics = evaluate_promotion(
-              trainer.uncompiled_policy, promotion_env,
-              args.promotion_episodes,
+              trainer.uncompiled_policy, promotion_env, episodes,
               args.seed + 1000000 + 10000 * level, args.device)
         finally:
           promotion_env.close()

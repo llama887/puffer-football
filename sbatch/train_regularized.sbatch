@@ -22,17 +22,14 @@ NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
 WANDB_GROUP=${WANDB_GROUP:-simple-marl-ppo}
 ATTACKER_ONLY_LEVELS=${ATTACKER_ONLY_LEVELS:-13}
-CRITIC_LEARNING_RATE=${CRITIC_LEARNING_RATE:-0.00001}
 LEARNING_RATE=${LEARNING_RATE:-0.00008}
 ENT_COEF=${ENT_COEF:-0.01}
 SEED=${SEED:-0}
+ENVS_PER_WORKER=${ENVS_PER_WORKER:-2}
 PROMOTION_INTERVAL=${PROMOTION_INTERVAL:-50}
 PROMOTION_EPISODES=${PROMOTION_EPISODES:-256}
+PROMOTION_MIN_EPISODES=${PROMOTION_MIN_EPISODES:-64}
 PROMOTION_WORKERS=${PROMOTION_WORKERS:-$NUM_WORKERS}
-GRADIENT_AUDIT_ARGS=()
-if [[ ${GRADIENT_AUDIT:-0} == 1 ]]; then
-  GRADIENT_AUDIT_ARGS+=(--gradient-audit)
-fi
 ANNEAL_LR_ARGS=(--anneal-lr)
 if [[ ${ANNEAL_LR:-1} == 0 ]]; then
   ANNEAL_LR_ARGS=(--no-anneal-lr)
@@ -82,21 +79,21 @@ echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
 
 cd "$RUN_ROOT"
 "$ENV_PREFIX/bin/python" -u -m gfootball.examples.train_puffer \
-  "${GRADIENT_AUDIT_ARGS[@]}" \
   "${ANNEAL_LR_ARGS[@]}" \
   --device cuda \
   --num-workers "$NUM_WORKERS" \
+  --envs-per-worker "$ENVS_PER_WORKER" \
   --frame-stack 4 \
   --curriculum-levels 33 \
   --curriculum-window 20 \
   --curriculum-success-threshold 0.6 \
   --attacker-only-levels "$ATTACKER_ONLY_LEVELS" \
-  --critic-learning-rate "$CRITIC_LEARNING_RATE" \
   --learning-rate "$LEARNING_RATE" \
   --ent-coef "$ENT_COEF" \
   --seed "$SEED" \
   --promotion-interval "$PROMOTION_INTERVAL" \
   --promotion-episodes "$PROMOTION_EPISODES" \
+  --promotion-min-episodes "$PROMOTION_MIN_EPISODES" \
   --promotion-workers "$PROMOTION_WORKERS" \
   --total-timesteps "$TOTAL_TIMESTEPS" \
   --wandb \

@@ -7,8 +7,8 @@ import random
 from . import *
 from gfootball.curriculum import (
     ATTACKER_ORDER, DEFENDER_ORDER, SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS,
-    curriculum_episode, curriculum_geometry, curriculum_state,
-    keeper_spawn_offset)
+    curriculum_episode, curriculum_episode_duration, curriculum_geometry,
+    curriculum_state, keeper_spawn_offset)
 
 
 _FORMATION = (
@@ -87,8 +87,7 @@ def build_scenario(builder):
   episode = builder.EpisodeNumber()
   curriculum_level = max(0, min(
       TOTAL_LEVELS - 1, int(builder._config['curriculum_level'])))
-  level_attackers, active_defenders, progress = curriculum_state(
-      curriculum_level)
+  _, active_defenders, progress = curriculum_state(curriculum_level)
   _, alignment = curriculum_geometry(curriculum_level)
   seed = int(builder._config._values.get('game_engine_random_seed', 0))
   evaluation = bool(
@@ -116,12 +115,8 @@ def build_scenario(builder):
   # The keeper walks in from outside the post to the centre of the goal.
   keeper_y = keeper_spawn_offset(curriculum_level)
 
-  # Give an episode time in proportion to how crowded the scene is, so the
-  # easy single-attacker levels stay short and cheap.
-  near_goal_duration = min(
-      599, 119 + 40 * (level_attackers - 1 + active_defenders))
-  builder.config().game_duration = int(
-      near_goal_duration + (3000 - near_goal_duration) * progress)
+  builder.config().game_duration = curriculum_episode_duration(
+      curriculum_level)
   builder.config().deterministic = False
   builder.config().use_magnet = False
   builder.config().offsides = progress >= 0.75

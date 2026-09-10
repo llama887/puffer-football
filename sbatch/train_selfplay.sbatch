@@ -19,6 +19,11 @@ ENV_PREFIX="$REPO/.venv"
 TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
 RUN_ROOT=/scratch/fyy2003/experiments/football-selfplay-${SLURM_JOB_ID}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
+# Matches held per worker.  Above 1, PufferLib collects the next batch while
+# the policy consumes the current one, so a match resetting -- which costs far
+# more than a step -- no longer stalls every other worker.  Each extra match is
+# another resident GRF engine, so watch memory before raising this.
+ENVS_PER_WORKER=${ENVS_PER_WORKER:-2}
 
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
 WANDB_GROUP=${WANDB_GROUP:-self-play-lstm-ppo}
@@ -38,6 +43,7 @@ SEED=${SEED:-0}
 START_LEVEL=${START_LEVEL:-0}
 PROMOTION_INTERVAL=${PROMOTION_INTERVAL:-50}
 PROMOTION_EPISODES=${PROMOTION_EPISODES:-256}
+PROMOTION_MIN_EPISODES=${PROMOTION_MIN_EPISODES:-64}
 PROMOTION_WORKERS=${PROMOTION_WORKERS:-$NUM_WORKERS}
 SCORED_PROMOTION_LEVELS=${SCORED_PROMOTION_LEVELS:-4}
 TIMED_PROMOTION_EPOCHS=${TIMED_PROMOTION_EPOCHS:-200}
@@ -101,6 +107,7 @@ cd "$RUN_ROOT"
   --device cuda \
   --env-name "$ENV_NAME" \
   --num-workers "$NUM_WORKERS" \
+  --envs-per-worker "$ENVS_PER_WORKER" \
   --frame-stack "$FRAME_STACK" \
   --hidden-size "$HIDDEN_SIZE" \
   --curriculum-window 20 \
@@ -118,6 +125,7 @@ cd "$RUN_ROOT"
   --start-level "$START_LEVEL" \
   --promotion-interval "$PROMOTION_INTERVAL" \
   --promotion-episodes "$PROMOTION_EPISODES" \
+  --promotion-min-episodes "$PROMOTION_MIN_EPISODES" \
   --promotion-workers "$PROMOTION_WORKERS" \
   --scored-promotion-levels "$SCORED_PROMOTION_LEVELS" \
   --timed-promotion-epochs "$TIMED_PROMOTION_EPOCHS" \

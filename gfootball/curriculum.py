@@ -105,6 +105,20 @@ def curriculum_state(level):
   return 11, 10, _ramp(level - DEFENDER_PHASE_END + 1, DISTANCE_LEVELS + 1)
 
 
+def curriculum_episode_duration(level):
+  """Engine steps a level's episode is allowed to run.
+
+  Episodes stay short while the scene is sparse and open out to a full match
+  as the distance phase progresses.  Callers that need to budget wall clock
+  (the promotion evaluation) read this rather than rediscovering the formula.
+  """
+  attackers, defenders, progress = curriculum_state(level)
+  # Give an episode time in proportion to how crowded the scene is, so the
+  # easy single-attacker levels stay short and cheap.
+  near_goal_duration = min(599, 119 + 40 * (attackers - 1 + defenders))
+  return int(near_goal_duration + (3000 - near_goal_duration) * progress)
+
+
 def curriculum_geometry(level):
   """Return goalkeeper progress and carrier-alignment progress.
 

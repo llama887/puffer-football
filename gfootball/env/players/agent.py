@@ -18,8 +18,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import copy
-
 from gfootball.env import player_base
 
 
@@ -33,5 +31,9 @@ class Player(player_base.PlayerBase):
   def set_action(self, action):
     self._action = action
 
+  def needs_observations(self):
+    return False
+
   def take_action(self, observations):
-    return copy.deepcopy(self._action)
+    # `observations` is deliberately unused -- the action comes from set_action.
+    return list(self._action)

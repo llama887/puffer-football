@@ -49,5 +49,9 @@ gfootball/build_game_engine.sh
   FootballEnvTest.test_fast_mode_matches_baseline_dynamics1 \
   FootballEnvTest.test_fast_mode_matches_baseline_dynamics2
 "$ENV_PREFIX/bin/python" -m gfootball.env.puffer_env_test
+"$ENV_PREFIX/bin/python" -m gfootball.env.observation_equivalence_test
 "$ENV_PREFIX/bin/python" -m gfootball.examples.benchmark_fast_mode \
-  --steps=500 --repeats=3
+  --steps=500 --repeats=3 --players=11
+# Where the remaining per-step time goes, at the training shape.
+"$ENV_PREFIX/bin/python" -m gfootball.examples.benchmark_fast_mode \
+  --profile --steps=500 --players=11

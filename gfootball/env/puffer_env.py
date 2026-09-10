@@ -96,15 +96,15 @@ def sort_players_by_distance(observations):
   return observations
 
 
-def centralized_score_rewards(score_reward, active_mask):
+def centralized_score_rewards(score_reward, active_mask, out=None):
   """Share the zero-sum match score with every active player on each team."""
   active_mask = np.asarray(active_mask, dtype=bool)
   if active_mask.shape != (22,):
     raise ValueError('active_mask must have shape (22,)')
   score_reward = float(score_reward)
-  rewards = np.concatenate((
-      np.full(11, score_reward, dtype=np.float32),
-      np.full(11, -score_reward, dtype=np.float32)))
+  rewards = np.empty(22, dtype=np.float32) if out is None else out
+  rewards[:11] = score_reward
+  rewards[11:] = -score_reward
   rewards[~active_mask] = 0
   return rewards
 
@@ -156,6 +156,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._episode_template = 0
     self._attacking_left = True
     self._active_mask = np.ones(self.num_agents, dtype=bool)
+    self._episode_active_mask = np.ones(self.num_agents, dtype=bool)
+    self._step_actions = np.zeros(self.num_agents, dtype=np.int64)
+    self._step_rewards = np.zeros(self.num_agents, dtype=np.float32)
     self._env = self._make_env()
     self._episode_return = np.zeros(2, dtype=np.float32)
     self._episode_length = 0
@@ -187,6 +190,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
             'curriculum_evaluation': self._curriculum_evaluation,
             'fast_mode': not self._render,
             'game_engine_random_seed': self._seed,
+            # simple115v2 does not encode sticky actions, and producing them
+            # costs ten engine queries per controlled player per step.
+            'needs_sticky_actions': False,
             'real_time': False,
         })
 
@@ -249,11 +255,17 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     if observations.shape != self.observations.shape:
       raise ValueError('Expected observations with shape {}, got {}'.format(
           self.observations.shape, observations.shape))
-    self.observations[:] = observations
-    normalize_egocentric(self.observations)
-    if self._sort_players:
-      sort_players_by_distance(self.observations)
-    self.observations[~self._active_mask] = 0
+    # Inactive rows are zeroed either way, so normalizing and sorting them is
+    # pure waste: the early curriculum levels control 1 of 22 players, and
+    # sort_players_by_distance is the most expensive numpy in the step loop.
+    active = self._active_mask
+    self.observations[~active] = 0
+    rows = observations[active]
+    if rows.size:
+      normalize_egocentric(rows)
+      if self._sort_players:
+        sort_players_by_distance(rows)
+      self.observations[active] = rows
 
   def reset(self, seed=None):
     if seed is not None and int(seed) != self._seed:
@@ -271,12 +283,18 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     return self.observations, []
 
   def step(self, actions):
-    episode_active_mask = self._active_mask.copy()
-    actions = np.asarray(actions).reshape(self.num_agents).copy()
+    # _reset_match rewrites _active_mask mid-step, so the mask that governs
+    # this transition has to be snapshotted first.  Reuse the buffers rather
+    # than allocating three arrays on every step.
+    episode_active_mask = self._episode_active_mask
+    np.copyto(episode_active_mask, self._active_mask)
+    np.copyto(self._step_actions, np.asarray(actions).reshape(self.num_agents),
+              casting='unsafe')
+    actions = self._step_actions
     actions[~episode_active_mask] = 0
     observations, _, done, info = self._env.step(actions)
     rewards = centralized_score_rewards(
-        info['score_reward'], episode_active_mask)
+        info['score_reward'], episode_active_mask, out=self._step_rewards)
     for team, team_slice in enumerate((slice(0, 11), slice(11, 22))):
       team_active = episode_active_mask[team_slice]
       if team_active.any():
@@ -343,15 +361,28 @@ class FootballPufferEnv(pufferlib.PufferEnv):
 
 def make_vector_env(num_envs=None, num_workers=None, batch_size=None,
                     reserved_cpus=2, seed=0, centralized_curriculum=False,
-                    **env_kwargs):
-  """Create one headless match per PufferLib multiprocessing worker."""
+                    envs_per_worker=1, **env_kwargs):
+  """Create headless matches across PufferLib multiprocessing workers.
+
+  With ``envs_per_worker`` above 1 the workers hold more matches than any one
+  batch needs, which lets PufferLib collect the next batch while the policy is
+  still consuming the current one.  That matters here because a GRF reset costs
+  far more than a step and the early curriculum levels end episodes every ~119
+  steps: with one env per worker and a full-width batch, every reset stalls
+  every other worker.
+  """
   if num_workers is None:
     available_cpus = (len(psutil.Process().cpu_affinity())
                       if hasattr(psutil.Process(), 'cpu_affinity') else
                       psutil.cpu_count(logical=False) or 1)
     num_workers = max(1, available_cpus - reserved_cpus)
-  num_envs = num_workers if num_envs is None else num_envs
+  envs_per_worker = max(1, int(envs_per_worker))
+  num_envs = num_workers * envs_per_worker if num_envs is None else num_envs
   batch_size = num_workers if batch_size is None else batch_size
+  if num_envs % num_workers:
+    raise ValueError('num_envs must be a multiple of num_workers')
+  if batch_size % envs_per_worker:
+    raise ValueError('batch_size must be a multiple of envs_per_worker')
   if centralized_curriculum:
     if env_kwargs.get('curriculum_level_value') is not None:
       raise ValueError('centralized curriculum already has a shared level')

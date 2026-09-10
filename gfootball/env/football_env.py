@@ -105,32 +105,49 @@ class FootballEnv(gym.Env):
     observations = []
     copy_observation = not self._config['fast_mode']
     for is_left in [True, False]:
+      count = (player.num_controlled_left_players() if is_left
+               else player.num_controlled_right_players())
+      if not count:
+        continue
       adopted = original if is_left or player.can_play_right(
       ) else observation_rotation.flip_observation(original, self._config)
       prefix = 'left' if is_left or not player.can_play_right() else 'right'
       position = left_player_position if is_left else right_player_position
-      for x in range(player.num_controlled_left_players() if is_left
-                     else player.num_controlled_right_players()):
-        o = {}
-        for v in constants.EXPOSED_OBSERVATIONS:
-          o[v] = (copy.deepcopy(adopted[v]) if copy_observation else adopted[v])
-        assert (len(adopted[prefix + '_agent_controlled_player']) == len(
-            adopted[prefix + '_agent_sticky_actions']))
-        o['designated'] = adopted[prefix + '_team_designated_player']
-        if position + x >= len(adopted[prefix + '_agent_controlled_player']):
+      controlled = adopted[prefix + '_agent_controlled_player']
+      sticky = adopted[prefix + '_agent_sticky_actions']
+      assert len(controlled) == len(sticky)
+      designated = adopted[prefix + '_team_designated_player']
+      # Every player on this side shares the same view of the world and differs
+      # only in 'designated'/'active'/'sticky_actions'.  In fast mode the values
+      # are shared references anyway, so build the common part once and
+      # shallow-copy it -- with 22 controlled players the old per-player loop
+      # over EXPOSED_OBSERVATIONS was 440 dict inserts per step.  Outside fast
+      # mode each player must keep its own deep copy, so the base is rebuilt.
+      base = None
+      if not copy_observation:
+        base = {v: adopted[v] for v in constants.EXPOSED_OBSERVATIONS}
+        base['designated'] = designated
+        # There is no frame for players on the right ATM.
+        if is_left and 'frame' in original:
+          base['frame'] = original['frame']
+      for x in range(count):
+        if base is not None:
+          o = base.copy()
+        else:
+          o = {v: copy.deepcopy(adopted[v])
+               for v in constants.EXPOSED_OBSERVATIONS}
+          o['designated'] = designated
+          if is_left and 'frame' in original:
+            o['frame'] = original['frame']
+        if position + x >= len(controlled):
           o['active'] = -1
           o['sticky_actions'] = []
         else:
-          o['active'] = (
-              adopted[prefix + '_agent_controlled_player'][position + x])
-          sticky_actions = adopted[
-              prefix + '_agent_sticky_actions'][position + x]
+          o['active'] = controlled[position + x]
+          sticky_actions = sticky[position + x]
           o['sticky_actions'] = np.array(
               copy.deepcopy(sticky_actions) if copy_observation else
               sticky_actions, copy=copy_observation)
-        # There is no frame for players on the right ATM.
-        if is_left and 'frame' in original:
-          o['frame'] = original['frame']
         observations.append(o)
     return observations
 
@@ -148,15 +165,25 @@ class FootballEnv(gym.Env):
     left_player_position = 0
     right_player_position = 0
     for player in self._players:
-      adopted_obs = self._convert_observations(obs, player,
-                                               left_player_position,
-                                               right_player_position)
+      # A player that ignores its observations (the training agent, whose
+      # action was already handed to it by set_action) does not need the
+      # conversion, which for a 22-player match is the most expensive thing in
+      # the step and would otherwise run twice -- once here on the pre-step
+      # observation and once in observation() on the post-step one.
+      if player.needs_observations():
+        adopted_obs = self._convert_observations(obs, player,
+                                                 left_player_position,
+                                                 right_player_position)
+        expected = len(adopted_obs)
+      else:
+        adopted_obs = None
+        expected = player.num_controlled_players()
       left_player_position += player.num_controlled_left_players()
       right_player_position += player.num_controlled_right_players()
       a = self._action_to_list(player.take_action(adopted_obs))
-      assert len(adopted_obs) == len(
-          a), 'Player provided {} actions instead of {}.'.format(
-              len(a), len(adopted_obs))
+      assert expected == len(
+          a), 'Player provided {} actions instead of {}.'.format(len(a),
+                                                                 expected)
       if not player.can_play_right():
         for x in range(player.num_controlled_right_players()):
           index = x + player.num_controlled_left_players()
