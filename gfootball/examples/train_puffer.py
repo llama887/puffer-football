@@ -114,8 +114,10 @@ def promotion_passes(metrics, success_threshold, worst_template_threshold):
       worst_template_threshold)
 
 
-def evaluate_promotion(policy, vecenv, episodes, seed, device):
-  """Run policy-only episodes on spawn templates excluded from training."""
+def evaluate_promotion(policy, vecenv, episodes, seed, device, recurrent_horizon):
+  """Evaluate with the same recurrent windows as PufferLib training rollouts."""
+  if recurrent_horizon < 1:
+    raise ValueError('recurrent_horizon must be positive')
   observations, _ = vecenv.reset(seed=seed)
   generator = torch.Generator(device=device).manual_seed(seed)
   state = {'lstm_h': None, 'lstm_c': None, 'done': None}
@@ -123,10 +125,15 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
   action_counts = torch.zeros(len(ACTION_NAMES), dtype=torch.long)
   active_logits_rows = []
   decisions = 0
+  steps = 0
   was_training = policy.training
   policy.eval()
   try:
     while len(rows) < episodes:
+      # PuffeRL.evaluate starts every rollout window from zero memory. Keep
+      # this clock independent of episode resets, just like the collector.
+      if steps % recurrent_horizon == 0:
+        state['lstm_h'] = state['lstm_c'] = None
       observation_tensor = torch.as_tensor(observations, device=device)
       active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
       with torch.no_grad():
@@ -141,6 +148,7 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
       decisions += active_actions.numel()
       observations, _, terminals, _, infos = vecenv.step(
           actions.cpu().numpy())
+      steps += 1
       state['done'] = torch.as_tensor(
           np.asarray(terminals), device=device)
       for info in infos:
@@ -151,6 +159,7 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
   metrics = promotion_statistics(rows)
   diagnostics = policy_diagnostics(torch.cat(active_logits_rows))
   metrics.update({
+      'promotion_recurrent_horizon': float(recurrent_horizon),
       'promotion_episodes': float(len(rows)),
       'promotion_mean_episode_length': sum(
           row['episode_length'] for row in rows) / len(rows),
@@ -668,7 +677,8 @@ def main():
           metrics = evaluate_promotion(
               trainer.uncompiled_policy, promotion_env,
               args.promotion_episodes,
-              args.seed + 1000000 + 10000 * level, args.device)
+              args.seed + 1000000 + 10000 * level, args.device,
+              recurrent_horizon=args.bptt_horizon)
         finally:
           promotion_env.close()
         scored_gate = promotion_passes(

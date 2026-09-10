@@ -9,7 +9,8 @@ import torch
 
 from gfootball.examples.train_puffer import (
     ACTION_NAMES, SHOT_ACTION, FootballPolicy, build_config, build_parser,
-    explained_variance, generalized_advantages, normalize_advantages,
+    evaluate_promotion, explained_variance, generalized_advantages,
+    normalize_advantages,
     policy_diagnostics, promotion_passes, promotion_statistics)
 
 
@@ -79,6 +80,63 @@ def test_bptt_forward_matches_stepwise_rollout_with_episode_resets():
   stepwise_values = torch.stack(stepwise_values, dim=1)
   assert torch.allclose(logits, stepwise_logits, atol=1e-5)
   assert torch.allclose(values, stepwise_values, atol=1e-5)
+
+
+def test_promotion_matches_training_across_rollout_and_episode_boundaries():
+  """Promotion must replay the same recurrent windows as PufferLib rollout."""
+  for horizon in (3, 32):
+    torch.manual_seed(7)
+    steps = 2 * horizon + 5
+    observations = torch.randn(1, steps + 1, 115)
+    done = torch.zeros(1, steps + 1, dtype=torch.bool)
+    done[0, [2, horizon + 2, steps]] = True
+
+    class RecordingPolicy(FootballPolicy):
+      def forward_eval(self, observations, state):
+        logits, values = super().forward_eval(observations, state)
+        self.recorded_logits.append(logits.clone())
+        self.recorded_values.append(values.clone())
+        return logits, values
+
+    class TrajectoryEnv:
+      def reset(self, seed):
+        self.step_index = 0
+        self.episode_length = 0
+        return observations[:, 0].numpy(), []
+
+      def step(self, actions):
+        self.step_index += 1
+        self.episode_length += 1
+        terminals = done[:, self.step_index].numpy()
+        infos = []
+        if terminals[0]:
+          infos.append({'curriculum_success': 1.0,
+                        'curriculum_template': 0,
+                        'episode_length': self.episode_length})
+          self.episode_length = 0
+        return (observations[:, self.step_index].numpy(), np.zeros(1),
+                terminals, np.zeros(1, dtype=bool), infos)
+
+    policy = RecordingPolicy(_env(), hidden_size=16)
+    policy.recorded_logits, policy.recorded_values = [], []
+    expected_logits, expected_values = [], []
+    with torch.no_grad():
+      # PufferLib starts each rollout window from zero, regardless of which
+      # episodes ended inside it. PPO replays these same windows from zero.
+      for start in range(0, steps, horizon):
+        stop = min(start + horizon, steps)
+        logits, values = policy(observations[:, start:stop],
+                                {'done': done[:, start:stop]})
+        expected_logits.append(logits)
+        expected_values.append(values.flatten())
+    metrics = evaluate_promotion(policy, TrajectoryEnv(), 3, 17, 'cpu', horizon)
+    assert policy.training  # Evaluation restores the caller's mode.
+    assert metrics['promotion_episodes'] == 3
+    assert metrics['promotion_recurrent_horizon'] == horizon
+    assert torch.allclose(torch.cat(policy.recorded_logits),
+                          torch.cat(expected_logits), atol=1e-6)
+    assert torch.allclose(torch.cat(policy.recorded_values),
+                          torch.cat(expected_values), atol=1e-6)
 
 
 def test_episode_end_clears_recurrent_memory():
