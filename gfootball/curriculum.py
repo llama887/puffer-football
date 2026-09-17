@@ -19,6 +19,7 @@ Level 0 is deliberately the easiest possible scoring task -- open goal,
 carrier aligned -- and is the anchor the whole schedule is measured against.
 """
 
+import math
 import random
 
 ATTACKER_ORDER = (2, 1, 10, 7, 9, 8, 3, 6, 4, 5, 0)
@@ -88,6 +89,35 @@ ADVANTAGE_LEVELS = 21
 NARROW_LATERAL_HALF_WIDTH = 0.05
 FULL_LATERAL_HALF_WIDTH = 2 / 3 * 0.20
 LATERAL_RAMP_END_ADVANTAGE = 0.60
+
+
+# Goal-side blockers.  The expected count runs linearly from one at advantage
+# 1.00 to MAX_GOALSIDE_BLOCKERS at 0.00.  Rounding that to an integer per level
+# put the second blocker on level 3 in a single step, and dead centre on the
+# shot line: three seeds cleared levels 0-2 and then collapsed there, success
+# falling from 0.56 to 0.12-0.35 over 1300+ epochs without recovering.  The
+# fractional part now fades the next blocker in by probability, so consecutive
+# levels differ by at most one fifth of a blocker, and level 0 is unchanged.
+MAX_GOALSIDE_BLOCKERS = 5
+
+
+def expected_goalside_blockers(advantage):
+  """Mean number of goal-side blockers at this advantage."""
+  advantage = max(0.0, min(1.0, float(advantage)))
+  return 1.0 + (MAX_GOALSIDE_BLOCKERS - 1) * (1.0 - advantage)
+
+
+def goalside_blockers(advantage, draw):
+  """Blockers this episode: the whole part always, the fraction by chance.
+
+  `draw` is a uniform [0, 1) sample from the episode's own generator, so a
+  seed/episode pair still spawns the same scene every time.
+  """
+  expected = expected_goalside_blockers(advantage)
+  whole = int(math.floor(expected + 1e-9))
+  fraction = expected - whole
+  count = whole + (1 if float(draw) < fraction else 0)
+  return max(1, min(MAX_GOALSIDE_BLOCKERS, count))
 
 
 def lateral_half_width(advantage):

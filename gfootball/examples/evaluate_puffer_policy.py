@@ -17,13 +17,18 @@ ACTION_NAMES = tuple(
     str(action) for action in football_action_set.action_set_dict['default'])
 
 
-def _observation_contract(observations, active):
+def _observation_contract(observations, active, sorted_players=True):
   active_observations = observations[active]
   frames = active_observations.reshape(-1, 4, 115)
-  active_players = frames[:, :, 97:108].argmax(axis=-1)
   own_positions = frames[:, :, :22].reshape(-1, 4, 11, 2)
-  rows, history = np.indices(active_players.shape)
-  ego_positions = own_positions[rows, history, active_players]
+  if sorted_players:
+    # Training sorts teammates by distance, so the controlled player is
+    # always slot 0 rather than the slot named by the active one-hot.
+    ego_positions = own_positions[:, :, 0]
+  else:
+    active_players = frames[:, :, 97:108].argmax(axis=-1)
+    rows, history = np.indices(active_players.shape)
+    ego_positions = own_positions[rows, history, active_players]
   return (float(np.abs(active_observations).max()),
           float(np.abs(ego_positions).max()),
           int(np.abs(active_observations).argmax() % observations.shape[1]))

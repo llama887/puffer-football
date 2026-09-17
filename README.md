@@ -197,13 +197,24 @@ curriculum also disables movement magnetism, automatic pass/shot aiming and
 power, and automatic standing interference. Stock scenarios and rendered
 evaluation keep the original features.
 
-The Torch job below runs shared-policy PPO with KL-to-past and decaying
-KL-to-uniform regularization. It uses 30 environment workers, one H100, and a
-low-priority GPU heartbeat:
+The Torch job below runs recurrent shared-policy PPO self-play on the
+`11_vs_11_advantage` curriculum with 30 environment workers, one H100, and a
+low-priority GPU heartbeat.  Submit it as an array to train one seed per task;
+single-seed results on this task are inside the seed noise:
 
 ```shell
-sbatch sbatch/train_regularized.sbatch
+sbatch --array=0-2 sbatch/train_selfplay.sbatch
+python scripts/summarize_runs.py sbatch/logs/football-selfplay-<array id>-*.out
 ```
+
+Promotion to the next level is gated on held-out evaluation against a
+*frozen* snapshot of the policy taken on entering the level, so the score
+target is fixed rather than the same network's improving defence
+(`FROZEN_DEFENCE_GATE=0` restores the live self-play gate).  Each check also
+logs a greedy (argmax) evaluation and a small live self-play evaluation as
+diagnostics, and a hopeless gate evaluation stops after a quarter of its
+episodes.  Goal-side blockers fade in by probability across levels instead of
+arriving one whole defender at a time.
 
 # Contents #
 

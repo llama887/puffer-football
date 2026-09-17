@@ -17,33 +17,59 @@ set -euo pipefail
 REPO=/scratch/fyy2003/repos/football
 ENV_PREFIX="$REPO/.venv"
 TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
-RUN_ROOT=/scratch/fyy2003/experiments/football-selfplay-${SLURM_JOB_ID}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
+
+# Single-seed results on this task are not reliable: the same configuration
+# clears level 0 anywhere between 175 and 2275 epochs depending on the seed.
+# Submit as an array to get one run per seed, e.g. `sbatch --array=0-2 ...`;
+# each task derives its seed from SEED_BASE and keeps its own run directory.
+# Summarize a set of runs with scripts/summarize_runs.py.
+SEED_BASE=${SEED_BASE:-20260917}
+if [[ -n ${SLURM_ARRAY_TASK_ID:-} ]]; then
+  SEED=${SEED:-$((SEED_BASE + SLURM_ARRAY_TASK_ID))}
+  RUN_ROOT=/scratch/fyy2003/experiments/football-selfplay-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}
+else
+  SEED=${SEED:-$SEED_BASE}
+  RUN_ROOT=/scratch/fyy2003/experiments/football-selfplay-${SLURM_JOB_ID}
+fi
 
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
 WANDB_GROUP=${WANDB_GROUP:-self-play-lstm-ppo}
-ENV_NAME=${ENV_NAME:-11_vs_11_curriculum}
+ENV_NAME=${ENV_NAME:-11_vs_11_advantage}
 LEARNING_RATE=${LEARNING_RATE:-0.0003}
-ENT_COEF=${ENT_COEF:-0.01}
+# 0.01 kept every run within 10% of a uniform policy after 3000+ epochs.
+ENT_COEF=${ENT_COEF:-0.001}
 VF_COEF=${VF_COEF:-0.5}
 CLIP_COEF=${CLIP_COEF:-0.2}
-GAMMA=${GAMMA:-0.99}
-GAE_LAMBDA=${GAE_LAMBDA:-0.95}
+GAMMA=${GAMMA:-0.997}
+GAE_LAMBDA=${GAE_LAMBDA:-0.98}
 UPDATE_EPOCHS=${UPDATE_EPOCHS:-4}
 BPTT_HORIZON=${BPTT_HORIZON:-32}
 MINIBATCH_SEGMENTS=${MINIBATCH_SEGMENTS:-32}
 HIDDEN_SIZE=${HIDDEN_SIZE:-256}
 FRAME_STACK=${FRAME_STACK:-1}
-SEED=${SEED:-0}
 START_LEVEL=${START_LEVEL:-0}
-PROMOTION_INTERVAL=${PROMOTION_INTERVAL:-50}
-PROMOTION_EPISODES=${PROMOTION_EPISODES:-256}
+# 256 episodes every 25 epochs was ~40% of a ten-hour job.  Larger and rarer
+# is cheaper and less noisy, and a hopeless evaluation stops after a quarter.
+PROMOTION_INTERVAL=${PROMOTION_INTERVAL:-100}
+PROMOTION_EPISODES=${PROMOTION_EPISODES:-512}
 PROMOTION_WORKERS=${PROMOTION_WORKERS:-$NUM_WORKERS}
+PROMOTION_EARLY_ABORT_MARGIN=${PROMOTION_EARLY_ABORT_MARGIN:-0.2}
+GREEDY_PROMOTION_EPISODES=${GREEDY_PROMOTION_EPISODES:-128}
+SELFPLAY_PROMOTION_EPISODES=${SELFPLAY_PROMOTION_EPISODES:-128}
 SCORED_PROMOTION_LEVELS=${SCORED_PROMOTION_LEVELS:-4}
 TIMED_PROMOTION_EPOCHS=${TIMED_PROMOTION_EPOCHS:-200}
 ANNEAL_LR_ARGS=(--no-anneal-lr)
 if [[ ${ANNEAL_LR:-0} == 1 ]]; then
   ANNEAL_LR_ARGS=(--anneal-lr)
+fi
+# The score gate plays against a frozen snapshot of the policy taken on
+# entering the level, so "attackers score 60%" is a fixed target rather than
+# the same network's ever-improving defence.  FROZEN_DEFENCE_GATE=0 restores
+# the live self-play gate.
+FROZEN_GATE_ARGS=(--frozen-defence-gate)
+if [[ ${FROZEN_DEFENCE_GATE:-1} == 0 ]]; then
+  FROZEN_GATE_ARGS=(--no-frozen-defence-gate)
 fi
 
 mkdir -p "$RUN_ROOT/checkpoints" "$REPO/sbatch/logs"
@@ -119,10 +145,15 @@ cd "$RUN_ROOT"
   --promotion-interval "$PROMOTION_INTERVAL" \
   --promotion-episodes "$PROMOTION_EPISODES" \
   --promotion-workers "$PROMOTION_WORKERS" \
+  --promotion-early-abort-margin "$PROMOTION_EARLY_ABORT_MARGIN" \
+  --greedy-promotion-episodes "$GREEDY_PROMOTION_EPISODES" \
+  --selfplay-promotion-episodes "$SELFPLAY_PROMOTION_EPISODES" \
+  "${FROZEN_GATE_ARGS[@]}" \
   --scored-promotion-levels "$SCORED_PROMOTION_LEVELS" \
   --timed-promotion-epochs "$TIMED_PROMOTION_EPOCHS" \
   --total-timesteps "$TOTAL_TIMESTEPS" \
   --wandb \
   --wandb-project google-football-fast-rl \
   --wandb-group "$WANDB_GROUP" \
+  ${WANDB_TAG:+--wandb-tag "$WANDB_TAG"} \
   --data-dir "$RUN_ROOT/checkpoints"

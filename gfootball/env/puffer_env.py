@@ -116,9 +116,12 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                seed=0, frame_stack=4, curriculum_levels=TOTAL_LEVELS,
                curriculum_window=20, curriculum_success_threshold=0.6,
                attacker_only_levels=0, curriculum_level_value=None,
-               curriculum_evaluation=False, sort_players=True):
+               curriculum_evaluation=False, sort_players=True,
+               frozen_defence_path=None, frozen_defence_horizon=32):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
+    if frozen_defence_horizon < 1:
+      raise ValueError('frozen_defence_horizon must be positive')
     if curriculum_levels < 2:
       raise ValueError('curriculum_levels must be at least 2')
     if curriculum_window < 1:
@@ -156,6 +159,16 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._episode_template = 0
     self._attacking_left = True
     self._active_mask = np.ones(self.num_agents, dtype=bool)
+    # A frozen policy plays the whole defending side, so the learner (and the
+    # promotion gate) faces a FIXED opponent instead of its own moving self.
+    # It runs inside this worker process on the CPU; the defending rows are
+    # hidden from the caller exactly like inactive curriculum players.
+    self._frozen_defence_path = frozen_defence_path
+    self._frozen_defence_horizon = int(frozen_defence_horizon)
+    self._frozen_policy = None
+    self._frozen_state = None
+    self._frozen_steps = 0
+    self._full_observations = None
     self._env = self._make_env()
     self._episode_return = np.zeros(2, dtype=np.float32)
     self._episode_length = 0
@@ -211,25 +224,57 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._episode_template = int(
           raw_config._values['curriculum_episode_template'])
     self._set_active_players()
+    if self._frozen_defence_path is not None:
+      self._frozen_state = {'lstm_h': None, 'lstm_c': None, 'done': None}
     return observations
+
+  def _defending_rows(self):
+    return slice(11, 22) if self._attacking_left else slice(0, 11)
 
   def _set_active_players(self):
     self._active_mask.fill(True)
-    if not self._curriculum_enabled or self._advantage_mode:
-      # The advantage schedule keeps every player on the pitch at every level.
-      return
-    _, defenders, _ = curriculum_state(self._episode_level)
-    self._active_mask.fill(False)
-    attacking_offset = 0 if self._attacking_left else 11
-    defending_offset = 11 - attacking_offset
-    self._active_mask[
-        attacking_offset + np.asarray(
-            ATTACKER_ORDER[:self._episode_attackers], dtype=np.intp)] = True
-    if self._episode_level >= self._attacker_only_levels:
-      self._active_mask[defending_offset] = True
+    if self._curriculum_enabled and not self._advantage_mode:
+      _, defenders, _ = curriculum_state(self._episode_level)
+      self._active_mask.fill(False)
+      attacking_offset = 0 if self._attacking_left else 11
+      defending_offset = 11 - attacking_offset
       self._active_mask[
-          defending_offset + np.asarray(
-              DEFENDER_ORDER[:defenders], dtype=np.intp)] = True
+          attacking_offset + np.asarray(
+              ATTACKER_ORDER[:self._episode_attackers], dtype=np.intp)] = True
+      if self._episode_level >= self._attacker_only_levels:
+        self._active_mask[defending_offset] = True
+        self._active_mask[
+            defending_offset + np.asarray(
+                DEFENDER_ORDER[:defenders], dtype=np.intp)] = True
+    if self._frozen_defence_path is not None:
+      # The frozen side is acted by this worker, never by the caller.
+      self._active_mask[self._defending_rows()] = False
+
+  def _frozen_actions(self):
+    """Actions for the defending rows from the frozen policy."""
+    if self._frozen_policy is None:
+      import torch
+      from gfootball.env.puffer_policy import load_frozen_policy
+      torch.set_num_threads(1)
+      self._torch = torch
+      self._frozen_policy = load_frozen_policy(self._frozen_defence_path, self)
+      self._frozen_generator = torch.Generator().manual_seed(self._seed)
+    torch = self._torch
+    # Training resets the recurrent state at the start of every rollout
+    # window regardless of episode boundaries, so a policy trained that way is
+    # replayed the same way here.  Episode ends reset it too (_reset_match).
+    if self._frozen_steps % self._frozen_defence_horizon == 0:
+      self._frozen_state['lstm_h'] = self._frozen_state['lstm_c'] = None
+    self._frozen_steps += 1
+    observations = torch.as_tensor(
+        self._full_observations[self._defending_rows()])
+    with torch.no_grad():
+      logits, _ = self._frozen_policy.forward_eval(
+          observations, self._frozen_state)
+      actions = torch.multinomial(
+          torch.softmax(logits.float(), dim=-1), 1,
+          generator=self._frozen_generator).squeeze(-1)
+    return actions.numpy()
 
   def _record_curriculum_result(self, success):
     self._curriculum_results.append(float(success))
@@ -253,6 +298,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     normalize_egocentric(self.observations)
     if self._sort_players:
       sort_players_by_distance(self.observations)
+    if self._frozen_defence_path is not None:
+      # The frozen side needs its own rows before they are hidden below.
+      self._full_observations = self.observations.copy()
     self.observations[~self._active_mask] = 0
 
   def reset(self, seed=None):
@@ -274,6 +322,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     episode_active_mask = self._active_mask.copy()
     actions = np.asarray(actions).reshape(self.num_agents).copy()
     actions[~episode_active_mask] = 0
+    if self._frozen_defence_path is not None:
+      actions[self._defending_rows()] = self._frozen_actions()
     observations, _, done, info = self._env.step(actions)
     rewards = centralized_score_rewards(
         info['score_reward'], episode_active_mask)
@@ -316,6 +366,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
               self._episode_level >= self._attacker_only_levels),
           'curriculum_distance_progress': distance_progress,
           'curriculum_template': float(self._episode_template),
+          'curriculum_attacking_left': float(self._attacking_left),
+          'curriculum_frozen_defence': float(
+              self._frozen_defence_path is not None),
           'curriculum_evaluation': float(self._curriculum_evaluation),
           'episode_length': self._episode_length,
           'possession_fraction': (

@@ -139,6 +139,90 @@ def test_promotion_matches_training_across_rollout_and_episode_boundaries():
                           torch.cat(expected_values), atol=1e-6)
 
 
+class _ScriptedEnv:
+  """One agent row; every episode lasts `length` steps and ends as told."""
+
+  def __init__(self, length, successes):
+    self.length = length
+    self.successes = list(successes)
+    self.actions = []
+
+  def reset(self, seed):
+    self.step_index = 0
+    self.episode = 0
+    return np.random.RandomState(seed).randn(1, 115).astype(np.float32), []
+
+  def step(self, actions):
+    self.actions.append(int(np.asarray(actions).reshape(-1)[0]))
+    self.step_index += 1
+    infos = []
+    terminal = self.step_index % self.length == 0
+    if terminal:
+      success = self.successes[self.episode % len(self.successes)]
+      infos.append({'curriculum_success': float(success),
+                    'curriculum_template': self.episode % 8,
+                    'episode_length': self.length})
+      self.episode += 1
+    observation = np.random.RandomState(self.step_index).randn(
+        1, 115).astype(np.float32)
+    return (observation, np.zeros(1), np.array([terminal]),
+            np.zeros(1, dtype=bool), infos)
+
+
+def test_greedy_promotion_takes_the_argmax_action():
+  torch.manual_seed(3)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  # Make the actor decisive so argmax and sampling visibly differ.
+  with torch.no_grad():
+    policy.actor.weight.mul_(50)
+  env = _ScriptedEnv(length=4, successes=[1])
+  logits_seen = []
+  original = policy.forward_eval
+
+  def recording_forward_eval(observations, state):
+    logits, values = original(observations, state)
+    logits_seen.append(logits.clone())
+    return logits, values
+
+  policy.forward_eval = recording_forward_eval
+  metrics = evaluate_promotion(policy, env, 2, 5, 'cpu', 4, greedy=True)
+  assert metrics['promotion_greedy'] == 1.0
+  assert metrics['promotion_aborted'] == 0.0
+  expected = [int(logits.argmax(dim=-1)[0]) for logits in logits_seen]
+  assert env.actions == expected
+
+
+def test_promotion_early_abort_stops_hopeless_evaluations():
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  hopeless = _ScriptedEnv(length=2, successes=[0])
+  metrics = evaluate_promotion(
+      policy, hopeless, 40, 1, 'cpu', 8, early_abort=(6, 0.4))
+  assert metrics['promotion_aborted'] == 1.0
+  assert metrics['promotion_episodes'] == 6
+  assert metrics['promotion_success_rate'] == 0.0
+  assert not promotion_passes(metrics, 0.6, 0.4)
+
+  promising = _ScriptedEnv(length=2, successes=[1, 1, 0])
+  metrics = evaluate_promotion(
+      policy, promising, 12, 1, 'cpu', 8, early_abort=(6, 0.4))
+  assert metrics['promotion_aborted'] == 0.0
+  assert metrics['promotion_episodes'] == 12
+
+
+def test_defaults_lower_entropy_and_spend_less_on_evaluation():
+  args = build_parser().parse_args(['--device', 'cpu'])
+  assert args.ent_coef == 0.001
+  assert args.promotion_interval == 100
+  assert args.promotion_episodes == 512
+  assert args.frozen_defence_gate is True
+  assert args.greedy_promotion_episodes > 0
+  # Per 100 epochs the old schedule ran 4 x 256 held-out episodes; the new
+  # gate plus both diagnostics must not cost more than that.
+  assert (args.promotion_episodes + args.greedy_promotion_episodes +
+          args.selfplay_promotion_episodes) <= 4 * 256
+
+
 def test_episode_end_clears_recurrent_memory():
   torch.manual_seed(0)
   policy = FootballPolicy(_env(), hidden_size=16).eval()

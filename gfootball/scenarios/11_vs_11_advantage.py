@@ -28,7 +28,7 @@ import random
 
 from . import *
 from gfootball.curriculum import (
-    SPAWN_TEMPLATE_COUNT, lateral_half_width)
+    SPAWN_TEMPLATE_COUNT, goalside_blockers, lateral_half_width)
 
 
 _FORMATION = (
@@ -134,21 +134,20 @@ def _carrier_spawn(rank, ball_x, ball_y, direction, rng):
           ball_y + rng.uniform(-0.004, 0.004))
 
 
-def _goalside_count(advantage):
-  """Defenders standing between the ball and the goal.
-
-  One at full advantage, up to a five-man block at the end.  At low advantage
-  the ball is near halfway and the defenders' own formation already sits
-  between it and their goal, so no more than a block is needed.
-  """
-  return max(1, min(5, int(round(1 + 4 * (1.0 - advantage)))))
+# Lateral lane each successive blocker takes, as a multiple of _LANE_WIDTH.
+# The first blocker sits off to one side (the measured level-0 anchor, left
+# exactly as it was).  The second MIRRORS it on the other side, so the pair is
+# symmetric and the shot line between them stays open; only the third closes
+# the middle.  Before this the second blocker landed on the shot line itself.
+_BLOCKER_LANES = (-1, 1, 0)
+_LANE_WIDTH = 0.085
 
 
 def _blocker_spawn(rank, ball_x, ball_y, direction, rng):
   """A defensive line between the ball and the goal it protects."""
-  row, lane = divmod(rank, 3)
+  row, slot = divmod(rank, len(_BLOCKER_LANES))
   depth = 0.07 + 0.04 * row
-  offset = (lane - 1) * 0.085
+  offset = _BLOCKER_LANES[slot] * _LANE_WIDTH
   forward_room = max(0.04, _PITCH_X - abs(ball_x))
   depth = min(depth, forward_room)
   return (ball_x + direction * depth,
@@ -193,7 +192,10 @@ def build_scenario(builder):
   # Lay every outfield player out in world coordinates first, so overlaps can
   # be resolved across both teams before anyone is committed to the scenario.
   attacking_team = Team.e_Left if attack_right else Team.e_Right
-  goalside = _goalside_count(advantage)
+  # A separate generator for the blocker draw keeps every other spawn draw,
+  # and therefore level 0 itself, bit-identical to the measured anchor.
+  goalside = goalside_blockers(
+      advantage, random.Random((seed + episode) * 1000003 + 97).random())
   values['curriculum_goalside_defenders'] = goalside
   outfield = []
   for team in (Team.e_Left, Team.e_Right):
