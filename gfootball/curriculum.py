@@ -88,7 +88,15 @@ ADVANTAGE_LEVELS = 21
 # own instead of a hidden precondition on the anchor level.
 NARROW_LATERAL_HALF_WIDTH = 0.05
 FULL_LATERAL_HALF_WIDTH = 2 / 3 * 0.20
-LATERAL_RAMP_END_ADVANTAGE = 0.60
+# The band used to start opening on level 1, at the same time as the ball
+# moved back and the second blocker began to appear.  Three seeds then sat on
+# level 1 for 2500-7500 epochs, all blocked by the negative-edge template
+# (engine-space probes show the spawn geometry is symmetric between attack
+# directions, so that edge is harder in the engine itself).  Hold the band at
+# level-0 width until the blocker fade has finished (advantage 0.75, level 5),
+# then open it over the next seven levels, so each level changes one thing.
+LATERAL_RAMP_START_ADVANTAGE = 0.75
+LATERAL_RAMP_END_ADVANTAGE = 0.40
 
 
 # Goal-side blockers.  The expected count runs linearly from one at advantage
@@ -123,8 +131,9 @@ def goalside_blockers(advantage, draw):
 def lateral_half_width(advantage):
   """Half-width of the lateral ball-spawn band at this advantage."""
   advantage = max(0.0, min(1.0, float(advantage)))
-  progress = min(1.0, max(0.0, (1.0 - advantage) /
-                          (1.0 - LATERAL_RAMP_END_ADVANTAGE)))
+  progress = min(1.0, max(0.0, (LATERAL_RAMP_START_ADVANTAGE - advantage) /
+                          (LATERAL_RAMP_START_ADVANTAGE -
+                           LATERAL_RAMP_END_ADVANTAGE)))
   return (NARROW_LATERAL_HALF_WIDTH +
           (FULL_LATERAL_HALF_WIDTH - NARROW_LATERAL_HALF_WIDTH) * progress)
 

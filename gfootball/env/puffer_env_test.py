@@ -473,13 +473,23 @@ class PufferEnvTest(absltest.TestCase):
     self.assertAlmostEqual(
         lateral_half_width(1.0), NARROW_LATERAL_HALF_WIDTH)
     self.assertAlmostEqual(
-        lateral_half_width(0.6), FULL_LATERAL_HALF_WIDTH)
+        lateral_half_width(0.4), FULL_LATERAL_HALF_WIDTH)
     self.assertAlmostEqual(
         lateral_half_width(0.0), FULL_LATERAL_HALF_WIDTH)
     widths = [lateral_half_width(advantage_for_level(level))
               for level in range(ADVANTAGE_LEVELS)]
     self.assertEqual(widths, sorted(widths))
     self.assertLess(widths[0], 0.10)
+    # The band holds at level-0 width until the blocker fade is complete
+    # (level 5), so the two ramps never move on the same level.
+    for level in range(6):
+      self.assertAlmostEqual(widths[level], NARROW_LATERAL_HALF_WIDTH)
+      self.assertAlmostEqual(
+          expected_goalside_blockers(advantage_for_level(level)),
+          1.0 + 0.2 * level)
+    self.assertGreater(widths[6], NARROW_LATERAL_HALF_WIDTH)
+    self.assertAlmostEqual(
+        expected_goalside_blockers(advantage_for_level(6)), 2.2)
 
     cfg = config.Config({
         'level': ADVANTAGE_ENV_NAME,

@@ -214,13 +214,39 @@ def test_defaults_lower_entropy_and_spend_less_on_evaluation():
   args = build_parser().parse_args(['--device', 'cpu'])
   assert args.ent_coef == 0.001
   assert args.promotion_interval == 100
-  assert args.promotion_episodes == 512
+  assert args.promotion_episodes == 256
   assert args.frozen_defence_gate is True
   assert args.greedy_promotion_episodes > 0
-  # Per 100 epochs the old schedule ran 4 x 256 held-out episodes; the new
-  # gate plus both diagnostics must not cost more than that.
+  # Per 100 epochs the original schedule ran 4 x 256 held-out episodes and
+  # the first frozen-gate schedule 512 + 128 + 128, which measured at half
+  # the job.  The gate plus both diagnostics must stay well under either.
   assert (args.promotion_episodes + args.greedy_promotion_episodes +
-          args.selfplay_promotion_episodes) <= 4 * 256
+          args.selfplay_promotion_episodes) <= 2 * 256
+
+
+def test_gate_averages_the_two_weakest_templates():
+  episodes = []
+  for template in range(8):
+    rate = 0.3 if template == 7 else 0.7
+    episodes.extend({
+        'curriculum_template': template,
+        'curriculum_success': float(index < rate * 10),
+    } for index in range(10))
+  metrics = promotion_statistics(episodes)
+  assert math.isclose(metrics['promotion_worst_template_success_rate'], 0.3)
+  assert math.isclose(
+      metrics['promotion_worst_two_template_success_rate'], 0.5)
+  # One weak template no longer blocks promotion on its own ...
+  assert promotion_passes(metrics, 0.6, 0.4)
+  # ... but a genuine hole in two templates still does.
+  episodes[-20:] = ({
+      'curriculum_template': 6 + (index >= 10),
+      'curriculum_success': float(index % 10 < 2),
+  } for index in range(20))
+  metrics = promotion_statistics(episodes)
+  assert math.isclose(
+      metrics['promotion_worst_two_template_success_rate'], 0.2)
+  assert not promotion_passes(metrics, 0.6, 0.4)
 
 
 def test_episode_end_clears_recurrent_memory():

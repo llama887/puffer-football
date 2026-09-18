@@ -48,6 +48,7 @@ def summarize(path, rows):
       'gate': last.get('gate', 'selfplay'),
       'success': last.get('promotion_success_rate'),
       'worst': last.get('promotion_worst_template_success_rate'),
+      'worst_two': last.get('promotion_worst_two_template_success_rate'),
       'greedy_success': last.get('greedy_promotion_success_rate'),
       'selfplay_success': last.get('selfplay_promotion_success_rate'),
       'entropy': last.get('promotion_policy_entropy_fraction'),
@@ -78,16 +79,16 @@ def main(argv):
 
   print('per run (epochs at which each level was cleared; gate numbers are '
         'from the latest evaluation)')
-  print('{:<44} {:>5} {:>6} {:>7} {:>7} {:>7} {:>7} {:>6} {:>6}  cleared'
-        .format('log', 'level', 'evals', 'gate', 'worst', 'greedy',
+  print('{:<44} {:>5} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6} {:>6}  cleared'
+        .format('log', 'level', 'evals', 'gate', 'worst', 'worst2', 'greedy',
                 'selfpl', 'entr', 'maxp'))
   for row in summaries:
     name = row['path'][-44:]
     cleared = ' '.join('L{}@{}'.format(level, epoch)
                        for level, epoch in sorted(row['cleared'].items()))
-    print('{:<44} {:>5} {:>6} {} {} {} {} {} {}  {}'.format(
+    print('{:<44} {:>5} {:>6} {} {} {} {} {} {} {}  {}'.format(
         name, row['final_level'], row['evaluations'],
-        _fmt(row['success']), _fmt(row['worst']),
+        _fmt(row['success']), _fmt(row['worst']), _fmt(row['worst_two']),
         _fmt(row['greedy_success']), _fmt(row['selfplay_success']),
         _fmt(row['entropy']), _fmt(row['max_probability']), cleared))
 
