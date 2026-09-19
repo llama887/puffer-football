@@ -224,6 +224,14 @@ def test_defaults_lower_entropy_and_spend_less_on_evaluation():
           args.selfplay_promotion_episodes) <= 2 * 256
 
 
+def test_every_level_is_score_gated_by_default():
+  args = build_parser().parse_args(['--device', 'cpu'])
+  assert args.scored_promotion_levels is None
+  args = build_parser().parse_args(
+      ['--device', 'cpu', '--scored-promotion-levels', '4'])
+  assert args.scored_promotion_levels == 4
+
+
 def test_gate_averages_the_two_weakest_templates():
   episodes = []
   for template in range(8):

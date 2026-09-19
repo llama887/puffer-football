@@ -486,8 +486,13 @@ def build_parser():
                            'check when the gate is frozen-defence '
                            '(diagnostic only, comparable to older runs); '
                            '0 disables')
-  parser.add_argument('--scored-promotion-levels', type=int, default=4,
-                      help='levels below this advance only on the score gate')
+  # Timed promotion was added when no run could clear level 0, so that the
+  # later levels were at least visited.  Once level 3 fell, two seeds rode the
+  # 200-epoch timer from level 4 to level 20 with success at zero.  Mastery
+  # is the goal, so every level is score-gated unless a job says otherwise.
+  parser.add_argument('--scored-promotion-levels', type=int, default=None,
+                      help='levels below this advance only on the score '
+                           'gate; default: every level')
   parser.add_argument('--timed-promotion-epochs', type=int, default=200,
                       help='at or above --scored-promotion-levels, also '
                            'advance after this many epochs on a level')
@@ -573,6 +578,8 @@ def main():
     # The advantage schedule has every player active from level 0, so there
     # is no attacker-only prefix to configure.
     args.attacker_only_levels = 0 if advantage_schedule else ATTACKER_ONLY_LEVELS
+  if args.scored_promotion_levels is None:
+    args.scored_promotion_levels = args.curriculum_levels
   if args.device == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA training requested but no GPU is visible')
   os.makedirs(args.data_dir, exist_ok=True)
