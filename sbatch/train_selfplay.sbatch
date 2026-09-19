@@ -43,6 +43,11 @@ VF_COEF=${VF_COEF:-0.5}
 CLIP_COEF=${CLIP_COEF:-0.2}
 GAMMA=${GAMMA:-0.997}
 GAE_LAMBDA=${GAE_LAMBDA:-0.98}
+# Potential-based shaping on ball progress toward the attacked goal
+# (Ng, Harada & Russell 1999): F = gamma*Phi(s') - Phi(s) with
+# Phi = -BALL_POTENTIAL * distance-to-goal-line.  Leaves the optimal policy
+# unchanged; 0 disables.  Uses GAMMA above as the discount.
+BALL_POTENTIAL=${BALL_POTENTIAL:-0}
 UPDATE_EPOCHS=${UPDATE_EPOCHS:-4}
 BPTT_HORIZON=${BPTT_HORIZON:-32}
 MINIBATCH_SEGMENTS=${MINIBATCH_SEGMENTS:-32}
@@ -106,7 +111,7 @@ if [[ ! -e "$REPO/resources" ]]; then
     "$REPO/resources"
 fi
 
-export GPU_HEARTBEAT_TARGET_UTILIZATION=70
+export GPU_HEARTBEAT_TARGET_UTILIZATION="${GPU_HEARTBEAT_TARGET_UTILIZATION:-85}"
 export GPU_HEARTBEAT_CHECK_INTERVAL=0.2
 export GPU_HEARTBEAT_MATRIX_SIZE=6144
 export GPU_HEARTBEAT_DTYPE=bfloat16
@@ -140,6 +145,7 @@ cd "$RUN_ROOT"
   --vf-coef "$VF_COEF" \
   --clip-coef "$CLIP_COEF" \
   --gamma "$GAMMA" \
+  --ball-potential "$BALL_POTENTIAL" \
   --gae-lambda "$GAE_LAMBDA" \
   --update-epochs "$UPDATE_EPOCHS" \
   --bptt-horizon "$BPTT_HORIZON" \

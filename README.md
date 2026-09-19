@@ -216,6 +216,12 @@ diagnostics, and a hopeless gate evaluation stops after a quarter of its
 episodes.  Goal-side blockers fade in by probability across levels instead of
 arriving one whole defender at a time.
 
+`BALL_POTENTIAL=k` adds potential-based reward shaping on the ball's progress
+toward the goal each side attacks: every step pays `gamma * Phi(s') - Phi(s)`
+with `Phi = -k * (distance of the ball from that goal line)` and `Phi = 0` in
+the absorbing state, which by Ng, Harada and Russell (1999, Theorem 1) leaves
+the optimal policy unchanged.  Promotion evaluation never uses it.
+
 # Contents #
 
 * [Running training](#training-agents-to-play-GRF)

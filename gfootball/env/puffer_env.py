@@ -96,6 +96,29 @@ def sort_players_by_distance(observations):
   return observations
 
 
+def ball_potential(advance, scale):
+  """Potential of a state for the side attacking the goal at advance +1.
+
+  Ng, Harada and Russell (1999) shape the gridworld with minus the distance
+  to the goal, an estimate of V*.  Here the distance is the ball's from the
+  goal line it is being carried toward, in the [-1, 1] pitch coordinate, so
+  the potential is zero on that line and most negative at the far end.
+  """
+  return -float(scale) * (1.0 - float(advance))
+
+
+def potential_shaping(previous, current, gamma, terminal):
+  """F(s, a, s') = gamma * Phi(s') - Phi(s), with Phi(absorbing) = 0.
+
+  Theorem 1 of Ng et al.: a shaping reward of exactly this form, and only
+  this form, leaves every optimal policy of the original MDP optimal in the
+  shaped one.  Corollary 2 needs the absorbing state's potential to be zero,
+  which is what the `terminal` branch does; the shaping over an episode then
+  telescopes to -Phi(s_0), a constant the critic absorbs.
+  """
+  return (0.0 if terminal else float(gamma) * float(current)) - float(previous)
+
+
 def centralized_score_rewards(score_reward, active_mask):
   """Share the zero-sum match score with every active player on each team."""
   active_mask = np.asarray(active_mask, dtype=bool)
@@ -117,11 +140,16 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                curriculum_window=20, curriculum_success_threshold=0.6,
                attacker_only_levels=0, curriculum_level_value=None,
                curriculum_evaluation=False, sort_players=True,
-               frozen_defence_path=None, frozen_defence_horizon=32):
+               frozen_defence_path=None, frozen_defence_horizon=32,
+               ball_potential_scale=0.0, potential_gamma=0.99):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     if frozen_defence_horizon < 1:
       raise ValueError('frozen_defence_horizon must be positive')
+    if ball_potential_scale < 0:
+      raise ValueError('ball_potential_scale must be non-negative')
+    if not 0 < potential_gamma <= 1:
+      raise ValueError('potential_gamma must be in (0, 1]')
     if curriculum_levels < 2:
       raise ValueError('curriculum_levels must be at least 2')
     if curriculum_window < 1:
@@ -177,6 +205,28 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     # improving before it starts converting.
     self._possession_steps = 0
     self._advance_sum = 0.0
+    # Potential-based shaping on the ball's progress toward the attacked
+    # goal.  The score reward stays the only thing that defines success;
+    # shaping is added to the rewards the learner sees and nothing else.
+    self._ball_potential_scale = float(ball_potential_scale)
+    self._potential_gamma = float(potential_gamma)
+    self._attack_potential = 0.0
+    self._defence_potential = 0.0
+    self._shaping_return = np.zeros(2, dtype=np.float32)
+
+  @staticmethod
+  def _ball_advance(raw_observations, attacking_left):
+    """Ball x in [-1, 1], signed so +1 is the goal being attacked."""
+    frame = np.asarray(raw_observations, dtype=np.float32).reshape(
+        22, -1)[0, -115:]
+    return float(frame[88] if attacking_left else -frame[88])
+
+  def _set_potentials(self, raw_observations):
+    advance = self._ball_advance(raw_observations, self._attacking_left)
+    self._attack_potential = ball_potential(
+        advance, self._ball_potential_scale)
+    self._defence_potential = ball_potential(
+        -advance, self._ball_potential_scale)
 
   def _make_env(self):
     return football_env.create_environment(
@@ -226,6 +276,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._set_active_players()
     if self._frozen_defence_path is not None:
       self._frozen_state = {'lstm_h': None, 'lstm_c': None, 'done': None}
+    if self._ball_potential_scale:
+      self._set_potentials(observations)
     return observations
 
   def _defending_rows(self):
@@ -313,6 +365,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self.terminals.fill(False)
     self.truncations.fill(False)
     self._episode_return.fill(0)
+    self._shaping_return.fill(0)
     self._episode_length = 0
     self._possession_steps = 0
     self._advance_sum = 0.0
@@ -340,8 +393,34 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     if owner == attacking_owner:
       self._possession_steps += 1
     # +1 means the ball is on the goal being attacked, -1 the other end.
-    self._advance_sum += float(
-        frame[88] if self._attacking_left else -frame[88])
+    advance = float(frame[88] if self._attacking_left else -frame[88])
+    self._advance_sum += advance
+    if self._ball_potential_scale:
+      # Each side is shaped on the ball's progress toward the goal IT
+      # attacks, from its own potential, so the sum stays zero-sum up to the
+      # constant (1 - gamma) term.  A finished episode enters the absorbing
+      # state, whose potential is zero, whatever the final frame shows.
+      attack_shaping = potential_shaping(
+          self._attack_potential,
+          ball_potential(advance, self._ball_potential_scale),
+          self._potential_gamma, done)
+      defence_shaping = potential_shaping(
+          self._defence_potential,
+          ball_potential(-advance, self._ball_potential_scale),
+          self._potential_gamma, done)
+      attacking_team = 0 if self._attacking_left else 1
+      shaping = np.zeros(self.num_agents, dtype=np.float32)
+      shaping[:11] = attack_shaping if attacking_team == 0 else defence_shaping
+      shaping[11:] = defence_shaping if attacking_team == 0 else attack_shaping
+      shaping[~episode_active_mask] = 0
+      self._shaping_return[attacking_team] += attack_shaping
+      self._shaping_return[1 - attacking_team] += defence_shaping
+      rewards = rewards + shaping
+      if not done:
+        self._attack_potential = ball_potential(
+            advance, self._ball_potential_scale)
+        self._defence_potential = ball_potential(
+            -advance, self._ball_potential_scale)
     self.rewards[:] = rewards
     self.terminals.fill(done)
     self.truncations.fill(False)
@@ -377,10 +456,13 @@ class FootballPufferEnv(pufferlib.PufferEnv):
               self._advance_sum / max(1, self._episode_length)),
           'left_episode_return': float(self._episode_return[0]),
           'right_episode_return': float(self._episode_return[1]),
+          'attacking_shaping_return': float(
+              self._shaping_return[0 if self._attacking_left else 1]),
           'score_reward': float(info['score_reward']),
       })
       observations = self._reset_match()
       self._episode_return.fill(0)
+      self._shaping_return.fill(0)
       self._episode_length = 0
       self._possession_steps = 0
       self._advance_sum = 0.0

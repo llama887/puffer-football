@@ -573,6 +573,97 @@ class PufferEnvTest(absltest.TestCase):
     self.assertEqual(set(counts), {1, 2})
     self.assertAlmostEqual(sum(counts) / len(counts), 1.6, delta=0.1)
 
+  def test_potential_shaping_telescopes_to_minus_the_start_potential(self):
+    """Ng et al. (1999): F = gamma*Phi(s') - Phi(s), Phi(absorbing) = 0.
+
+    Summed over any trajectory the shaping is -Phi(s_0) plus the (1-gamma)
+    drift, whatever happened in between and however it ended, which is what
+    makes it unable to change the optimal policy.
+    """
+    gamma, scale = 0.9, 2.0
+    self.assertEqual(puffer_env.ball_potential(1.0, scale), 0.0)
+    self.assertEqual(puffer_env.ball_potential(-1.0, scale), -4.0)
+    for advances in ([0.9, 0.95, 1.0], [0.9, 0.5, 0.2, 0.7], [0.3]):
+      potentials = [puffer_env.ball_potential(a, scale) for a in advances]
+      total = 0.0
+      drift = 0.0
+      for index in range(1, len(potentials)):
+        total += puffer_env.potential_shaping(
+            potentials[index - 1], potentials[index], gamma, terminal=False)
+        drift += (gamma - 1) * potentials[index]
+      # The episode ends: the absorbing state has zero potential.
+      total += puffer_env.potential_shaping(
+          potentials[-1], potentials[-1], gamma, terminal=True)
+      self.assertAlmostEqual(total, -potentials[0] + drift)
+    # Progress toward the goal is paid for as it happens ...
+    self.assertGreater(puffer_env.potential_shaping(
+        puffer_env.ball_potential(0.9, 1.0),
+        puffer_env.ball_potential(0.95, 1.0), 1.0, False), 0)
+    # ... and moving away costs the same amount back.
+    self.assertLess(puffer_env.potential_shaping(
+        puffer_env.ball_potential(0.95, 1.0),
+        puffer_env.ball_potential(0.9, 1.0), 1.0, False), 0)
+
+  def test_ball_shaping_rewards_both_sides_and_leaves_success_alone(self):
+    scale, gamma = 1.0, 0.99
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
+        curriculum_levels=ADVANTAGE_LEVELS, ball_potential_scale=scale,
+        potential_gamma=gamma)
+    plain = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
+        curriculum_levels=ADVANTAGE_LEVELS)
+    try:
+      env.reset()
+      plain.reset()
+      attacking = slice(0, 11) if env._attacking_left else slice(11, 22)
+      defending = slice(11, 22) if env._attacking_left else slice(0, 11)
+      start_potential = env._attack_potential
+      self.assertLess(start_potential, 0.0)
+      # Sprint toward the goal with everyone: the ball carrier advances it.
+      shaped_total = 0.0
+      infos = []
+      for _ in range(400):
+        previous_attack = env._attack_potential
+        previous_defence = env._defence_potential
+        _, rewards, _, _, infos = env.step(np.full(22, 5, dtype=np.int32))
+        _, plain_rewards, _, _, _ = plain.step(np.full(22, 5, dtype=np.int32))
+        attack = float(rewards[attacking][0])
+        defence = float(rewards[defending][0])
+        # Every row on a side sees the same shaping ...
+        np.testing.assert_allclose(rewards[attacking], attack, atol=1e-6)
+        np.testing.assert_allclose(rewards[defending], defence, atol=1e-6)
+        score = float(plain_rewards[attacking][0])
+        shaped_total += attack - score
+        if infos:
+          # The absorbing state has zero potential, so the last step refunds
+          # each side exactly its own potential, whatever the final frame.
+          self.assertAlmostEqual(attack - score, -previous_attack, places=5)
+          self.assertAlmostEqual(defence + score, -previous_defence, places=5)
+          break
+        # ... and until then the two sides are shaped in opposite directions,
+        # up to the (1 - gamma) constant, on top of the zero-sum score.
+        self.assertAlmostEqual(
+            (attack - score) + (defence + score), 2 * scale * (1 - gamma),
+            places=5)
+      self.assertTrue(infos)
+      info = infos[0]
+      # Success and the score returns are untouched by shaping.
+      self.assertIn(info['curriculum_success'], (0.0, 1.0))
+      self.assertEqual(
+          info['curriculum_success'],
+          float(info['left_episode_return' if env._attacking_left
+                     else 'right_episode_return'] > 0))
+      self.assertAlmostEqual(
+          info['attacking_shaping_return'], shaped_total, places=4)
+      # Telescoped: the episode's shaping is -Phi(s_0) plus the tiny drift,
+      # which for a spawn near the goal is a small number, not a goal's worth.
+      self.assertLess(abs(shaped_total + start_potential), 0.05 + 0.02)
+      self.assertLess(abs(shaped_total), 0.2)
+    finally:
+      env.close()
+      plain.close()
+
   def test_frozen_defence_plays_the_defending_side_from_a_snapshot(self):
     """The frozen side is hidden from the caller and acted in the worker."""
     torch.manual_seed(0)
