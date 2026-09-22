@@ -222,6 +222,43 @@ with `Phi = -k * (distance of the ball from that goal line)` and `Phi = 0` in
 the absorbing state, which by Ng, Harada and Russell (1999, Theorem 1) leaves
 the optimal policy unchanged.  Promotion evaluation never uses it.
 
+`PLAYER_POTENTIAL=k` additionally shapes the distance of the closest teammate
+to the ball (including the goalkeeper, ignoring absent
+players). It uses Euclidean distance with the engine's x/y coordinate scales
+accounted for, expressed in pitch half-length units. The combined potential is
+`Phi = -BALL_POTENTIAL * ball_to_goal_line - PLAYER_POTENTIAL * nearest_to_ball`.
+Both scales default to zero. For example, submit with
+`--export=ALL,BALL_POTENTIAL=1,PLAYER_POTENTIAL=0.3` to enable both terms.
+The trainer's `--gamma` is used for the entire potential difference and all
+episode endings use zero terminal potential. Thus the **discounted** sum of
+shaping rewards is exactly `-Phi(initial_state)` regardless of trajectory or
+outcome. This preserves the underlying discounted objective; it does not
+guarantee PPO convergence or faster learning. Success and promotion remain
+goal-based. See [Ng, Harada and Russell (1999)](https://ai.stanford.edu/~ang/papers/shaping-icml99.pdf).
+
+The bounded screen in `scripts/tune_shaping.py` compares eight configurations
+over the same three seeds, at 50M agent steps each (1.2B total). It includes
+unshaped and ball-only controls, player scales 0.1/0.3/1.0, ball scales
+0.3/1.0, learning rates 0.0001/0.0003, and entropy coefficients 0.001/0.003
+as targeted variations, not a full Cartesian grid. Discount stays 0.997.
+Final checkpoints are evaluated without shaping or early abort for 256
+episodes at each of levels 4, 6, and 7, using identical evaluation seeds and
+the same copied frozen opponents for every candidate. The primary ranking
+is mean goal success across these levels and seeds; weak-scenario success
+and seed variability are also reported. This is an initial screening budget,
+not evidence of full-run convergence.
+
+Create a study directory containing `repo/` (a copy of this source, with
+`third_party` and `resources` available), `opponents/level4.pt`, `level6.pt`,
+`level7.pt`, and `results/`. Submit
+`sbatch --array=0-23%3 --export=ALL,SHAPING_STUDY=/absolute/study sbatch/tune_shaping.sbatch`.
+After the array finishes, run
+`python scripts/tune_shaping.py summarize --study /absolute/study`.
+It writes `summary.json` and selects a screening winner only after all 24
+full-budget trials have produced benchmark results. Keep source and opponent
+snapshots fixed for the entire study. The September 21 study is stored under
+`/scratch/fyy2003/experiments/football-player-ball-shaping-20260921`.
+
 # Contents #
 
 * [Running training](#training-agents-to-play-GRF)

@@ -2,6 +2,7 @@
 
 import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import gymnasium
 import numpy as np
@@ -353,6 +354,21 @@ def test_config_satisfies_pufferlib_batching_constraints():
   assert segments >= num_agents
   # One segment per agent per epoch keeps rollout and BPTT state aligned.
   assert segments == num_agents
+
+
+def test_shaping_controls_share_discount_and_stay_out_of_promotion():
+  """CLI scales stay opt-in and promotion construction receives neither."""
+  from gfootball.examples.train_puffer import _make_promotion_env
+  defaults = build_parser().parse_args([])
+  assert defaults.ball_potential == defaults.player_potential == 0
+  args = build_parser().parse_args([
+      '--ball-potential', '1', '--player-potential', '0.3', '--gamma', '0.997'])
+  assert args.player_potential == 0.3
+  assert build_config(args, 660)['gamma'] == 0.997
+  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
+    _make_promotion_env(args, SimpleNamespace(value=4))
+  assert 'ball_potential_scale' not in make.call_args.kwargs
+  assert 'player_potential_scale' not in make.call_args.kwargs
 
 
 def test_update_epochs_cover_the_active_data_at_least_once():

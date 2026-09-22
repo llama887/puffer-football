@@ -576,9 +576,9 @@ class PufferEnvTest(absltest.TestCase):
   def test_potential_shaping_telescopes_to_minus_the_start_potential(self):
     """Ng et al. (1999): F = gamma*Phi(s') - Phi(s), Phi(absorbing) = 0.
 
-    Summed over any trajectory the shaping is -Phi(s_0) plus the (1-gamma)
-    drift, whatever happened in between and however it ended, which is what
-    makes it unable to change the optimal policy.
+    Discounted over any complete trajectory the shaping is -Phi(s_0),
+    independent of its length, intermediate states, or terminal outcome.
+    This is the return identity required for policy invariance.
     """
     gamma, scale = 0.9, 2.0
     self.assertEqual(puffer_env.ball_potential(1.0, scale), 0.0)
@@ -586,15 +586,13 @@ class PufferEnvTest(absltest.TestCase):
     for advances in ([0.9, 0.95, 1.0], [0.9, 0.5, 0.2, 0.7], [0.3]):
       potentials = [puffer_env.ball_potential(a, scale) for a in advances]
       total = 0.0
-      drift = 0.0
       for index in range(1, len(potentials)):
-        total += puffer_env.potential_shaping(
+        total += gamma ** (index - 1) * puffer_env.potential_shaping(
             potentials[index - 1], potentials[index], gamma, terminal=False)
-        drift += (gamma - 1) * potentials[index]
       # The episode ends: the absorbing state has zero potential.
-      total += puffer_env.potential_shaping(
+      total += gamma ** (len(potentials) - 1) * puffer_env.potential_shaping(
           potentials[-1], potentials[-1], gamma, terminal=True)
-      self.assertAlmostEqual(total, -potentials[0] + drift)
+      self.assertAlmostEqual(total, -potentials[0])
     # Progress toward the goal is paid for as it happens ...
     self.assertGreater(puffer_env.potential_shaping(
         puffer_env.ball_potential(0.9, 1.0),
@@ -603,6 +601,97 @@ class PufferEnvTest(absltest.TestCase):
     self.assertLess(puffer_env.potential_shaping(
         puffer_env.ball_potential(0.95, 1.0),
         puffer_env.ball_potential(0.9, 1.0), 1.0, False), 0)
+
+  def test_closest_player_potential_geometry_and_identity_changes(self):
+    """Use the ball position, physical distance, and only present players."""
+    positions = np.full((11, 2), -1.0)
+    ball = np.array((0.6, 0.1))
+    positions[0] = (0.4, 0.1)
+    positions[1] = (0.5, 0.3)  # Nearer in x, farther in physical distance.
+    self.assertAlmostEqual(
+        puffer_env.closest_player_potential(positions, ball, 2), -0.4)
+    mirrored = -positions
+    mirrored[2:] = -1  # Absent sentinel does not get mirrored.
+    self.assertAlmostEqual(
+        puffer_env.closest_player_potential(mirrored, -ball, 2), -0.4)
+    positions[[0, 1]] = positions[[1, 0]]
+    self.assertAlmostEqual(
+        puffer_env.closest_player_potential(positions, ball, 2), -0.4)
+    # Moving the ball onto a stationary teammate changes the potential.
+    self.assertEqual(
+        puffer_env.closest_player_potential(positions, positions[1], 2), 0)
+    positions[0] = ball
+    self.assertEqual(puffer_env.closest_player_potential(positions, ball, 2), 0)
+    self.assertEqual(
+        puffer_env.closest_player_potential(np.full((11, 2), -1), ball, 2), 0)
+
+  def test_both_teams_measure_distance_to_the_same_ball(self):
+    """Opponent positions and ball share row zero's absolute coordinate frame."""
+    env = object.__new__(puffer_env.FootballPufferEnv)
+    env._ball_potential_scale = 0.0
+    env._player_potential_scale = 1.0
+    raw = np.zeros((22, 115), dtype=np.float32)
+    raw[0, :22] = raw[0, 44:66] = -1
+    raw[0, :2] = (0.4, 0.1)
+    raw[0, 44:46] = (0.9, 0.1)
+    raw[0, 88:90] = (0.6, 0.1)
+    env._attacking_left = True
+    np.testing.assert_allclose(env._potentials(raw), (-0.2, -0.3), atol=1e-6)
+    env._attacking_left = False
+    np.testing.assert_allclose(env._potentials(raw), (-0.3, -0.2), atol=1e-6)
+    raw[0, 88:90] = (0.5, 0.1)
+    np.testing.assert_allclose(env._potentials(raw), (-0.4, -0.1), atol=1e-6)
+
+  def test_combined_potentials_telescope_across_real_episode_resets(self):
+    """Both teams preserve score returns with combined or player-only shaping.
+
+    Replay identical engine actions with shaping on/off through two complete
+    episodes. Check the discounted return identity separately for each side,
+    including terminal correction and potential initialisation after reset.
+    Stacked observations must use their newest absolute frame.
+    """
+    gamma = 0.997
+    for ball_scale, player_scale, stack in ((1.0, 0.3, 1), (0.0, 1.0, 4)):
+      common = dict(env_name=ADVANTAGE_ENV_NAME, frame_stack=stack,
+                    seed=7, curriculum_levels=ADVANTAGE_LEVELS)
+      env = puffer_env.FootballPufferEnv(
+          **common, ball_potential_scale=ball_scale,
+          player_potential_scale=player_scale, potential_gamma=gamma)
+      plain = puffer_env.FootballPufferEnv(**common)
+      try:
+        env.reset()
+        plain.reset()
+        for episode in range(2):
+          initial = np.array([env._attack_potential, env._defence_potential])
+          attacking_left = env._attacking_left
+          discounted = np.zeros(2)
+          for step in range(500):
+            actions = np.full(22, 5, dtype=np.int32)
+            _, rewards, terminals, _, infos = env.step(actions)
+            _, scores, plain_terminals, _, plain_infos = plain.step(actions)
+            np.testing.assert_array_equal(terminals, plain_terminals)
+            difference = (rewards - scores).reshape(2, 11)
+            np.testing.assert_allclose(
+                difference, np.repeat(difference[:, :1], 11, axis=1), atol=1e-6)
+            sides = difference[:, 0] if attacking_left else difference[::-1, 0]
+            discounted += gamma ** step * sides
+            if infos:
+              for key in ('curriculum_success', 'left_episode_return',
+                          'right_episode_return', 'score_reward'):
+                self.assertEqual(infos[0][key], plain_infos[0][key])
+              break
+          self.assertTrue(infos, 'test must reach a terminal state')
+          np.testing.assert_allclose(discounted, -initial, atol=2e-6)
+      finally:
+        env.close()
+        plain.close()
+
+  def test_shaping_scales_reject_nonfinite_or_negative_values(self):
+    """Invalid potentials must fail before constructing an engine instance."""
+    for name in ('ball_potential_scale', 'player_potential_scale'):
+      for value in (-1, float('inf'), float('nan')):
+        with self.assertRaisesRegex(ValueError, 'finite and non-negative'):
+          puffer_env.FootballPufferEnv(**{name: value})
 
   def test_ball_shaping_rewards_both_sides_and_leaves_success_alone(self):
     scale, gamma = 1.0, 0.99

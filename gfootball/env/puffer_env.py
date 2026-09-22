@@ -119,6 +119,31 @@ def potential_shaping(previous, current, gamma, terminal):
   return (0.0 if terminal else float(gamma) * float(current)) - float(previous)
 
 
+def closest_player_potential(positions, ball_position, scale):
+  """Negative nearest teammate distance to the ball, in pitch-length units.
+
+  Read absolute, unnormalised simple115v2 positions. Its x and y axes use
+  different physical scales, so convert y to x-distance units before taking
+  the Euclidean distance. Every present teammate, including the goalkeeper,
+  is eligible; absent (-1, -1) slots are ignored. Use the ball's ground-plane
+  position in the same absolute frame as the teammates. An empty team has zero
+  potential. Taking the minimum makes this independent of player ordering
+  and allows the identity of the nearest player to change without a bonus.
+  This state potential is used only through potential_shaping, never as a
+  per-step proximity reward. With zero terminal potential, the discounted
+  shaping return is independent of the actions and episode outcome.
+  """
+  if not scale:
+    return 0.0
+  positions = np.asarray(positions).reshape(-1, 2)
+  present = positions[~np.all(positions == -1, axis=1)]
+  if not len(present):
+    return 0.0
+  delta = present - np.asarray(ball_position)[:2]
+  distance = np.hypot(delta[:, 0], delta[:, 1] * (83.6 / 54.4))
+  return -float(scale) * float(distance.min())
+
+
 def centralized_score_rewards(score_reward, active_mask):
   """Share the zero-sum match score with every active player on each team."""
   active_mask = np.asarray(active_mask, dtype=bool)
@@ -141,13 +166,16 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                attacker_only_levels=0, curriculum_level_value=None,
                curriculum_evaluation=False, sort_players=True,
                frozen_defence_path=None, frozen_defence_horizon=32,
-               ball_potential_scale=0.0, potential_gamma=0.99):
+               ball_potential_scale=0.0, potential_gamma=0.99,
+               player_potential_scale=0.0):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     if frozen_defence_horizon < 1:
       raise ValueError('frozen_defence_horizon must be positive')
-    if ball_potential_scale < 0:
-      raise ValueError('ball_potential_scale must be non-negative')
+    for name, scale in (('ball_potential_scale', ball_potential_scale),
+                        ('player_potential_scale', player_potential_scale)):
+      if not np.isfinite(scale) or scale < 0:
+        raise ValueError(name + ' must be finite and non-negative')
     if not 0 < potential_gamma <= 1:
       raise ValueError('potential_gamma must be in (0, 1]')
     if curriculum_levels < 2:
@@ -209,6 +237,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     # goal.  The score reward stays the only thing that defines success;
     # shaping is added to the rewards the learner sees and nothing else.
     self._ball_potential_scale = float(ball_potential_scale)
+    self._player_potential_scale = float(player_potential_scale)
     self._potential_gamma = float(potential_gamma)
     self._attack_potential = 0.0
     self._defence_potential = 0.0
@@ -222,11 +251,29 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     return float(frame[88] if attacking_left else -frame[88])
 
   def _set_potentials(self, raw_observations):
+    """Initialise both teams' combined potentials from the new episode."""
+    self._attack_potential, self._defence_potential = self._potentials(
+        raw_observations)
+
+  def _potentials(self, raw_observations):
+    """Return attacker/defender potentials before egocentric normalisation.
+
+    Row zero is the left team's absolute view: left teammates occupy 0:22,
+    right teammates 44:66, and the ball 88:90. Both teams approach that same
+    ball; the episode's designated attacker only changes the return order.
+    Adding fixed state potentials preserves their telescoping
+    property; both terms use the same discount and terminal correction.
+    """
+    frame = np.asarray(raw_observations, dtype=np.float32).reshape(
+        22, -1)[0, -115:]
     advance = self._ball_advance(raw_observations, self._attacking_left)
-    self._attack_potential = ball_potential(
-        advance, self._ball_potential_scale)
-    self._defence_potential = ball_potential(
-        -advance, self._ball_potential_scale)
+    left = closest_player_potential(frame[:22], frame[88:90],
+                                    self._player_potential_scale)
+    right = closest_player_potential(frame[44:66], frame[88:90],
+                                     self._player_potential_scale)
+    attack, defence = (left, right) if self._attacking_left else (right, left)
+    return (ball_potential(advance, self._ball_potential_scale) + attack,
+            ball_potential(-advance, self._ball_potential_scale) + defence)
 
   def _make_env(self):
     return football_env.create_environment(
@@ -276,7 +323,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._set_active_players()
     if self._frozen_defence_path is not None:
       self._frozen_state = {'lstm_h': None, 'lstm_c': None, 'done': None}
-    if self._ball_potential_scale:
+    if self._ball_potential_scale or self._player_potential_scale:
       self._set_potentials(observations)
     return observations
 
@@ -395,18 +442,18 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     # +1 means the ball is on the goal being attacked, -1 the other end.
     advance = float(frame[88] if self._attacking_left else -frame[88])
     self._advance_sum += advance
-    if self._ball_potential_scale:
-      # Each side is shaped on the ball's progress toward the goal IT
-      # attacks, from its own potential, so the sum stays zero-sum up to the
-      # constant (1 - gamma) term.  A finished episode enters the absorbing
-      # state, whose potential is zero, whatever the final frame shows.
+    if self._ball_potential_scale or self._player_potential_scale:
+      # Shape each side from its own combined state potential. The terminal
+      # state has zero potential even on timeout or a conceded goal, so the
+      # discounted shaping return is always exactly -Phi(initial state).
+      current_attack, current_defence = self._potentials(observations)
       attack_shaping = potential_shaping(
           self._attack_potential,
-          ball_potential(advance, self._ball_potential_scale),
+          current_attack,
           self._potential_gamma, done)
       defence_shaping = potential_shaping(
           self._defence_potential,
-          ball_potential(-advance, self._ball_potential_scale),
+          current_defence,
           self._potential_gamma, done)
       attacking_team = 0 if self._attacking_left else 1
       shaping = np.zeros(self.num_agents, dtype=np.float32)
@@ -417,10 +464,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._shaping_return[1 - attacking_team] += defence_shaping
       rewards = rewards + shaping
       if not done:
-        self._attack_potential = ball_potential(
-            advance, self._ball_potential_scale)
-        self._defence_potential = ball_potential(
-            -advance, self._ball_potential_scale)
+        self._attack_potential = current_attack
+        self._defence_potential = current_defence
     self.rewards[:] = rewards
     self.terminals.fill(done)
     self.truncations.fill(False)

@@ -14,8 +14,8 @@
 
 set -euo pipefail
 
-REPO=/scratch/fyy2003/repos/football
-ENV_PREFIX="$REPO/.venv"
+REPO=${REPO:-/scratch/fyy2003/repos/football}
+ENV_PREFIX=${ENV_PREFIX:-/scratch/fyy2003/repos/football/.venv}
 TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 
@@ -48,6 +48,9 @@ GAE_LAMBDA=${GAE_LAMBDA:-0.98}
 # Phi = -BALL_POTENTIAL * distance-to-goal-line.  Leaves the optimal policy
 # unchanged; 0 disables.  Uses GAMMA above as the discount.
 BALL_POTENTIAL=${BALL_POTENTIAL:-0}
+# Distance of the nearest teammate to the ball, combined
+# with the ball potential before the same discounted potential difference.
+PLAYER_POTENTIAL=${PLAYER_POTENTIAL:-0}
 UPDATE_EPOCHS=${UPDATE_EPOCHS:-4}
 BPTT_HORIZON=${BPTT_HORIZON:-32}
 MINIBATCH_SEGMENTS=${MINIBATCH_SEGMENTS:-32}
@@ -146,6 +149,7 @@ cd "$RUN_ROOT"
   --clip-coef "$CLIP_COEF" \
   --gamma "$GAMMA" \
   --ball-potential "$BALL_POTENTIAL" \
+  --player-potential "$PLAYER_POTENTIAL" \
   --gae-lambda "$GAE_LAMBDA" \
   --update-epochs "$UPDATE_EPOCHS" \
   --bptt-horizon "$BPTT_HORIZON" \

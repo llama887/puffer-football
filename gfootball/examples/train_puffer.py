@@ -512,6 +512,11 @@ def build_parser():
                            'which leaves the optimal policy unchanged (Ng, '
                            'Harada & Russell 1999); 0 disables')
   parser.add_argument('--gae-lambda', type=float, default=0.95)
+  parser.add_argument('--player-potential', type=float, default=0.0,
+                      help='potential-based shaping scale for the closest '
+                           'teammate to the ball; added to '
+                           'the ball potential with the same gamma and '
+                           'zero terminal potential; 0 disables')
   parser.add_argument('--update-epochs', type=int, default=4)
   parser.add_argument('--bptt-horizon', type=int, default=32)
   parser.add_argument('--minibatch-segments', type=int, default=16)
@@ -605,6 +610,7 @@ def main():
       # Shaping is a training signal only.  Promotion is judged on goals, so
       # the evaluation envs are built without it.
       ball_potential_scale=args.ball_potential,
+      player_potential_scale=args.player_potential,
       potential_gamma=args.gamma)
   if not 0 <= args.start_level < args.curriculum_levels:
     raise ValueError('start-level must be inside the curriculum')
@@ -630,6 +636,7 @@ def main():
           args.promotion_worst_template_threshold),
       'promotion_early_abort_margin': args.promotion_early_abort_margin,
       'ball_potential': args.ball_potential,
+      'player_potential': args.player_potential,
       'frozen_defence_gate': args.frozen_defence_gate,
       'greedy_promotion_episodes': args.greedy_promotion_episodes,
       'selfplay_promotion_episodes': args.selfplay_promotion_episodes,
