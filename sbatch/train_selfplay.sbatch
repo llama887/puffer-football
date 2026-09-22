@@ -4,20 +4,21 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:h100:1
+#SBATCH --partition=h100_tandon
 #SBATCH --time=48:00:00
-#SBATCH --account=torch_pr_1066_tandon_advanced
+#SBATCH --account=torch_pr_355_tandon_advanced
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=fyy2003@nyu.edu
-#SBATCH --chdir=/scratch/fyy2003/repos/football
-#SBATCH --output=/scratch/fyy2003/repos/football/sbatch/logs/%x-%j.out
-#SBATCH --error=/scratch/fyy2003/repos/football/sbatch/logs/%x-%j.err
+#SBATCH --mail-user=wz2445@nyu.edu
+#SBATCH --chdir=/scratch/wz2445/puffer-football
+#SBATCH --output=/scratch/wz2445/puffer-football/sbatch/logs/%x-%j.out
+#SBATCH --error=/scratch/wz2445/puffer-football/sbatch/logs/%x-%j.err
 
 set -euo pipefail
 
-REPO=/scratch/fyy2003/repos/football
+REPO=/scratch/wz2445/puffer-football
 ENV_PREFIX="$REPO/.venv"
-TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
-RUN_ROOT=/scratch/fyy2003/experiments/football-selfplay-${SLURM_JOB_ID}
+TOOLCHAIN_PREFIX=/scratch/wz2445/.conda/envs/football-fast
+RUN_ROOT=/scratch/wz2445/experiments/football-selfplay-${SLURM_JOB_ID}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
@@ -64,9 +65,9 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
-if [ -f /scratch/fyy2003/repos/Puffer-Soccer/.env ]; then
+if [ -f /scratch/wz2445/Puffer-Soccer/.env ]; then
   set -a
-  source /scratch/fyy2003/repos/Puffer-Soccer/.env
+  source /scratch/wz2445/Puffer-Soccer/.env
   set +a
 fi
 
@@ -90,8 +91,8 @@ cleanup() {
 trap cleanup EXIT
 
 nvidia-smi
-nice -n 19 /scratch/fyy2003/repos/Puffer-Soccer/.venv/bin/python -u \
-  /scratch/fyy2003/repos/Puffer-Soccer/sbatch/gpu_heartbeat.py &
+nice -n 19 /scratch/wz2445/Puffer-Soccer/.venv/bin/python -u \
+  /scratch/wz2445/Puffer-Soccer/sbatch/gpu_heartbeat.py &
 HEARTBEAT_PID=$!
 echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
 
