@@ -2,6 +2,7 @@
 
 import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import gymnasium
 import numpy as np
@@ -9,7 +10,8 @@ import torch
 
 from gfootball.examples.train_puffer import (
     ACTION_NAMES, SHOT_ACTION, FootballPolicy, build_config, build_parser,
-    explained_variance, generalized_advantages, normalize_advantages,
+    evaluate_promotion, explained_variance, generalized_advantages,
+    normalize_advantages,
     policy_diagnostics, promotion_passes, promotion_statistics)
 
 
@@ -79,6 +81,181 @@ def test_bptt_forward_matches_stepwise_rollout_with_episode_resets():
   stepwise_values = torch.stack(stepwise_values, dim=1)
   assert torch.allclose(logits, stepwise_logits, atol=1e-5)
   assert torch.allclose(values, stepwise_values, atol=1e-5)
+
+
+def test_promotion_matches_training_across_rollout_and_episode_boundaries():
+  """Promotion must replay the same recurrent windows as PufferLib rollout."""
+  for horizon in (3, 32):
+    torch.manual_seed(7)
+    steps = 2 * horizon + 5
+    observations = torch.randn(1, steps + 1, 115)
+    done = torch.zeros(1, steps + 1, dtype=torch.bool)
+    done[0, [2, horizon + 2, steps]] = True
+
+    class RecordingPolicy(FootballPolicy):
+      def forward_eval(self, observations, state):
+        logits, values = super().forward_eval(observations, state)
+        self.recorded_logits.append(logits.clone())
+        self.recorded_values.append(values.clone())
+        return logits, values
+
+    class TrajectoryEnv:
+      def reset(self, seed):
+        self.step_index = 0
+        self.episode_length = 0
+        return observations[:, 0].numpy(), []
+
+      def step(self, actions):
+        self.step_index += 1
+        self.episode_length += 1
+        terminals = done[:, self.step_index].numpy()
+        infos = []
+        if terminals[0]:
+          infos.append({'curriculum_success': 1.0,
+                        'curriculum_template': 0,
+                        'episode_length': self.episode_length})
+          self.episode_length = 0
+        return (observations[:, self.step_index].numpy(), np.zeros(1),
+                terminals, np.zeros(1, dtype=bool), infos)
+
+    policy = RecordingPolicy(_env(), hidden_size=16)
+    policy.recorded_logits, policy.recorded_values = [], []
+    expected_logits, expected_values = [], []
+    with torch.no_grad():
+      # PufferLib starts each rollout window from zero, regardless of which
+      # episodes ended inside it. PPO replays these same windows from zero.
+      for start in range(0, steps, horizon):
+        stop = min(start + horizon, steps)
+        logits, values = policy(observations[:, start:stop],
+                                {'done': done[:, start:stop]})
+        expected_logits.append(logits)
+        expected_values.append(values.flatten())
+    metrics = evaluate_promotion(policy, TrajectoryEnv(), 3, 17, 'cpu', horizon)
+    assert policy.training  # Evaluation restores the caller's mode.
+    assert metrics['promotion_episodes'] == 3
+    assert metrics['promotion_recurrent_horizon'] == horizon
+    assert torch.allclose(torch.cat(policy.recorded_logits),
+                          torch.cat(expected_logits), atol=1e-6)
+    assert torch.allclose(torch.cat(policy.recorded_values),
+                          torch.cat(expected_values), atol=1e-6)
+
+
+class _ScriptedEnv:
+  """One agent row; every episode lasts `length` steps and ends as told."""
+
+  def __init__(self, length, successes):
+    self.length = length
+    self.successes = list(successes)
+    self.actions = []
+
+  def reset(self, seed):
+    self.step_index = 0
+    self.episode = 0
+    return np.random.RandomState(seed).randn(1, 115).astype(np.float32), []
+
+  def step(self, actions):
+    self.actions.append(int(np.asarray(actions).reshape(-1)[0]))
+    self.step_index += 1
+    infos = []
+    terminal = self.step_index % self.length == 0
+    if terminal:
+      success = self.successes[self.episode % len(self.successes)]
+      infos.append({'curriculum_success': float(success),
+                    'curriculum_template': self.episode % 8,
+                    'episode_length': self.length})
+      self.episode += 1
+    observation = np.random.RandomState(self.step_index).randn(
+        1, 115).astype(np.float32)
+    return (observation, np.zeros(1), np.array([terminal]),
+            np.zeros(1, dtype=bool), infos)
+
+
+def test_greedy_promotion_takes_the_argmax_action():
+  torch.manual_seed(3)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  # Make the actor decisive so argmax and sampling visibly differ.
+  with torch.no_grad():
+    policy.actor.weight.mul_(50)
+  env = _ScriptedEnv(length=4, successes=[1])
+  logits_seen = []
+  original = policy.forward_eval
+
+  def recording_forward_eval(observations, state):
+    logits, values = original(observations, state)
+    logits_seen.append(logits.clone())
+    return logits, values
+
+  policy.forward_eval = recording_forward_eval
+  metrics = evaluate_promotion(policy, env, 2, 5, 'cpu', 4, greedy=True)
+  assert metrics['promotion_greedy'] == 1.0
+  assert metrics['promotion_aborted'] == 0.0
+  expected = [int(logits.argmax(dim=-1)[0]) for logits in logits_seen]
+  assert env.actions == expected
+
+
+def test_promotion_early_abort_stops_hopeless_evaluations():
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  hopeless = _ScriptedEnv(length=2, successes=[0])
+  metrics = evaluate_promotion(
+      policy, hopeless, 40, 1, 'cpu', 8, early_abort=(6, 0.4))
+  assert metrics['promotion_aborted'] == 1.0
+  assert metrics['promotion_episodes'] == 6
+  assert metrics['promotion_success_rate'] == 0.0
+  assert not promotion_passes(metrics, 0.6, 0.4)
+
+  promising = _ScriptedEnv(length=2, successes=[1, 1, 0])
+  metrics = evaluate_promotion(
+      policy, promising, 12, 1, 'cpu', 8, early_abort=(6, 0.4))
+  assert metrics['promotion_aborted'] == 0.0
+  assert metrics['promotion_episodes'] == 12
+
+
+def test_defaults_lower_entropy_and_spend_less_on_evaluation():
+  args = build_parser().parse_args(['--device', 'cpu'])
+  assert args.ent_coef == 0.001
+  assert args.promotion_interval == 100
+  assert args.promotion_episodes == 256
+  assert args.frozen_defence_gate is True
+  assert args.greedy_promotion_episodes > 0
+  # Per 100 epochs the original schedule ran 4 x 256 held-out episodes and
+  # the first frozen-gate schedule 512 + 128 + 128, which measured at half
+  # the job.  The gate plus both diagnostics must stay well under either.
+  assert (args.promotion_episodes + args.greedy_promotion_episodes +
+          args.selfplay_promotion_episodes) <= 2 * 256
+
+
+def test_every_level_is_score_gated_by_default():
+  args = build_parser().parse_args(['--device', 'cpu'])
+  assert args.scored_promotion_levels is None
+  args = build_parser().parse_args(
+      ['--device', 'cpu', '--scored-promotion-levels', '4'])
+  assert args.scored_promotion_levels == 4
+
+
+def test_gate_averages_the_two_weakest_templates():
+  episodes = []
+  for template in range(8):
+    rate = 0.3 if template == 7 else 0.7
+    episodes.extend({
+        'curriculum_template': template,
+        'curriculum_success': float(index < rate * 10),
+    } for index in range(10))
+  metrics = promotion_statistics(episodes)
+  assert math.isclose(metrics['promotion_worst_template_success_rate'], 0.3)
+  assert math.isclose(
+      metrics['promotion_worst_two_template_success_rate'], 0.5)
+  # One weak template no longer blocks promotion on its own ...
+  assert promotion_passes(metrics, 0.6, 0.4)
+  # ... but a genuine hole in two templates still does.
+  episodes[-20:] = ({
+      'curriculum_template': 6 + (index >= 10),
+      'curriculum_success': float(index % 10 < 2),
+  } for index in range(20))
+  metrics = promotion_statistics(episodes)
+  assert math.isclose(
+      metrics['promotion_worst_two_template_success_rate'], 0.2)
+  assert not promotion_passes(metrics, 0.6, 0.4)
 
 
 def test_episode_end_clears_recurrent_memory():
@@ -177,6 +354,21 @@ def test_config_satisfies_pufferlib_batching_constraints():
   assert segments >= num_agents
   # One segment per agent per epoch keeps rollout and BPTT state aligned.
   assert segments == num_agents
+
+
+def test_shaping_controls_share_discount_and_stay_out_of_promotion():
+  """CLI scales stay opt-in and promotion construction receives neither."""
+  from gfootball.examples.train_puffer import _make_promotion_env
+  defaults = build_parser().parse_args([])
+  assert defaults.ball_potential == defaults.player_potential == 0
+  args = build_parser().parse_args([
+      '--ball-potential', '1', '--player-potential', '0.3', '--gamma', '0.997'])
+  assert args.player_potential == 0.3
+  assert build_config(args, 660)['gamma'] == 0.997
+  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
+    _make_promotion_env(args, SimpleNamespace(value=4))
+  assert 'ball_potential_scale' not in make.call_args.kwargs
+  assert 'player_potential_scale' not in make.call_args.kwargs
 
 
 def test_update_epochs_cover_the_active_data_at_least_once():

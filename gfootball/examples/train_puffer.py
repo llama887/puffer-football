@@ -23,6 +23,9 @@ import pufferlib.pytorch
 
 from gfootball.env.puffer_env import make_vector_env
 from gfootball.env import football_action_set
+# Re-exported: scripts and tests import the policy from this module.
+from gfootball.env.puffer_policy import (  # noqa: F401
+    FootballPolicy, RunningNormalizer, save_policy_snapshot)
 from gfootball.curriculum import (
     ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, ATTACKER_ONLY_LEVELS,
     SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS)
@@ -92,10 +95,16 @@ def promotion_statistics(episodes):
       template: sum(values) / len(values)
       for template, values in by_template.items()
   }
+  ranked = sorted(template_rates.values())
   metrics = {
       'promotion_success_rate': success_rate,
-      'promotion_worst_template_success_rate': (
-          min(template_rates.values()) if template_rates else 0.0),
+      'promotion_worst_template_success_rate': ranked[0] if ranked else 0.0,
+      # One template is a 32-64 episode bin, so a single worst template
+      # flickers around the threshold from check to check.  Averaging the two
+      # weakest still refuses a policy with a hole in it while halving the
+      # noise the gate has to see through.
+      'promotion_worst_two_template_success_rate': (
+          sum(ranked[:2]) / len(ranked[:2]) if ranked else 0.0),
       'promotion_templates_covered': float(len(template_rates)),
   }
   metrics.update({
@@ -107,15 +116,27 @@ def promotion_statistics(episodes):
 
 
 def promotion_passes(metrics, success_threshold, worst_template_threshold):
+  """Overall success and the mean of the two weakest templates both pass."""
   return (
       metrics['promotion_templates_covered'] == SPAWN_TEMPLATE_COUNT and
       metrics['promotion_success_rate'] >= success_threshold and
-      metrics['promotion_worst_template_success_rate'] >=
+      metrics['promotion_worst_two_template_success_rate'] >=
       worst_template_threshold)
 
 
-def evaluate_promotion(policy, vecenv, episodes, seed, device):
-  """Run policy-only episodes on spawn templates excluded from training."""
+def evaluate_promotion(policy, vecenv, episodes, seed, device,
+                       recurrent_horizon, greedy=False, early_abort=None):
+  """Evaluate with the same recurrent windows as PufferLib training rollouts.
+
+  `greedy` takes the argmax action instead of sampling, which shows whether
+  the network has actually learned a shot underneath a near-uniform
+  distribution.  `early_abort` is an optional `(after_episodes, min_rate)`
+  pair: once that many episodes are in, a success rate below the floor ends
+  the evaluation early, since it cannot pass the gate and the remaining
+  episodes would only refine a number nobody acts on.
+  """
+  if recurrent_horizon < 1:
+    raise ValueError('recurrent_horizon must be positive')
   observations, _ = vecenv.reset(seed=seed)
   generator = torch.Generator(device=device).manual_seed(seed)
   state = {'lstm_h': None, 'lstm_c': None, 'done': None}
@@ -123,24 +144,39 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
   action_counts = torch.zeros(len(ACTION_NAMES), dtype=torch.long)
   active_logits_rows = []
   decisions = 0
+  steps = 0
+  aborted = False
   was_training = policy.training
   policy.eval()
   try:
     while len(rows) < episodes:
+      if early_abort is not None and len(rows) >= early_abort[0]:
+        rate = sum(float(row['curriculum_success']) for row in rows) / len(rows)
+        if rate < early_abort[1]:
+          aborted = True
+          break
+      # PuffeRL.evaluate starts every rollout window from zero memory. Keep
+      # this clock independent of episode resets, just like the collector.
+      if steps % recurrent_horizon == 0:
+        state['lstm_h'] = state['lstm_c'] = None
       observation_tensor = torch.as_tensor(observations, device=device)
       active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
       with torch.no_grad():
         logits, _ = policy.forward_eval(observation_tensor, state)
         active_logits_rows.append(logits[active].float().cpu())
-        actions = torch.multinomial(
-            torch.softmax(logits.float(), dim=-1), 1,
-            generator=generator).squeeze(-1)
+        if greedy:
+          actions = logits.argmax(dim=-1)
+        else:
+          actions = torch.multinomial(
+              torch.softmax(logits.float(), dim=-1), 1,
+              generator=generator).squeeze(-1)
       active_actions = actions[active].cpu()
       action_counts += torch.bincount(
           active_actions, minlength=len(ACTION_NAMES))
       decisions += active_actions.numel()
       observations, _, terminals, _, infos = vecenv.step(
           actions.cpu().numpy())
+      steps += 1
       state['done'] = torch.as_tensor(
           np.asarray(terminals), device=device)
       for info in infos:
@@ -151,6 +187,9 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
   metrics = promotion_statistics(rows)
   diagnostics = policy_diagnostics(torch.cat(active_logits_rows))
   metrics.update({
+      'promotion_recurrent_horizon': float(recurrent_horizon),
+      'promotion_greedy': float(greedy),
+      'promotion_aborted': float(aborted),
       'promotion_episodes': float(len(rows)),
       'promotion_mean_episode_length': sum(
           row['episode_length'] for row in rows) / len(rows),
@@ -172,128 +211,6 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
       },
   })
   return metrics
-
-
-class RunningNormalizer(torch.nn.Module):
-  """Per-feature running standardization of observations.
-
-  simple115v2 is wildly unbalanced for this task: measured on the curriculum,
-  the twenty-one other players' relative positions carry ~8x the magnitude and
-  ~5x the variance of the ball's relative position, which is the one feature
-  that actually matters.  Standardizing each feature puts them on equal footing
-  so the first layer does not have to learn a 8x weight ratio to compensate.
-  """
-
-  def __init__(self, size, epsilon=1e-4, clip=10.0):
-    super().__init__()
-    self.clip = clip
-    self.register_buffer('mean', torch.zeros(size))
-    self.register_buffer('var', torch.ones(size))
-    self.register_buffer('count', torch.full((), float(epsilon)))
-
-  @torch.no_grad()
-  def update(self, observations):
-    """Chan et al. parallel variance update from one rollout."""
-    batch = observations.reshape(-1, observations.shape[-1]).float()
-    if batch.shape[0] < 2:
-      return
-    batch_count = batch.new_tensor(float(batch.shape[0]))
-    batch_mean = batch.mean(0)
-    batch_var = batch.var(0, unbiased=False)
-    delta = batch_mean - self.mean
-    total = self.count + batch_count
-    combined = (self.var * self.count + batch_var * batch_count +
-                delta.square() * self.count * batch_count / total)
-    self.mean.copy_(self.mean + delta * batch_count / total)
-    self.var.copy_(combined / total)
-    self.count.copy_(total)
-
-  def forward(self, observations):
-    normalized = (observations - self.mean) * torch.rsqrt(self.var + 1e-8)
-    return normalized.clamp(-self.clip, self.clip)
-
-
-class FootballPolicy(torch.nn.Module):
-  """Shared trunk into an LSTM, then an actor head and a value head."""
-
-  is_continuous = False
-
-  def __init__(self, env, hidden_size=256):
-    super().__init__()
-    observation_size = int(np.prod(env.single_observation_space.shape))
-    self.hidden_size = hidden_size
-    self.normalizer = RunningNormalizer(observation_size)
-    self.encoder = torch.nn.Sequential(
-        pufferlib.pytorch.layer_init(
-            torch.nn.Linear(observation_size, hidden_size)),
-        torch.nn.ReLU(),
-        pufferlib.pytorch.layer_init(
-            torch.nn.Linear(hidden_size, hidden_size)),
-        torch.nn.ReLU(),
-        torch.nn.LayerNorm(hidden_size),
-    )
-    self.cell = torch.nn.LSTMCell(hidden_size, hidden_size)
-    for name, parameter in self.cell.named_parameters():
-      if 'bias' in name:
-        torch.nn.init.constant_(parameter, 0)
-      else:
-        torch.nn.init.orthogonal_(parameter, 1.0)
-    self.actor = pufferlib.pytorch.layer_init(
-        torch.nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
-    self.critic = pufferlib.pytorch.layer_init(
-        torch.nn.Linear(hidden_size, 1), std=1.0)
-
-  def _recurrent_state(self, state, rows, reference):
-    hidden = state.get('lstm_h')
-    cell = state.get('lstm_c')
-    if hidden is None or cell is None:
-      hidden = reference.new_zeros(rows, self.hidden_size, dtype=torch.float32)
-      cell = torch.zeros_like(hidden)
-    return hidden.float(), cell.float()
-
-  @staticmethod
-  def _reset_finished(hidden, cell, done):
-    """Zero the recurrent state of any row whose episode just ended."""
-    if done is None:
-      return hidden, cell
-    keep = (~done.bool()).to(hidden.dtype).unsqueeze(-1)
-    return hidden * keep, cell * keep
-
-  def forward_eval(self, observations, state):
-    """Advance one environment step for every agent row."""
-    observations = observations.float()
-    hidden, cell = self._recurrent_state(
-        state, observations.shape[0], observations)
-    hidden, cell = self._reset_finished(hidden, cell, state.get('done'))
-    encoded = self.encoder(self.normalizer(observations))
-    hidden, cell = self.cell(encoded, (hidden, cell))
-    state['lstm_h'] = hidden
-    state['lstm_c'] = cell
-    return self.actor(hidden), self.critic(hidden).squeeze(-1)
-
-  def forward(self, observations, state=None):
-    """Backprop through time over a (segments, horizon) minibatch."""
-    if observations.dim() == 2:
-      return self.forward_eval(observations, dict(state or {}))
-    state = dict(state or {})
-    segments, horizon = observations.shape[:2]
-    observations = observations.float()
-    encoded = self.encoder(self.normalizer(
-        observations.reshape(segments * horizon, -1))).view(
-            segments, horizon, self.hidden_size)
-    hidden, cell = self._recurrent_state(state, segments, observations)
-    done = state.get('done')
-    outputs = []
-    for step in range(horizon):
-      hidden, cell = self._reset_finished(
-          hidden, cell, None if done is None else done[:, step])
-      hidden, cell = self.cell(encoded[:, step], (hidden, cell))
-      outputs.append(hidden)
-    hidden = torch.stack(outputs, dim=1).reshape(
-        segments * horizon, self.hidden_size)
-    state['lstm_h'] = hidden.detach()
-    state['lstm_c'] = cell.detach()
-    return self.actor(hidden), self.critic(hidden).view(segments, horizon)
 
 
 class FootballPuffeRL(pufferl.PuffeRL):
@@ -488,7 +405,7 @@ def _base_config():
     sys.argv = original_argv
 
 
-def _make_promotion_env(args, curriculum_level_value):
+def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
   return make_vector_env(
       num_envs=args.promotion_workers, num_workers=args.promotion_workers,
       batch_size=args.promotion_workers, reserved_cpus=0,
@@ -500,7 +417,33 @@ def _make_promotion_env(args, curriculum_level_value):
       attacker_only_levels=args.attacker_only_levels,
       curriculum_level_value=curriculum_level_value,
       sort_players=args.sort_players,
-      curriculum_evaluation=True)
+      curriculum_evaluation=True,
+      frozen_defence_path=frozen_defence_path,
+      frozen_defence_horizon=args.bptt_horizon)
+
+
+def _run_promotion(args, policy, level_value, level, device, episodes,
+                   frozen_defence_path=None, greedy=False, early_abort=None):
+  """One held-out evaluation on a fresh promotion env.
+
+  A fresh env per evaluation is deliberate.  Reusing one deadlocks:
+  evaluate_promotion returns as soon as it has enough episodes, so the vecenv
+  is left mid-flight with outstanding send/recv pairs and the next reset()
+  never completes.
+  """
+  promotion_env = _make_promotion_env(args, level_value, frozen_defence_path)
+  try:
+    return evaluate_promotion(
+        policy, promotion_env, episodes,
+        args.seed + 1000000 + 10000 * level, device,
+        recurrent_horizon=args.bptt_horizon, greedy=greedy,
+        early_abort=early_abort)
+  finally:
+    promotion_env.close()
+
+
+def _prefixed(prefix, metrics):
+  return {prefix + name: value for name, value in metrics.items()}
 
 
 def build_parser():
@@ -515,24 +458,65 @@ def build_parser():
   parser.add_argument('--curriculum-window', type=int, default=20)
   parser.add_argument('--curriculum-success-threshold', type=float, default=0.6)
   parser.add_argument('--attacker-only-levels', type=int, default=None)
-  parser.add_argument('--promotion-interval', type=int, default=50)
+  # Evaluation budget.  256 episodes every 25 epochs was ~40% of a ten-hour
+  # job; 512 + 128 + 128 every 100 epochs against a frozen defence (slower per
+  # episode, the defence is a network in every worker) came to ~50%.  This
+  # schedule is 256 + 64 + 64 every 100 epochs, and a hopeless gate stops at
+  # 64 episodes.
+  parser.add_argument('--promotion-interval', type=int, default=100)
   parser.add_argument('--promotion-episodes', type=int, default=256)
   parser.add_argument('--promotion-workers', type=int, default=30)
   parser.add_argument('--promotion-worst-template-threshold', type=float,
                       default=0.4)
-  parser.add_argument('--scored-promotion-levels', type=int, default=4,
-                      help='levels below this advance only on the score gate')
+  parser.add_argument('--promotion-early-abort-margin', type=float,
+                      default=0.2,
+                      help='stop the gate evaluation after a quarter of its '
+                           'episodes when success is this far below the '
+                           'threshold; 0 disables')
+  parser.add_argument('--frozen-defence-gate',
+                      action=argparse.BooleanOptionalAction, default=True,
+                      help='gate promotion against a frozen snapshot of the '
+                           'policy taken on entering the level, instead of '
+                           'the live self-play opponent')
+  parser.add_argument('--greedy-promotion-episodes', type=int, default=64,
+                      help='extra argmax-action evaluation per promotion '
+                           'check (diagnostic only); 0 disables')
+  parser.add_argument('--selfplay-promotion-episodes', type=int, default=64,
+                      help='extra live self-play evaluation per promotion '
+                           'check when the gate is frozen-defence '
+                           '(diagnostic only, comparable to older runs); '
+                           '0 disables')
+  # Timed promotion was added when no run could clear level 0, so that the
+  # later levels were at least visited.  Once level 3 fell, two seeds rode the
+  # 200-epoch timer from level 4 to level 20 with success at zero.  Mastery
+  # is the goal, so every level is score-gated unless a job says otherwise.
+  parser.add_argument('--scored-promotion-levels', type=int, default=None,
+                      help='levels below this advance only on the score '
+                           'gate; default: every level')
   parser.add_argument('--timed-promotion-epochs', type=int, default=200,
                       help='at or above --scored-promotion-levels, also '
                            'advance after this many epochs on a level')
   parser.add_argument('--anneal-lr', action=argparse.BooleanOptionalAction,
                       default=False)
   parser.add_argument('--learning-rate', type=float, default=3e-4)
-  parser.add_argument('--ent-coef', type=float, default=0.01)
+  # At 0.01 the entropy bonus matched the policy-gradient term in size and
+  # every run stayed within 10% of a uniform policy after 3000+ epochs.
+  parser.add_argument('--ent-coef', type=float, default=0.001)
   parser.add_argument('--vf-coef', type=float, default=0.5)
   parser.add_argument('--clip-coef', type=float, default=0.2)
   parser.add_argument('--gamma', type=float, default=0.99)
+  parser.add_argument('--ball-potential', type=float, default=0.0,
+                      help='potential-based shaping scale k: each side is '
+                           'rewarded gamma*Phi(s\')-Phi(s) with Phi = -k * '
+                           '(distance of the ball from the goal it attacks), '
+                           'which leaves the optimal policy unchanged (Ng, '
+                           'Harada & Russell 1999); 0 disables')
   parser.add_argument('--gae-lambda', type=float, default=0.95)
+  parser.add_argument('--player-potential', type=float, default=0.0,
+                      help='potential-based shaping scale for the closest '
+                           'teammate to the ball; added to '
+                           'the ball potential with the same gamma and '
+                           'zero terminal potential; 0 disables')
   parser.add_argument('--update-epochs', type=int, default=4)
   parser.add_argument('--bptt-horizon', type=int, default=32)
   parser.add_argument('--minibatch-segments', type=int, default=16)
@@ -605,6 +589,8 @@ def main():
     # The advantage schedule has every player active from level 0, so there
     # is no attacker-only prefix to configure.
     args.attacker_only_levels = 0 if advantage_schedule else ATTACKER_ONLY_LEVELS
+  if args.scored_promotion_levels is None:
+    args.scored_promotion_levels = args.curriculum_levels
   if args.device == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA training requested but no GPU is visible')
   os.makedirs(args.data_dir, exist_ok=True)
@@ -620,7 +606,12 @@ def main():
       curriculum_success_threshold=args.curriculum_success_threshold,
       attacker_only_levels=args.attacker_only_levels,
       sort_players=args.sort_players,
-      centralized_curriculum=True)
+      centralized_curriculum=True,
+      # Shaping is a training signal only.  Promotion is judged on goals, so
+      # the evaluation envs are built without it.
+      ball_potential_scale=args.ball_potential,
+      player_potential_scale=args.player_potential,
+      potential_gamma=args.gamma)
   if not 0 <= args.start_level < args.curriculum_levels:
     raise ValueError('start-level must be inside the curriculum')
   env.curriculum_level_value.value = args.start_level
@@ -643,6 +634,12 @@ def main():
       'promotion_workers': args.promotion_workers,
       'promotion_worst_template_threshold': (
           args.promotion_worst_template_threshold),
+      'promotion_early_abort_margin': args.promotion_early_abort_margin,
+      'ball_potential': args.ball_potential,
+      'player_potential': args.player_potential,
+      'frozen_defence_gate': args.frozen_defence_gate,
+      'greedy_promotion_episodes': args.greedy_promotion_episodes,
+      'selfplay_promotion_episodes': args.selfplay_promotion_episodes,
   }, sort_keys=True), flush=True)
 
   policy = FootballPolicy(env, hidden_size=args.hidden_size).to(args.device)
@@ -655,25 +652,40 @@ def main():
     })
   trainer = FootballPuffeRL(config, env, policy, logger=logger)
   level_entry_epoch = 0
+  # The gate opponent is the policy as it was on entering the level.  Against
+  # the live self-play opponent, "attackers score 60%" was a moving target:
+  # every improvement in attack was matched by the same network's defence.
+  frozen_defence_path = None
+  if args.frozen_defence_gate:
+    frozen_defence_path = os.path.join(args.data_dir, 'frozen_defence.pt')
+    save_policy_snapshot(policy, frozen_defence_path)
+  early_abort = None
+  if args.promotion_early_abort_margin > 0:
+    early_abort = (
+        max(SPAWN_TEMPLATE_COUNT * 4, args.promotion_episodes // 4),
+        args.curriculum_success_threshold - args.promotion_early_abort_margin)
   try:
     while trainer.global_step < config['total_timesteps']:
       if trainer.epoch % args.promotion_interval == 0:
         level = env.curriculum_level_value.value
-        # Build a fresh promotion env per evaluation.  Reusing one deadlocks:
-        # evaluate_promotion returns as soon as it has enough episodes, so the
-        # vecenv is left mid-flight with outstanding send/recv pairs and the
-        # next reset() never completes.
-        promotion_env = _make_promotion_env(args, env.curriculum_level_value)
-        try:
-          metrics = evaluate_promotion(
-              trainer.uncompiled_policy, promotion_env,
-              args.promotion_episodes,
-              args.seed + 1000000 + 10000 * level, args.device)
-        finally:
-          promotion_env.close()
+        started = time.time()
+        metrics = _run_promotion(
+            args, trainer.uncompiled_policy, env.curriculum_level_value,
+            level, args.device, args.promotion_episodes,
+            frozen_defence_path=frozen_defence_path, early_abort=early_abort)
         scored_gate = promotion_passes(
             metrics, args.curriculum_success_threshold,
             args.promotion_worst_template_threshold)
+        if args.greedy_promotion_episodes > 0:
+          metrics.update(_prefixed('greedy_', _run_promotion(
+              args, trainer.uncompiled_policy, env.curriculum_level_value,
+              level, args.device, args.greedy_promotion_episodes,
+              frozen_defence_path=frozen_defence_path, greedy=True)))
+        if frozen_defence_path and args.selfplay_promotion_episodes > 0:
+          metrics.update(_prefixed('selfplay_', _run_promotion(
+              args, trainer.uncompiled_policy, env.curriculum_level_value,
+              level, args.device, args.selfplay_promotion_episodes)))
+        metrics['promotion_wall_seconds'] = time.time() - started
         epochs_here = trainer.epoch - level_entry_epoch
         # The later levels are too hard to gate on mastery, so they advance on
         # a schedule instead; a level still promotes early if it is mastered.
@@ -684,9 +696,17 @@ def main():
         if advanced:
           env.curriculum_level_value.value = level + 1
           level_entry_epoch = trainer.epoch
+          if frozen_defence_path:
+            # The next level's opponent is the policy that just cleared this
+            # one.  Keep a per-level copy so any level can be re-evaluated.
+            save_policy_snapshot(trainer.uncompiled_policy, os.path.join(
+                args.data_dir, 'frozen_defence_level{}.pt'.format(level + 1)))
+            save_policy_snapshot(
+                trainer.uncompiled_policy, frozen_defence_path)
         trainer.record_promotion(level, metrics, advanced)
         print('PROMOTION {}'.format(json.dumps({
             'level': level, 'advanced': advanced,
+            'gate': 'frozen' if frozen_defence_path else 'selfplay',
             'reason': ('scored' if scored_gate else
                        'timed' if timed_gate else 'none'),
             'epochs_on_level': epochs_here,

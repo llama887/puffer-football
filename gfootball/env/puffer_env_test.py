@@ -1,16 +1,46 @@
 """Smoke test for the native PufferLib interface."""
 
 import math
+from types import SimpleNamespace
 
 from absl.testing import absltest
+import gymnasium
 import numpy as np
+import torch
 
 from gfootball.env import puffer_env
 from gfootball.env import config
+from gfootball.env.puffer_policy import FootballPolicy, save_policy_snapshot
 from gfootball.curriculum import (
-    ALIGNMENT_SCHEDULE, ATTACKER_ONLY_LEVELS, KEEPER_LEVELS, TOTAL_LEVELS,
-    curriculum_episode, curriculum_geometry, curriculum_state,
-    keeper_spawn_offset)
+    ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, ALIGNMENT_SCHEDULE,
+    ATTACKER_ONLY_LEVELS, FULL_LATERAL_HALF_WIDTH, KEEPER_LEVELS,
+    MAX_GOALSIDE_BLOCKERS, NARROW_LATERAL_HALF_WIDTH, SPAWN_TEMPLATE_COUNT,
+    TOTAL_LEVELS, advantage_for_level, curriculum_episode,
+    curriculum_geometry, curriculum_state, expected_goalside_blockers,
+    goalside_blockers, keeper_spawn_offset, lateral_half_width)
+
+
+def _advantage_config(advantage, evaluation=True, seed=0):
+  return config.Config({
+      'level': ADVANTAGE_ENV_NAME,
+      'advantage': advantage,
+      'curriculum_level': 0,
+      'curriculum_levels': ADVANTAGE_LEVELS,
+      'curriculum_evaluation': evaluation,
+      'game_engine_random_seed': seed,
+      'players': ['agent:left_players=11,right_players=11'],
+  })
+
+
+def _blocker_world_offsets(cfg, count):
+  """Lateral world offsets (defender minus ball) of the first blockers."""
+  scenario = cfg.ScenarioConfig()
+  attack_right = scenario.ball_position[0] > 0
+  defence = scenario.right_team if attack_right else scenario.left_team
+  # AddPlayer flips both axes for the right team, so undo that for world y.
+  side = -1.0 if attack_right else 1.0
+  return [side * defence[1 + rank].position[1] - scenario.ball_position[1]
+          for rank in range(count)]
 
 
 class PufferEnvTest(absltest.TestCase):
@@ -432,6 +462,375 @@ class PufferEnvTest(absltest.TestCase):
       self.assertEqual(truncations.shape, (44,))
     finally:
       env.close()
+
+  def test_level_zero_lateral_band_stays_inside_the_scoreable_region(self):
+    """Level 0 must not spawn the ball where nothing can score from.
+
+    Measured at advantage 1.00: success is 0.98 at |ball_y| 0.088 but 0.13 by
+    0.113, and always-shot is zero beyond 0.079.  The anchor level has to sit
+    inside that, and the band has to widen monotonically after it.
+    """
+    self.assertAlmostEqual(
+        lateral_half_width(1.0), NARROW_LATERAL_HALF_WIDTH)
+    self.assertAlmostEqual(
+        lateral_half_width(0.4), FULL_LATERAL_HALF_WIDTH)
+    self.assertAlmostEqual(
+        lateral_half_width(0.0), FULL_LATERAL_HALF_WIDTH)
+    widths = [lateral_half_width(advantage_for_level(level))
+              for level in range(ADVANTAGE_LEVELS)]
+    self.assertEqual(widths, sorted(widths))
+    self.assertLess(widths[0], 0.10)
+    # The band holds at level-0 width until the blocker fade is complete
+    # (level 5), so the two ramps never move on the same level.
+    for level in range(6):
+      self.assertAlmostEqual(widths[level], NARROW_LATERAL_HALF_WIDTH)
+      self.assertAlmostEqual(
+          expected_goalside_blockers(advantage_for_level(level)),
+          1.0 + 0.2 * level)
+    self.assertGreater(widths[6], NARROW_LATERAL_HALF_WIDTH)
+    self.assertAlmostEqual(
+        expected_goalside_blockers(advantage_for_level(6)), 2.2)
+
+    cfg = config.Config({
+        'level': ADVANTAGE_ENV_NAME,
+        'advantage': 1.0,
+        'curriculum_level': 0,
+        'curriculum_levels': ADVANTAGE_LEVELS,
+        'curriculum_evaluation': True,
+        'game_engine_random_seed': 0,
+        'players': ['agent:left_players=11,right_players=11'],
+    })
+    templates = {}
+    for episode in range(2 * SPAWN_TEMPLATE_COUNT):
+      cfg.NewScenario(episode)
+      ball_y = cfg.ScenarioConfig().ball_position[1]
+      self.assertLessEqual(abs(ball_y), NARROW_LATERAL_HALF_WIDTH + 1e-6)
+      templates[int(cfg._values['curriculum_episode_template'])] = ball_y
+    self.assertEqual(len(templates), SPAWN_TEMPLATE_COUNT)
+    # Every template still names a distinct lateral spawn inside the band.
+    self.assertEqual(len(set(round(y, 6) for y in templates.values())),
+                     SPAWN_TEMPLATE_COUNT)
+
+  def test_goalside_blockers_fade_in_by_at_most_a_fifth_per_level(self):
+    """No level may add a whole blocker at once; level 0 keeps exactly one.
+
+    Three seeds cleared levels 0-2 and collapsed on level 3, which is where
+    the rounded schedule dropped the second blocker in one step.
+    """
+    draws = [(k + 0.5) / 1000 for k in range(1000)]
+    for draw in (0.0, 0.5, 0.999):
+      self.assertEqual(goalside_blockers(1.0, draw), 1)
+      self.assertEqual(goalside_blockers(0.0, draw), MAX_GOALSIDE_BLOCKERS)
+    means = []
+    for level in range(ADVANTAGE_LEVELS):
+      advantage = advantage_for_level(level)
+      counts = [goalside_blockers(advantage, draw) for draw in draws]
+      self.assertLessEqual(max(counts) - min(counts), 1)
+      means.append(sum(counts) / len(counts))
+      self.assertAlmostEqual(
+          means[-1], expected_goalside_blockers(advantage), places=2)
+    self.assertEqual(means, sorted(means))
+    for earlier, later in zip(means, means[1:]):
+      self.assertLessEqual(later - earlier, 0.2 + 1e-6)
+    # Level 3 used to be a hard two-blocker level; now it is 60% likely.
+    self.assertAlmostEqual(means[3], 1.6, places=2)
+
+  def test_level_zero_blocker_geometry_is_the_measured_anchor(self):
+    cfg = _advantage_config(1.0)
+    for _ in range(2 * SPAWN_TEMPLATE_COUNT):
+      cfg.NewScenario()
+      self.assertEqual(cfg._values['curriculum_goalside_defenders'], 1)
+      (offset,) = _blocker_world_offsets(cfg, 1)
+      self.assertAlmostEqual(offset, -0.085, delta=0.02)
+
+  def test_second_blocker_mirrors_the_first_and_the_third_fills_the_middle(self):
+    """Two blockers must leave the shot line open; only the third closes it."""
+    cfg = _advantage_config(0.75)  # exactly two blockers, no fade
+    for _ in range(2 * SPAWN_TEMPLATE_COUNT):
+      cfg.NewScenario()
+      self.assertEqual(cfg._values['curriculum_goalside_defenders'], 2)
+      first, second = _blocker_world_offsets(cfg, 2)
+      self.assertAlmostEqual(first, -0.085, delta=0.02)
+      self.assertAlmostEqual(second, 0.085, delta=0.02)
+    cfg = _advantage_config(0.5)  # exactly three
+    cfg.NewScenario()
+    self.assertEqual(cfg._values['curriculum_goalside_defenders'], 3)
+    self.assertAlmostEqual(_blocker_world_offsets(cfg, 3)[2], 0.0, delta=0.02)
+
+  def test_blocker_fade_is_deterministic_per_episode_and_hits_its_rate(self):
+    # NewScenario(inc) ADVANCES the episode counter by inc, so a fresh config
+    # per pass is what makes the two passes see the same episode numbers.
+    def counts_for(passes):
+      cfg = _advantage_config(advantage_for_level(3), evaluation=False)
+      counts = []
+      for _ in range(passes):
+        cfg.NewScenario()
+        counts.append(cfg._values['curriculum_goalside_defenders'])
+      return counts
+
+    counts = counts_for(200)
+    self.assertEqual(counts, counts_for(200))
+    self.assertEqual(set(counts), {1, 2})
+    self.assertAlmostEqual(sum(counts) / len(counts), 1.6, delta=0.1)
+
+  def test_potential_shaping_telescopes_to_minus_the_start_potential(self):
+    """Ng et al. (1999): F = gamma*Phi(s') - Phi(s), Phi(absorbing) = 0.
+
+    Discounted over any complete trajectory the shaping is -Phi(s_0),
+    independent of its length, intermediate states, or terminal outcome.
+    This is the return identity required for policy invariance.
+    """
+    gamma, scale = 0.9, 2.0
+    self.assertEqual(puffer_env.ball_potential(1.0, scale), 0.0)
+    self.assertEqual(puffer_env.ball_potential(-1.0, scale), -4.0)
+    for advances in ([0.9, 0.95, 1.0], [0.9, 0.5, 0.2, 0.7], [0.3]):
+      potentials = [puffer_env.ball_potential(a, scale) for a in advances]
+      total = 0.0
+      for index in range(1, len(potentials)):
+        total += gamma ** (index - 1) * puffer_env.potential_shaping(
+            potentials[index - 1], potentials[index], gamma, terminal=False)
+      # The episode ends: the absorbing state has zero potential.
+      total += gamma ** (len(potentials) - 1) * puffer_env.potential_shaping(
+          potentials[-1], potentials[-1], gamma, terminal=True)
+      self.assertAlmostEqual(total, -potentials[0])
+    # Progress toward the goal is paid for as it happens ...
+    self.assertGreater(puffer_env.potential_shaping(
+        puffer_env.ball_potential(0.9, 1.0),
+        puffer_env.ball_potential(0.95, 1.0), 1.0, False), 0)
+    # ... and moving away costs the same amount back.
+    self.assertLess(puffer_env.potential_shaping(
+        puffer_env.ball_potential(0.95, 1.0),
+        puffer_env.ball_potential(0.9, 1.0), 1.0, False), 0)
+
+  def test_closest_player_potential_geometry_and_identity_changes(self):
+    """Use the ball position, physical distance, and only present players."""
+    positions = np.full((11, 2), -1.0)
+    ball = np.array((0.6, 0.1))
+    positions[0] = (0.4, 0.1)
+    positions[1] = (0.5, 0.3)  # Nearer in x, farther in physical distance.
+    self.assertAlmostEqual(
+        puffer_env.closest_player_potential(positions, ball, 2), -0.4)
+    mirrored = -positions
+    mirrored[2:] = -1  # Absent sentinel does not get mirrored.
+    self.assertAlmostEqual(
+        puffer_env.closest_player_potential(mirrored, -ball, 2), -0.4)
+    positions[[0, 1]] = positions[[1, 0]]
+    self.assertAlmostEqual(
+        puffer_env.closest_player_potential(positions, ball, 2), -0.4)
+    # Moving the ball onto a stationary teammate changes the potential.
+    self.assertEqual(
+        puffer_env.closest_player_potential(positions, positions[1], 2), 0)
+    positions[0] = ball
+    self.assertEqual(puffer_env.closest_player_potential(positions, ball, 2), 0)
+    self.assertEqual(
+        puffer_env.closest_player_potential(np.full((11, 2), -1), ball, 2), 0)
+
+  def test_both_teams_measure_distance_to_the_same_ball(self):
+    """Opponent positions and ball share row zero's absolute coordinate frame."""
+    env = object.__new__(puffer_env.FootballPufferEnv)
+    env._ball_potential_scale = 0.0
+    env._player_potential_scale = 1.0
+    raw = np.zeros((22, 115), dtype=np.float32)
+    raw[0, :22] = raw[0, 44:66] = -1
+    raw[0, :2] = (0.4, 0.1)
+    raw[0, 44:46] = (0.9, 0.1)
+    raw[0, 88:90] = (0.6, 0.1)
+    env._attacking_left = True
+    np.testing.assert_allclose(env._potentials(raw), (-0.2, -0.3), atol=1e-6)
+    env._attacking_left = False
+    np.testing.assert_allclose(env._potentials(raw), (-0.3, -0.2), atol=1e-6)
+    raw[0, 88:90] = (0.5, 0.1)
+    np.testing.assert_allclose(env._potentials(raw), (-0.4, -0.1), atol=1e-6)
+
+  def test_combined_potentials_telescope_across_real_episode_resets(self):
+    """Both teams preserve score returns with combined or player-only shaping.
+
+    Replay identical engine actions with shaping on/off through two complete
+    episodes. Check the discounted return identity separately for each side,
+    including terminal correction and potential initialisation after reset.
+    Stacked observations must use their newest absolute frame.
+    """
+    gamma = 0.997
+    for ball_scale, player_scale, stack in ((1.0, 0.3, 1), (0.0, 1.0, 4)):
+      common = dict(env_name=ADVANTAGE_ENV_NAME, frame_stack=stack,
+                    seed=7, curriculum_levels=ADVANTAGE_LEVELS)
+      env = puffer_env.FootballPufferEnv(
+          **common, ball_potential_scale=ball_scale,
+          player_potential_scale=player_scale, potential_gamma=gamma)
+      plain = puffer_env.FootballPufferEnv(**common)
+      try:
+        env.reset()
+        plain.reset()
+        for episode in range(2):
+          initial = np.array([env._attack_potential, env._defence_potential])
+          attacking_left = env._attacking_left
+          discounted = np.zeros(2)
+          for step in range(500):
+            actions = np.full(22, 5, dtype=np.int32)
+            _, rewards, terminals, _, infos = env.step(actions)
+            _, scores, plain_terminals, _, plain_infos = plain.step(actions)
+            np.testing.assert_array_equal(terminals, plain_terminals)
+            difference = (rewards - scores).reshape(2, 11)
+            np.testing.assert_allclose(
+                difference, np.repeat(difference[:, :1], 11, axis=1), atol=1e-6)
+            sides = difference[:, 0] if attacking_left else difference[::-1, 0]
+            discounted += gamma ** step * sides
+            if infos:
+              for key in ('curriculum_success', 'left_episode_return',
+                          'right_episode_return', 'score_reward'):
+                self.assertEqual(infos[0][key], plain_infos[0][key])
+              break
+          self.assertTrue(infos, 'test must reach a terminal state')
+          np.testing.assert_allclose(discounted, -initial, atol=2e-6)
+      finally:
+        env.close()
+        plain.close()
+
+  def test_shaping_scales_reject_nonfinite_or_negative_values(self):
+    """Invalid potentials must fail before constructing an engine instance."""
+    for name in ('ball_potential_scale', 'player_potential_scale'):
+      for value in (-1, float('inf'), float('nan')):
+        with self.assertRaisesRegex(ValueError, 'finite and non-negative'):
+          puffer_env.FootballPufferEnv(**{name: value})
+
+  def test_ball_shaping_rewards_both_sides_and_leaves_success_alone(self):
+    scale, gamma = 1.0, 0.99
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
+        curriculum_levels=ADVANTAGE_LEVELS, ball_potential_scale=scale,
+        potential_gamma=gamma)
+    plain = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
+        curriculum_levels=ADVANTAGE_LEVELS)
+    try:
+      env.reset()
+      plain.reset()
+      attacking = slice(0, 11) if env._attacking_left else slice(11, 22)
+      defending = slice(11, 22) if env._attacking_left else slice(0, 11)
+      start_potential = env._attack_potential
+      self.assertLess(start_potential, 0.0)
+      # Sprint toward the goal with everyone: the ball carrier advances it.
+      shaped_total = 0.0
+      infos = []
+      for _ in range(400):
+        previous_attack = env._attack_potential
+        previous_defence = env._defence_potential
+        _, rewards, _, _, infos = env.step(np.full(22, 5, dtype=np.int32))
+        _, plain_rewards, _, _, _ = plain.step(np.full(22, 5, dtype=np.int32))
+        attack = float(rewards[attacking][0])
+        defence = float(rewards[defending][0])
+        # Every row on a side sees the same shaping ...
+        np.testing.assert_allclose(rewards[attacking], attack, atol=1e-6)
+        np.testing.assert_allclose(rewards[defending], defence, atol=1e-6)
+        score = float(plain_rewards[attacking][0])
+        shaped_total += attack - score
+        if infos:
+          # The absorbing state has zero potential, so the last step refunds
+          # each side exactly its own potential, whatever the final frame.
+          self.assertAlmostEqual(attack - score, -previous_attack, places=5)
+          self.assertAlmostEqual(defence + score, -previous_defence, places=5)
+          break
+        # ... and until then the two sides are shaped in opposite directions,
+        # up to the (1 - gamma) constant, on top of the zero-sum score.
+        self.assertAlmostEqual(
+            (attack - score) + (defence + score), 2 * scale * (1 - gamma),
+            places=5)
+      self.assertTrue(infos)
+      info = infos[0]
+      # Success and the score returns are untouched by shaping.
+      self.assertIn(info['curriculum_success'], (0.0, 1.0))
+      self.assertEqual(
+          info['curriculum_success'],
+          float(info['left_episode_return' if env._attacking_left
+                     else 'right_episode_return'] > 0))
+      self.assertAlmostEqual(
+          info['attacking_shaping_return'], shaped_total, places=4)
+      # Telescoped: the episode's shaping is -Phi(s_0) plus the tiny drift,
+      # which for a spawn near the goal is a small number, not a goal's worth.
+      self.assertLess(abs(shaped_total + start_potential), 0.05 + 0.02)
+      self.assertLess(abs(shaped_total), 0.2)
+    finally:
+      env.close()
+      plain.close()
+
+  def test_frozen_defence_plays_the_defending_side_from_a_snapshot(self):
+    """The frozen side is hidden from the caller and acted in the worker."""
+    torch.manual_seed(0)
+    spaces = SimpleNamespace(
+        single_observation_space=gymnasium.spaces.Box(
+            low=-1, high=1, shape=(115,), dtype=np.float32),
+        single_action_space=gymnasium.spaces.Discrete(19))
+    snapshot = self.create_tempfile('frozen_defence.pt').full_path
+    save_policy_snapshot(FootballPolicy(spaces, hidden_size=16), snapshot)
+
+    class RecordingEnv:
+      def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.sent = []
+
+      def step(self, actions):
+        self.sent.append(np.asarray(actions).copy())
+        return self.wrapped.step(actions)
+
+      def __getattr__(self, name):
+        return getattr(self.wrapped, name)
+
+    def make():
+      env = puffer_env.FootballPufferEnv(
+          env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
+          curriculum_levels=ADVANTAGE_LEVELS, frozen_defence_path=snapshot,
+          frozen_defence_horizon=4)
+      env._env = RecordingEnv(env._env)
+      return env
+
+    env = make()
+    twin = make()
+    try:
+      observations, _ = env.reset()
+      twin.reset()
+      defending = env._defending_rows()
+      attacking = slice(0, 11) if env._attacking_left else slice(11, 22)
+      self.assertFalse(env._active_mask[defending].any())
+      self.assertTrue(env._active_mask[attacking].all())
+      self.assertFalse(np.any(observations[defending]))
+      self.assertTrue(np.all(np.any(observations[attacking], axis=1)))
+      # The rows the snapshot acts on are the real, un-hidden observations.
+      self.assertTrue(np.all(np.any(
+          env._full_observations[defending], axis=1)))
+
+      raw_env = env._env.unwrapped._env
+      before = np.concatenate([raw_env.observation()['left_team'],
+                               raw_env.observation()['right_team']])
+      requested = np.full(22, 5, dtype=np.int32)
+      infos = []
+      for _ in range(12):
+        env.step(requested)
+        twin.step(requested)
+      sent = np.stack(env._env.sent)
+      np.testing.assert_array_equal(sent[:, attacking], 5)
+      defender_actions = sent[:, defending]
+      self.assertTrue(np.any(defender_actions != 5))
+      self.assertGreater(len(np.unique(defender_actions)), 1)
+      # Same seed, same snapshot, same caller actions: the same defence.
+      np.testing.assert_array_equal(
+          defender_actions, np.stack(twin._env.sent)[:, defending])
+      after = np.concatenate([raw_env.observation()['left_team'],
+                              raw_env.observation()['right_team']])
+      movement = np.linalg.norm(after - before, axis=1)
+      self.assertGreater(movement[defending].max(), 0.002)
+
+      for _ in range(400):
+        _, _, _, _, infos = env.step(requested)
+        if infos:
+          break
+      self.assertTrue(infos)
+      self.assertEqual(infos[0]['curriculum_frozen_defence'], 1.0)
+      self.assertIn(infos[0]['curriculum_attacking_left'], (0.0, 1.0))
+      # A new episode starts the frozen memory from zero again.
+      self.assertIsNone(env._frozen_state['lstm_h'])
+    finally:
+      env.close()
+      twin.close()
 
 
 if __name__ == '__main__':
