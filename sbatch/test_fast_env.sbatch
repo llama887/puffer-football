@@ -4,10 +4,10 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --time=01:00:00
-#SBATCH --account=torch_pr_1066_tandon_advanced
-#SBATCH --chdir=/scratch/fyy2003/repos/football
-#SBATCH --output=/scratch/fyy2003/repos/football/sbatch/logs/%x-%j.out
-#SBATCH --error=/scratch/fyy2003/repos/football/sbatch/logs/%x-%j.err
+#SBATCH --account=torch_pr_355_general
+#SBATCH --chdir=/scratch/wz2445/puffer-football
+#SBATCH --output=/scratch/wz2445/puffer-football/sbatch/logs/%x-%j.out
+#SBATCH --error=/scratch/wz2445/puffer-football/sbatch/logs/%x-%j.err
 
 set -euo pipefail
 
@@ -17,9 +17,9 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
-REPO=/scratch/fyy2003/repos/football
+REPO=/scratch/wz2445/puffer-football
 ENV_PREFIX="$REPO/.venv"
-TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
+TOOLCHAIN_PREFIX=/scratch/wz2445/.conda/envs/football-fast
 mkdir -p sbatch/logs
 
 bash scripts/setup_uv_hpc.sh

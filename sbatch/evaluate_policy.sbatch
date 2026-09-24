@@ -4,20 +4,20 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=01:00:00
-#SBATCH --account=torch_pr_1066_tandon_advanced
-#SBATCH --chdir=/scratch/fyy2003/repos/football
-#SBATCH --output=/scratch/fyy2003/repos/football/sbatch/logs/%x-%j.out
-#SBATCH --error=/scratch/fyy2003/repos/football/sbatch/logs/%x-%j.err
+#SBATCH --account=torch_pr_355_general
+#SBATCH --chdir=/scratch/wz2445/puffer-football
+#SBATCH --output=/scratch/wz2445/puffer-football/sbatch/logs/%x-%j.out
+#SBATCH --error=/scratch/wz2445/puffer-football/sbatch/logs/%x-%j.err
 
 set -euo pipefail
 
 CHECKPOINT=${1:?checkpoint path is required}
 ATTACKER_ONLY_LEVELS=${ATTACKER_ONLY_LEVELS:-0}
 CURRICULUM_LEVEL=${CURRICULUM_LEVEL:-0}
-REPO=/scratch/fyy2003/repos/football
+REPO=/scratch/wz2445/puffer-football
 ENV_PREFIX="$REPO/.venv"
-TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
-RUN_DIR=/scratch/fyy2003/experiments/football-policy-eval-${SLURM_JOB_ID}
+TOOLCHAIN_PREFIX=/scratch/wz2445/.conda/envs/football-fast
+RUN_DIR=/scratch/wz2445/experiments/football-policy-eval-${SLURM_JOB_ID}
 
 module purge
 if [ ! -x "$ENV_PREFIX/bin/python" ]; then
@@ -33,9 +33,9 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
-if [ -f /scratch/fyy2003/repos/Puffer-Soccer/.env ]; then
+if [ -f /scratch/wz2445/Puffer-Soccer/.env ]; then
   set -a
-  source /scratch/fyy2003/repos/Puffer-Soccer/.env
+  source /scratch/wz2445/Puffer-Soccer/.env
   set +a
 fi
 

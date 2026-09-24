@@ -19,6 +19,7 @@ Level 0 is deliberately the easiest possible scoring task -- open goal,
 carrier aligned -- and is the anchor the whole schedule is measured against.
 """
 
+import math
 import random
 
 ATTACKER_ORDER = (2, 1, 10, 7, 9, 8, 3, 6, 4, 5, 0)
@@ -63,14 +64,78 @@ OPEN_GOAL_KEEPER_OFFSET = 0.36
 # the player count fixed keeps the observation distribution fixed too, which
 # the player-count schedule cannot do.
 #
-# Measured with fixed-action reference policies (96 episodes per point):
+# STALE -- do not trust the table below.  Re-measured at advantage 1.00 with
+# 1024 episodes per policy: always-shot scores 0.316 where the table records
+# 1.00, and uniform scores 0.151 where it records 0.38.  The rest of the row
+# has not been re-derived, so the difficulty calibration that cites it is
+# unverified.
 #   advantage 1.00 0.90 0.80 0.70 0.60 0.55 0.50 0.45 0.40
 #   shot      1.00 0.73 0.52 0.40 0.30 0.16 0.12 0.08 0.00
 #   uniform   0.38 0.21 0.10 0.14 0.08 0.06 0.05 0.02 0.03
-# Smooth and monotone down to 0.45; below that a constant action cannot score
-# at all and progress depends on learned ball advancing.
 ADVANTAGE_ENV_NAME = '11_vs_11_advantage'
 ADVANTAGE_LEVELS = 21
+
+# Lateral ball-spawn band.  Swept at advantage 1.00 over 32 bands, 2048
+# episodes each, self-play with the final policy of run 16794800:
+#   |ball_y|  0.088  0.096  0.104  0.113  0.121
+#   success    0.98   0.82   0.44   0.13   0.03
+# and always-shot is flat zero beyond |ball_y| 0.079.  The falloff is gradual,
+# so scoring from wide is a real skill rather than a broken spawn.  Level 0 was
+# drawing two of its eight templates from beyond the wall, which is why it
+# never cleared the worst-template gate in 604 promotion evaluations.  Start
+# the band inside the region a policy can already score from and open it to the
+# full width by LATERAL_RAMP_END_ADVANTAGE, so the wide shot is a level of its
+# own instead of a hidden precondition on the anchor level.
+NARROW_LATERAL_HALF_WIDTH = 0.05
+FULL_LATERAL_HALF_WIDTH = 2 / 3 * 0.20
+# The band used to start opening on level 1, at the same time as the ball
+# moved back and the second blocker began to appear.  Three seeds then sat on
+# level 1 for 2500-7500 epochs, all blocked by the negative-edge template
+# (engine-space probes show the spawn geometry is symmetric between attack
+# directions, so that edge is harder in the engine itself).  Hold the band at
+# level-0 width until the blocker fade has finished (advantage 0.75, level 5),
+# then open it over the next seven levels, so each level changes one thing.
+LATERAL_RAMP_START_ADVANTAGE = 0.75
+LATERAL_RAMP_END_ADVANTAGE = 0.40
+
+
+# Goal-side blockers.  The expected count runs linearly from one at advantage
+# 1.00 to MAX_GOALSIDE_BLOCKERS at 0.00.  Rounding that to an integer per level
+# put the second blocker on level 3 in a single step, and dead centre on the
+# shot line: three seeds cleared levels 0-2 and then collapsed there, success
+# falling from 0.56 to 0.12-0.35 over 1300+ epochs without recovering.  The
+# fractional part now fades the next blocker in by probability, so consecutive
+# levels differ by at most one fifth of a blocker, and level 0 is unchanged.
+MAX_GOALSIDE_BLOCKERS = 5
+
+
+def expected_goalside_blockers(advantage):
+  """Mean number of goal-side blockers at this advantage."""
+  advantage = max(0.0, min(1.0, float(advantage)))
+  return 1.0 + (MAX_GOALSIDE_BLOCKERS - 1) * (1.0 - advantage)
+
+
+def goalside_blockers(advantage, draw):
+  """Blockers this episode: the whole part always, the fraction by chance.
+
+  `draw` is a uniform [0, 1) sample from the episode's own generator, so a
+  seed/episode pair still spawns the same scene every time.
+  """
+  expected = expected_goalside_blockers(advantage)
+  whole = int(math.floor(expected + 1e-9))
+  fraction = expected - whole
+  count = whole + (1 if float(draw) < fraction else 0)
+  return max(1, min(MAX_GOALSIDE_BLOCKERS, count))
+
+
+def lateral_half_width(advantage):
+  """Half-width of the lateral ball-spawn band at this advantage."""
+  advantage = max(0.0, min(1.0, float(advantage)))
+  progress = min(1.0, max(0.0, (LATERAL_RAMP_START_ADVANTAGE - advantage) /
+                          (LATERAL_RAMP_START_ADVANTAGE -
+                           LATERAL_RAMP_END_ADVANTAGE)))
+  return (NARROW_LATERAL_HALF_WIDTH +
+          (FULL_LATERAL_HALF_WIDTH - NARROW_LATERAL_HALF_WIDTH) * progress)
 
 
 def advantage_for_level(level, levels=ADVANTAGE_LEVELS):

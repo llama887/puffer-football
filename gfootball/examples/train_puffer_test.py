@@ -2,14 +2,18 @@
 
 import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import gymnasium
 import numpy as np
 import torch
 
+from gfootball.env.puffer_policy import (
+    hidden_size_from_state_dict, upgrade_state_dict)
 from gfootball.examples.train_puffer import (
     ACTION_NAMES, SHOT_ACTION, FootballPolicy, build_config, build_parser,
-    explained_variance, generalized_advantages, normalize_advantages,
+    evaluate_promotion, explained_variance, generalized_advantages,
+    normalize_advantages,
     policy_diagnostics, promotion_passes, promotion_statistics)
 
 
@@ -81,6 +85,181 @@ def test_bptt_forward_matches_stepwise_rollout_with_episode_resets():
   assert torch.allclose(values, stepwise_values, atol=1e-5)
 
 
+def test_promotion_matches_training_across_rollout_and_episode_boundaries():
+  """Promotion must replay the same recurrent windows as PufferLib rollout."""
+  for horizon in (3, 32):
+    torch.manual_seed(7)
+    steps = 2 * horizon + 5
+    observations = torch.randn(1, steps + 1, 115)
+    done = torch.zeros(1, steps + 1, dtype=torch.bool)
+    done[0, [2, horizon + 2, steps]] = True
+
+    class RecordingPolicy(FootballPolicy):
+      def forward_eval(self, observations, state):
+        logits, values = super().forward_eval(observations, state)
+        self.recorded_logits.append(logits.clone())
+        self.recorded_values.append(values.clone())
+        return logits, values
+
+    class TrajectoryEnv:
+      def reset(self, seed):
+        self.step_index = 0
+        self.episode_length = 0
+        return observations[:, 0].numpy(), []
+
+      def step(self, actions):
+        self.step_index += 1
+        self.episode_length += 1
+        terminals = done[:, self.step_index].numpy()
+        infos = []
+        if terminals[0]:
+          infos.append({'curriculum_success': 1.0,
+                        'curriculum_template': 0,
+                        'episode_length': self.episode_length})
+          self.episode_length = 0
+        return (observations[:, self.step_index].numpy(), np.zeros(1),
+                terminals, np.zeros(1, dtype=bool), infos)
+
+    policy = RecordingPolicy(_env(), hidden_size=16)
+    policy.recorded_logits, policy.recorded_values = [], []
+    expected_logits, expected_values = [], []
+    with torch.no_grad():
+      # PufferLib starts each rollout window from zero, regardless of which
+      # episodes ended inside it. PPO replays these same windows from zero.
+      for start in range(0, steps, horizon):
+        stop = min(start + horizon, steps)
+        logits, values = policy(observations[:, start:stop],
+                                {'done': done[:, start:stop]})
+        expected_logits.append(logits)
+        expected_values.append(values.flatten())
+    metrics = evaluate_promotion(policy, TrajectoryEnv(), 3, 17, 'cpu', horizon)
+    assert policy.training  # Evaluation restores the caller's mode.
+    assert metrics['promotion_episodes'] == 3
+    assert metrics['promotion_recurrent_horizon'] == horizon
+    assert torch.allclose(torch.cat(policy.recorded_logits),
+                          torch.cat(expected_logits), atol=1e-6)
+    assert torch.allclose(torch.cat(policy.recorded_values),
+                          torch.cat(expected_values), atol=1e-6)
+
+
+class _ScriptedEnv:
+  """One agent row; every episode lasts `length` steps and ends as told."""
+
+  def __init__(self, length, successes):
+    self.length = length
+    self.successes = list(successes)
+    self.actions = []
+
+  def reset(self, seed):
+    self.step_index = 0
+    self.episode = 0
+    return np.random.RandomState(seed).randn(1, 115).astype(np.float32), []
+
+  def step(self, actions):
+    self.actions.append(int(np.asarray(actions).reshape(-1)[0]))
+    self.step_index += 1
+    infos = []
+    terminal = self.step_index % self.length == 0
+    if terminal:
+      success = self.successes[self.episode % len(self.successes)]
+      infos.append({'curriculum_success': float(success),
+                    'curriculum_template': self.episode % 8,
+                    'episode_length': self.length})
+      self.episode += 1
+    observation = np.random.RandomState(self.step_index).randn(
+        1, 115).astype(np.float32)
+    return (observation, np.zeros(1), np.array([terminal]),
+            np.zeros(1, dtype=bool), infos)
+
+
+def test_greedy_promotion_takes_the_argmax_action():
+  torch.manual_seed(3)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  # Make the actor decisive so argmax and sampling visibly differ.
+  with torch.no_grad():
+    policy.actor.weight.mul_(50)
+  env = _ScriptedEnv(length=4, successes=[1])
+  logits_seen = []
+  original = policy.forward_eval
+
+  def recording_forward_eval(observations, state):
+    logits, values = original(observations, state)
+    logits_seen.append(logits.clone())
+    return logits, values
+
+  policy.forward_eval = recording_forward_eval
+  metrics = evaluate_promotion(policy, env, 2, 5, 'cpu', 4, greedy=True)
+  assert metrics['promotion_greedy'] == 1.0
+  assert metrics['promotion_aborted'] == 0.0
+  expected = [int(logits.argmax(dim=-1)[0]) for logits in logits_seen]
+  assert env.actions == expected
+
+
+def test_promotion_early_abort_stops_hopeless_evaluations():
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  hopeless = _ScriptedEnv(length=2, successes=[0])
+  metrics = evaluate_promotion(
+      policy, hopeless, 40, 1, 'cpu', 8, early_abort=(6, 0.4))
+  assert metrics['promotion_aborted'] == 1.0
+  assert metrics['promotion_episodes'] == 6
+  assert metrics['promotion_success_rate'] == 0.0
+  assert not promotion_passes(metrics, 0.6, 0.4)
+
+  promising = _ScriptedEnv(length=2, successes=[1, 1, 0])
+  metrics = evaluate_promotion(
+      policy, promising, 12, 1, 'cpu', 8, early_abort=(6, 0.4))
+  assert metrics['promotion_aborted'] == 0.0
+  assert metrics['promotion_episodes'] == 12
+
+
+def test_defaults_lower_entropy_and_spend_less_on_evaluation():
+  args = build_parser().parse_args(['--device', 'cpu'])
+  assert args.ent_coef == 0.001
+  assert args.promotion_interval == 100
+  assert args.promotion_episodes == 256
+  assert args.frozen_defence_gate is True
+  assert args.greedy_promotion_episodes > 0
+  # Per 100 epochs the original schedule ran 4 x 256 held-out episodes and
+  # the first frozen-gate schedule 512 + 128 + 128, which measured at half
+  # the job.  The gate plus both diagnostics must stay well under either.
+  assert (args.promotion_episodes + args.greedy_promotion_episodes +
+          args.selfplay_promotion_episodes) <= 2 * 256
+
+
+def test_every_level_is_score_gated_by_default():
+  args = build_parser().parse_args(['--device', 'cpu'])
+  assert args.scored_promotion_levels is None
+  args = build_parser().parse_args(
+      ['--device', 'cpu', '--scored-promotion-levels', '4'])
+  assert args.scored_promotion_levels == 4
+
+
+def test_gate_averages_the_two_weakest_templates():
+  episodes = []
+  for template in range(8):
+    rate = 0.3 if template == 7 else 0.7
+    episodes.extend({
+        'curriculum_template': template,
+        'curriculum_success': float(index < rate * 10),
+    } for index in range(10))
+  metrics = promotion_statistics(episodes)
+  assert math.isclose(metrics['promotion_worst_template_success_rate'], 0.3)
+  assert math.isclose(
+      metrics['promotion_worst_two_template_success_rate'], 0.5)
+  # One weak template no longer blocks promotion on its own ...
+  assert promotion_passes(metrics, 0.6, 0.4)
+  # ... but a genuine hole in two templates still does.
+  episodes[-20:] = ({
+      'curriculum_template': 6 + (index >= 10),
+      'curriculum_success': float(index % 10 < 2),
+  } for index in range(20))
+  metrics = promotion_statistics(episodes)
+  assert math.isclose(
+      metrics['promotion_worst_two_template_success_rate'], 0.2)
+  assert not promotion_passes(metrics, 0.6, 0.4)
+
+
 def test_episode_end_clears_recurrent_memory():
   torch.manual_seed(0)
   policy = FootballPolicy(_env(), hidden_size=16).eval()
@@ -108,7 +287,7 @@ def test_policy_shapes_and_gradients_flow_to_every_head():
   assert values.shape == (4, 5)
   (logits.square().mean() + values.square().mean()).backward()
   named = dict(policy.named_parameters())
-  for name in ('actor.weight', 'critic.weight', 'cell.weight_ih',
+  for name in ('actor.weight', 'critic.weight', 'rnn.weight_ih_l0',
                'encoder.0.weight'):
     assert named[name].grad is not None
     assert named[name].grad.abs().sum() > 0
@@ -179,6 +358,21 @@ def test_config_satisfies_pufferlib_batching_constraints():
   assert segments == num_agents
 
 
+def test_shaping_controls_share_discount_and_stay_out_of_promotion():
+  """CLI scales stay opt-in and promotion construction receives neither."""
+  from gfootball.examples.train_puffer import _make_promotion_env
+  defaults = build_parser().parse_args([])
+  assert defaults.ball_potential == defaults.player_potential == 0
+  args = build_parser().parse_args([
+      '--ball-potential', '1', '--player-potential', '0.3', '--gamma', '0.997'])
+  assert args.player_potential == 0.3
+  assert build_config(args, 660)['gamma'] == 0.997
+  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
+    _make_promotion_env(args, SimpleNamespace(value=4))
+  assert 'ball_potential_scale' not in make.call_args.kwargs
+  assert 'player_potential_scale' not in make.call_args.kwargs
+
+
 def test_update_epochs_cover_the_active_data_at_least_once():
   for num_segments in (1, 7, 30, 60, 660):
     for requested in (1, 16, 64):
@@ -194,3 +388,54 @@ if __name__ == '__main__':
     if name.startswith('test_'):
       test()
       print('ok', name)
+
+
+def test_fused_lstm_matches_a_stepwise_cell_under_every_reset_pattern():
+  """The nn.LSTM window must reproduce the LSTMCell loop it replaced.
+
+  Runs are cut at every step where any row resets, so a pattern that resets
+  on every step degenerates to one call per step and must still agree.
+  """
+  policy = FootballPolicy(_env(), hidden_size=16)
+  segments, horizon = 6, 8
+  weight_ih = policy.rnn.weight_ih_l0
+  weight_hh = policy.rnn.weight_hh_l0
+  bias = policy.rnn.bias_ih_l0 + policy.rnn.bias_hh_l0
+
+  def stepwise(observations, done):
+    encoded = policy.encoder(policy.normalizer(
+        observations.reshape(segments * horizon, -1))).view(
+            segments, horizon, policy.hidden_size)
+    hidden = torch.zeros(segments, policy.hidden_size)
+    cell = torch.zeros(segments, policy.hidden_size)
+    outputs = []
+    for step in range(horizon):
+      keep = (~done[:, step].bool()).float().unsqueeze(-1)
+      hidden, cell = hidden * keep, cell * keep
+      gates = encoded[:, step] @ weight_ih.T + hidden @ weight_hh.T + bias
+      in_gate, forget, candidate, out_gate = gates.chunk(4, 1)
+      cell = forget.sigmoid() * cell + in_gate.sigmoid() * candidate.tanh()
+      hidden = out_gate.sigmoid() * cell.tanh()
+      outputs.append(hidden)
+    return torch.stack(outputs, dim=1).reshape(-1, policy.hidden_size)
+
+  torch.manual_seed(0)
+  for probability in (0.0, 0.05, 0.5, 1.0):
+    observations = torch.randn(segments, horizon, 115)
+    done = (torch.rand(segments, horizon) < probability)
+    with torch.no_grad():
+      expected = policy.actor(stepwise(observations, done))
+      actual, _ = policy(observations, {'done': done})
+    assert torch.allclose(actual, expected, atol=1e-5), probability
+
+
+def test_legacy_lstmcell_checkpoints_still_load():
+  """Checkpoints written before the nn.LSTM switch must keep working."""
+  policy = FootballPolicy(_env(), hidden_size=16)
+  legacy = {}
+  for key, value in policy.state_dict().items():
+    legacy[key.replace('rnn.', 'cell.').replace('_l0', '')] = value
+  assert 'cell.weight_hh' in legacy
+  assert hidden_size_from_state_dict(legacy) == 16
+  FootballPolicy(_env(), hidden_size=16).load_state_dict(
+      upgrade_state_dict(legacy))
