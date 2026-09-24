@@ -70,14 +70,8 @@ class FootballPolicy(torch.nn.Module):
         torch.nn.ReLU(),
         torch.nn.LayerNorm(hidden_size),
     )
-    # nn.LSTM rather than LSTMCell in a Python loop: the fused kernel covers
-    # a run of steps in one call.  Measured on a real minibatch (32 segments,
-    # horizon 32, late-training reset density) it is ~15% faster than the
-    # loop with several threads, and slightly slower on a single thread,
-    # because resets cut the window into runs of only a step or two.  It is
-    # worth it only alongside --torch-threads.
-    self.rnn = torch.nn.LSTM(hidden_size, hidden_size, batch_first=True)
-    for name, parameter in self.rnn.named_parameters():
+    self.cell = torch.nn.LSTMCell(hidden_size, hidden_size)
+    for name, parameter in self.cell.named_parameters():
       if 'bias' in name:
         torch.nn.init.constant_(parameter, 0)
       else:
@@ -103,20 +97,6 @@ class FootballPolicy(torch.nn.Module):
     keep = (~done.bool()).to(hidden.dtype).unsqueeze(-1)
     return hidden * keep, cell * keep
 
-  @staticmethod
-  def _reset_blocks(done, horizon):
-    """Split a window into runs that contain no reset after their first step.
-
-    Within a run every row carries its memory straight through, which is
-    exactly what nn.LSTM computes, so one call per run reproduces the
-    step-by-step loop while making far fewer calls.
-    """
-    if done is None:
-      return [(0, horizon)]
-    resets = done.bool().any(dim=0)
-    cuts = [0] + [step for step in range(1, horizon) if resets[step]] + [horizon]
-    return list(zip(cuts[:-1], cuts[1:]))
-
   def forward_eval(self, observations, state):
     """Advance one environment step for every agent row."""
     observations = observations.float()
@@ -124,10 +104,7 @@ class FootballPolicy(torch.nn.Module):
         state, observations.shape[0], observations)
     hidden, cell = self._reset_finished(hidden, cell, state.get('done'))
     encoded = self.encoder(self.normalizer(observations))
-    _, (hidden, cell) = self.rnn(
-        encoded.unsqueeze(1), (hidden.unsqueeze(0), cell.unsqueeze(0)))
-    hidden = hidden.squeeze(0)
-    cell = cell.squeeze(0)
+    hidden, cell = self.cell(encoded, (hidden, cell))
     state['lstm_h'] = hidden
     state['lstm_c'] = cell
     return self.actor(hidden), self.critic(hidden).squeeze(-1)
@@ -143,47 +120,62 @@ class FootballPolicy(torch.nn.Module):
         observations.reshape(segments * horizon, -1))).view(
             segments, horizon, self.hidden_size)
     hidden, cell = self._recurrent_state(state, segments, observations)
-    hidden = hidden.unsqueeze(0)
-    cell = cell.unsqueeze(0)
     done = state.get('done')
+    keep = (None if done is None else
+            (~done.bool()).to(hidden.dtype).unsqueeze(-1))
+    # The input half of every LSTM gate depends only on the encoder output,
+    # so it is one GEMM over the whole window instead of one per step.  Only
+    # the recurrent half stays inside the loop.  Same math as LSTMCell.
+    input_gates = torch.nn.functional.linear(encoded, self.cell.weight_ih)
+    fused = encoded.is_cuda
     outputs = []
-    for start, stop in self._reset_blocks(done, horizon):
-      # Only the first step of a run can reset, so mask once per run.
-      hidden, cell = self._reset_finished(
-          hidden, cell, None if done is None else done[:, start])
-      block, (hidden, cell) = self.rnn(encoded[:, start:stop], (hidden, cell))
-      outputs.append(block)
-    hidden = torch.cat(outputs, dim=1).reshape(
+    for step in range(horizon):
+      if keep is not None:
+        hidden = hidden * keep[:, step]
+        cell = cell * keep[:, step]
+      hidden_gates = torch.nn.functional.linear(hidden, self.cell.weight_hh)
+      if fused:
+        # The kernel LSTMCell itself dispatches to on CUDA.
+        hidden, cell, _ = torch.ops.aten._thnn_fused_lstm_cell(
+            input_gates[:, step], hidden_gates, cell,
+            self.cell.bias_ih, self.cell.bias_hh)
+      else:
+        gates = (input_gates[:, step] + hidden_gates +
+                 self.cell.bias_ih + self.cell.bias_hh)
+        in_gate, forget_gate, cell_gate, out_gate = gates.chunk(4, dim=-1)
+        cell = (torch.sigmoid(forget_gate) * cell +
+                torch.sigmoid(in_gate) * torch.tanh(cell_gate))
+        hidden = torch.sigmoid(out_gate) * torch.tanh(cell)
+      outputs.append(hidden)
+    hidden = torch.stack(outputs, dim=1).reshape(
         segments * horizon, self.hidden_size)
     state['lstm_h'] = hidden.detach()
-    state['lstm_c'] = cell.squeeze(0).detach()
+    state['lstm_c'] = cell.detach()
     return self.actor(hidden), self.critic(hidden).view(segments, horizon)
 
 
-# LSTMCell and a one-layer nn.LSTM hold identical parameters in identical
-# gate order, so checkpoints written before the nn.LSTM switch only need
-# their keys renaming.
-_LEGACY_RNN_KEYS = {
-    'cell.weight_ih': 'rnn.weight_ih_l0',
-    'cell.weight_hh': 'rnn.weight_hh_l0',
-    'cell.bias_ih': 'rnn.bias_ih_l0',
-    'cell.bias_hh': 'rnn.bias_hh_l0',
+# Checkpoints from the wesley-speed-improvement runs used a one-layer
+# nn.LSTM named `rnn`.  It holds exactly LSTMCell's parameters in the same
+# gate order, so those checkpoints load here after a key rename.
+_NN_LSTM_KEYS = {
+    'rnn.weight_ih_l0': 'cell.weight_ih',
+    'rnn.weight_hh_l0': 'cell.weight_hh',
+    'rnn.bias_ih_l0': 'cell.bias_ih',
+    'rnn.bias_hh_l0': 'cell.bias_hh',
 }
 
 
 def upgrade_state_dict(state_dict):
-  """Rename an LSTMCell-era checkpoint onto the nn.LSTM parameter names."""
-  if 'cell.weight_hh' not in state_dict:
+  """Rename an nn.LSTM-era checkpoint onto this policy's LSTMCell names."""
+  if 'rnn.weight_hh_l0' not in state_dict:
     return state_dict
-  return {_LEGACY_RNN_KEYS.get(key, key): value
+  return {_NN_LSTM_KEYS.get(key, key): value
           for key, value in state_dict.items()}
 
 
 def hidden_size_from_state_dict(state_dict):
   """Recover the LSTM width so a checkpoint loads without its command line."""
-  key = ('rnn.weight_hh_l0' if 'rnn.weight_hh_l0' in state_dict
-         else 'cell.weight_hh')
-  return int(state_dict[key].shape[1])
+  return int(upgrade_state_dict(state_dict)['cell.weight_hh'].shape[1])
 
 
 def save_policy_snapshot(policy, path):

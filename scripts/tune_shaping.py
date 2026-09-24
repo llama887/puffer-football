@@ -52,7 +52,10 @@ def configuration(index):
       PROMOTION_INTERVAL=100, PROMOTION_EPISODES=256,
       PROMOTION_EARLY_ABORT_MARGIN=0.2,
       GREEDY_PROMOTION_EPISODES=64, SELFPLAY_PROMOTION_EPISODES=64,
-      ENV_NAME='11_vs_11_advantage')
+      ENV_NAME='11_vs_11_advantage',
+      # Throughput only; recorded so a result says how it was trained.
+      ASYNC_COLLECTION=1, ASYNC_PROMOTION=1, COMPILE=1, GPU_FILLER=1,
+      LOCAL_GAME_DATA=1)
 
 
 def run_trial(study, index, steps=STEPS, episodes=256):
@@ -78,7 +81,9 @@ def run_trial(study, index, steps=STEPS, episodes=256):
   print('TUNING_CONFIG ' + json.dumps(config), flush=True)
   subprocess.run(['bash', str(repo / 'sbatch/train_selfplay.sbatch')],
                  env=env, check=True)
-  run_root = Path('/scratch/fyy2003/experiments') / (
+  experiments = Path(os.environ.get(
+      'EXPERIMENTS_DIR', '/scratch/{}/experiments'.format(os.environ['USER'])))
+  run_root = experiments / (
       'football-selfplay-{}-{}'.format(os.environ['SLURM_ARRAY_JOB_ID'], index))
   checkpoints = list((run_root / 'checkpoints').glob('*/model_*.pt'))
   if not checkpoints:
@@ -95,6 +100,9 @@ def run_trial(study, index, steps=STEPS, episodes=256):
   args.promotion_workers = int(os.environ['SLURM_CPUS_PER_TASK']) - 2
   args.promotion_episodes = episodes
   args.frame_stack = 1
+  # The benchmark contract stays synchronous: the first `episodes` to finish
+  # on fixed seeds and opponents, as in every earlier study.
+  args.async_promotion = False
   benchmark = {}
   for level in LEVELS:
     vector = _make_promotion_env(

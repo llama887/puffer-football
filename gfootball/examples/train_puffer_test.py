@@ -12,8 +12,8 @@ from gfootball.env.puffer_policy import (
     hidden_size_from_state_dict, upgrade_state_dict)
 from gfootball.examples.train_puffer import (
     ACTION_NAMES, SHOT_ACTION, FootballPolicy, build_config, build_parser,
-    evaluate_promotion, explained_variance, generalized_advantages,
-    normalize_advantages,
+    evaluate_promotion, evaluate_promotion_async, explained_variance,
+    generalized_advantages, normalize_advantages,
     policy_diagnostics, promotion_passes, promotion_statistics)
 
 
@@ -287,7 +287,7 @@ def test_policy_shapes_and_gradients_flow_to_every_head():
   assert values.shape == (4, 5)
   (logits.square().mean() + values.square().mean()).backward()
   named = dict(policy.named_parameters())
-  for name in ('actor.weight', 'critic.weight', 'rnn.weight_ih_l0',
+  for name in ('actor.weight', 'critic.weight', 'cell.weight_ih',
                'encoder.0.weight'):
     assert named[name].grad is not None
     assert named[name].grad.abs().sum() > 0
@@ -341,7 +341,7 @@ def test_promotion_requires_overall_and_every_heldout_template():
 
 
 def test_config_satisfies_pufferlib_batching_constraints():
-  args = build_parser().parse_args(['--device', 'cpu'])
+  args = build_parser().parse_args(['--device', 'cpu', '--no-async-collection'])
   num_agents = 660
   config = build_config(args, num_agents)
   horizon = config['bptt_horizon']
@@ -383,6 +383,109 @@ def test_update_epochs_cover_the_active_data_at_least_once():
       assert sampled >= 4 * num_segments
 
 
+class _AsyncScriptedPool:
+  """Matches of one agent each, returned in whatever order they finish.
+
+  Match m's episodes last `lengths[m]` steps and succeed iff `successes[m]`.
+  recv() hands back the `batch` matches that are furthest behind in time,
+  like a pool whose fast matches finish more steps.
+  """
+
+  def __init__(self, lengths, successes, batch=2):
+    self.lengths, self.successes, self.batch = lengths, successes, batch
+    self.num_agents = len(lengths)
+    self.driver_env = SimpleNamespace(num_agents=1)
+
+  def async_reset(self, seed):
+    self.seed = seed
+    self.clock = np.zeros(self.num_agents)
+    self.steps = np.zeros(self.num_agents, dtype=int)
+    self.pending = []
+
+  def recv(self):
+    # A short-episode match steps twice as fast in wall time.
+    order = np.argsort(self.clock, kind='stable')[:self.batch]
+    self.pending = order
+    infos = []
+    terminals = np.zeros(len(order), dtype=bool)
+    for position, match in enumerate(order):
+      if self.steps[match] and self.steps[match] % self.lengths[match] == 0:
+        terminals[position] = True
+        infos.append({'curriculum_success': float(self.successes[match]),
+                      'curriculum_template': int(match) % 8,
+                      'episode_length': int(self.lengths[match]),
+                      'env_seed': float(self.seed + match)})
+    observations = np.ones((len(order), 115), dtype=np.float32)
+    return (observations, np.zeros(len(order)), terminals,
+            np.zeros(len(order), dtype=bool), infos, order.copy(),
+            np.ones(len(order), dtype=bool))
+
+  def send(self, actions):
+    for match in self.pending:
+      self.steps[match] += 1
+      self.clock[match] += self.lengths[match] / 10
+
+
+def test_async_promotion_takes_a_fixed_quota_from_every_match():
+  """Short (successful) episodes must not crowd out long (failed) ones."""
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  # Half the matches score in 2 steps, half fail after 20.
+  lengths = [2, 2, 20, 20]
+  pool = _AsyncScriptedPool(lengths, successes=[1, 1, 0, 0])
+  metrics = evaluate_promotion_async(policy, pool, 8, 3, 'cpu', 4)
+  assert metrics['promotion_episodes'] == 8
+  assert metrics['promotion_success_rate'] == 0.5
+
+
+def test_async_promotion_does_not_depend_on_batching_or_timing():
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  lengths = [3, 5, 7, 11, 13]
+  for early_abort in (None, (10, 0.9)):
+    results = []
+    for batch in (1, 2, 4):
+      pool = _AsyncScriptedPool(lengths, successes=[1, 0, 1, 0, 1],
+                                batch=batch)
+      results.append(evaluate_promotion_async(
+          policy, pool, 20, 9, 'cpu', 4, early_abort=early_abort))
+    assert results[0]['promotion_aborted'] == float(early_abort is not None)
+    # Identical up to float summation order in the averaged diagnostics.
+    for other in results[1:]:
+      assert other.keys() == results[0].keys()
+      for name, value in results[0].items():
+        assert math.isclose(other[name], value, rel_tol=1e-6), name
+
+
+def test_masked_losses_equal_the_indexed_losses():
+  """The trainer's masked means are the same numbers as indexing first."""
+  torch.manual_seed(0)
+  mask = torch.rand(6, 5) < 0.6
+  weight = mask.float()
+  advantages = torch.randn(6, 5)
+  ratio = torch.rand(6, 5) + 0.5
+
+  def masked_mean(values):
+    return (values * weight).sum() / weight.sum()
+
+  indexed = normalize_advantages(advantages[mask])
+  expected = torch.max(-indexed * ratio[mask],
+                       -indexed * ratio[mask].clamp(0.8, 1.2)).mean()
+  mean = masked_mean(advantages)
+  std = masked_mean((advantages - mean).square()).sqrt()
+  normalized = (advantages - mean) / std
+  actual = masked_mean(torch.max(-normalized * ratio,
+                                 -normalized * ratio.clamp(0.8, 1.2)))
+  assert torch.isclose(actual, expected, atol=1e-6)
+
+
+def test_async_collection_doubles_the_rollout_buffer():
+  args = build_parser().parse_args(['--device', 'cpu'])
+  assert args.async_collection and args.async_promotion
+  config = build_config(args, 660)
+  assert config['batch_size'] // config['bptt_horizon'] == 2 * 660
+
+
 if __name__ == '__main__':
   for name, test in sorted(dict(globals()).items()):
     if name.startswith('test_'):
@@ -390,52 +493,17 @@ if __name__ == '__main__':
       print('ok', name)
 
 
-def test_fused_lstm_matches_a_stepwise_cell_under_every_reset_pattern():
-  """The nn.LSTM window must reproduce the LSTMCell loop it replaced.
-
-  Runs are cut at every step where any row resets, so a pattern that resets
-  on every step degenerates to one call per step and must still agree.
-  """
-  policy = FootballPolicy(_env(), hidden_size=16)
-  segments, horizon = 6, 8
-  weight_ih = policy.rnn.weight_ih_l0
-  weight_hh = policy.rnn.weight_hh_l0
-  bias = policy.rnn.bias_ih_l0 + policy.rnn.bias_hh_l0
-
-  def stepwise(observations, done):
-    encoded = policy.encoder(policy.normalizer(
-        observations.reshape(segments * horizon, -1))).view(
-            segments, horizon, policy.hidden_size)
-    hidden = torch.zeros(segments, policy.hidden_size)
-    cell = torch.zeros(segments, policy.hidden_size)
-    outputs = []
-    for step in range(horizon):
-      keep = (~done[:, step].bool()).float().unsqueeze(-1)
-      hidden, cell = hidden * keep, cell * keep
-      gates = encoded[:, step] @ weight_ih.T + hidden @ weight_hh.T + bias
-      in_gate, forget, candidate, out_gate = gates.chunk(4, 1)
-      cell = forget.sigmoid() * cell + in_gate.sigmoid() * candidate.tanh()
-      hidden = out_gate.sigmoid() * cell.tanh()
-      outputs.append(hidden)
-    return torch.stack(outputs, dim=1).reshape(-1, policy.hidden_size)
-
-  torch.manual_seed(0)
-  for probability in (0.0, 0.05, 0.5, 1.0):
-    observations = torch.randn(segments, horizon, 115)
-    done = (torch.rand(segments, horizon) < probability)
-    with torch.no_grad():
-      expected = policy.actor(stepwise(observations, done))
-      actual, _ = policy(observations, {'done': done})
-    assert torch.allclose(actual, expected, atol=1e-5), probability
-
-
-def test_legacy_lstmcell_checkpoints_still_load():
-  """Checkpoints written before the nn.LSTM switch must keep working."""
+def test_nn_lstm_checkpoints_still_load():
+  """Runs from the nn.LSTM era wrote rnn.*_l0 keys; they must still load."""
   policy = FootballPolicy(_env(), hidden_size=16)
   legacy = {}
   for key, value in policy.state_dict().items():
-    legacy[key.replace('rnn.', 'cell.').replace('_l0', '')] = value
-  assert 'cell.weight_hh' in legacy
+    if key.startswith('cell.'):
+      key = key.replace('cell.', 'rnn.') + '_l0'
+    legacy[key] = value
+  assert 'rnn.weight_hh_l0' in legacy and 'cell.weight_hh' not in legacy
   assert hidden_size_from_state_dict(legacy) == 16
-  FootballPolicy(_env(), hidden_size=16).load_state_dict(
-      upgrade_state_dict(legacy))
+  restored = FootballPolicy(_env(), hidden_size=16)
+  restored.load_state_dict(upgrade_state_dict(legacy))
+  for key, value in policy.state_dict().items():
+    assert torch.equal(restored.state_dict()[key], value), key
