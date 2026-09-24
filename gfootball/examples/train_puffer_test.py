@@ -339,7 +339,7 @@ def test_promotion_requires_overall_and_every_heldout_template():
 
 
 def test_config_satisfies_pufferlib_batching_constraints():
-  args = build_parser().parse_args(['--device', 'cpu'])
+  args = build_parser().parse_args(['--device', 'cpu', '--no-async-collection'])
   num_agents = 660
   config = build_config(args, num_agents)
   horizon = config['bptt_horizon']
@@ -395,6 +395,7 @@ class _AsyncScriptedPool:
     self.driver_env = SimpleNamespace(num_agents=1)
 
   def async_reset(self, seed):
+    self.seed = seed
     self.clock = np.zeros(self.num_agents)
     self.steps = np.zeros(self.num_agents, dtype=int)
     self.pending = []
@@ -411,7 +412,7 @@ class _AsyncScriptedPool:
         infos.append({'curriculum_success': float(self.successes[match]),
                       'curriculum_template': int(match) % 8,
                       'episode_length': int(self.lengths[match]),
-                      'env_seed': float(match)})
+                      'env_seed': float(self.seed + match)})
     observations = np.ones((len(order), 115), dtype=np.float32)
     return (observations, np.zeros(len(order)), terminals,
             np.zeros(len(order), dtype=bool), infos, order.copy(),
@@ -433,6 +434,25 @@ def test_async_promotion_takes_a_fixed_quota_from_every_match():
   metrics = evaluate_promotion_async(policy, pool, 8, 3, 'cpu', 4)
   assert metrics['promotion_episodes'] == 8
   assert metrics['promotion_success_rate'] == 0.5
+
+
+def test_async_promotion_does_not_depend_on_batching_or_timing():
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  lengths = [3, 5, 7, 11, 13]
+  for early_abort in (None, (10, 0.9)):
+    results = []
+    for batch in (1, 2, 4):
+      pool = _AsyncScriptedPool(lengths, successes=[1, 0, 1, 0, 1],
+                                batch=batch)
+      results.append(evaluate_promotion_async(
+          policy, pool, 20, 9, 'cpu', 4, early_abort=early_abort))
+    assert results[0]['promotion_aborted'] == float(early_abort is not None)
+    # Identical up to float summation order in the averaged diagnostics.
+    for other in results[1:]:
+      assert other.keys() == results[0].keys()
+      for name, value in results[0].items():
+        assert math.isclose(other[name], value, rel_tol=1e-6), name
 
 
 def test_masked_losses_equal_the_indexed_losses():
@@ -458,7 +478,8 @@ def test_masked_losses_equal_the_indexed_losses():
 
 
 def test_async_collection_doubles_the_rollout_buffer():
-  args = build_parser().parse_args(['--device', 'cpu', '--async-collection'])
+  args = build_parser().parse_args(['--device', 'cpu'])
+  assert args.async_collection and args.async_promotion
   config = build_config(args, 660)
   assert config['batch_size'] // config['bptt_horizon'] == 2 * 660
 

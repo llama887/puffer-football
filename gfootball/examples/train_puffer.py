@@ -220,6 +220,21 @@ def _promotion_metrics(rows, action_counts, decisions, active_logits_rows,
   return metrics
 
 
+def _match_gumbel_noise(seed, match_ids, match_steps, rows, actions):
+  """Gumbel noise that depends only on (seed, match, that match's step).
+
+  Sampling with argmax(logits + noise) then gives every match the same
+  actions no matter which other matches share its batch or in what order
+  the matches report back.
+  """
+  noise = np.empty((len(match_ids), rows, actions), dtype=np.float32)
+  for position, (match, step) in enumerate(zip(match_ids, match_steps)):
+    uniform = np.random.default_rng(
+        (int(seed), int(match), int(step))).random((rows, actions))
+    noise[position] = -np.log(-np.log(np.clip(uniform, 1e-12, 1 - 1e-12)))
+  return noise.reshape(len(match_ids) * rows, actions)
+
+
 def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
                              recurrent_horizon, greedy=False,
                              early_abort=None):
@@ -228,39 +243,66 @@ def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
   Every match contributes its first ceil(episodes / matches) episodes and
   nothing else.  Taking the first `episodes` to finish overall would favour
   short episodes, and at the scoring levels a short episode is a goal.
-  Recurrent memory restarts every `recurrent_horizon` of a match's own steps
-  and at episode ends, as the asynchronous training collector does.
+
+  The result does not depend on timing: each match's engine, frozen
+  defence and sampling noise are seeded per match, recurrent memory
+  restarts every `recurrent_horizon` of a match's own steps and at episode
+  ends, and everything reported (episodes, action statistics, the early
+  abort) is taken from a fixed number of each match's first episodes.
   """
   if recurrent_horizon < 1:
     raise ValueError('recurrent_horizon must be positive')
+  if getattr(vecenv, 'envs_per_worker', 1) != 1:
+    raise ValueError('async promotion needs one match per worker, so that '
+                     'match i is reset with seed + i')
   per_env = vecenv.driver_env.num_agents
   matches = vecenv.num_agents // per_env
   quota = -(-episodes // matches)
+  abort_quota = (None if early_abort is None else
+                 min(quota, -(-early_abort[0] // matches)))
   vecenv.async_reset(seed)
-  generator = torch.Generator(device=device).manual_seed(seed)
   hidden = policy.hidden_size
   agent_h = torch.zeros(vecenv.num_agents, hidden, device=device)
   agent_c = torch.zeros_like(agent_h)
   match_steps = np.zeros(matches, dtype=np.int64)
-  by_match = defaultdict(list)
-  rows = []
-  action_counts = torch.zeros(len(ACTION_NAMES), dtype=torch.long)
-  active_logits_rows = []
-  decisions = 0
+  # Per match: finished episodes, and the action counts and active logits
+  # of each finished episode and of the one in progress.
+  taken = [[] for _ in range(matches)]
+  episode_actions = [[] for _ in range(matches)]
+  episode_logits = [[] for _ in range(matches)]
+  current_actions = np.zeros((matches, len(ACTION_NAMES)), dtype=np.int64)
+  current_logits = [[] for _ in range(matches)]
+  limit = quota
   aborted = False
   was_training = policy.training
   policy.eval()
   try:
-    while len(by_match) < matches or any(
-        len(taken) < quota for taken in by_match.values()):
-      if early_abort is not None and len(rows) >= early_abort[0]:
-        rate = sum(float(row['curriculum_success']) for row in rows) / len(rows)
+    while any(len(rows) < quota for rows in taken):
+      if abort_quota is not None and all(
+          len(rows) >= abort_quota for rows in taken):
+        first = [row for rows in taken for row in rows[:abort_quota]]
+        rate = sum(float(row['curriculum_success'])
+                   for row in first) / len(first)
         if rate < early_abort[1]:
           aborted = True
+          limit = abort_quota
           break
+        abort_quota = None
       observations, _, terminals, _, infos, agent_ids, _ = vecenv.recv()
       agent_ids = np.asarray(agent_ids)
       match_ids = agent_ids[::per_env] // per_env
+      for info in infos:
+        if 'curriculum_success' not in info:
+          continue
+        # reset(seed) gives match i the seed `seed + i`.
+        match = int(info['env_seed']) - int(seed)
+        if not 0 <= match < matches:
+          raise RuntimeError('episode from an unknown match')
+        taken[match].append(info)
+        episode_actions[match].append(current_actions[match].copy())
+        episode_logits[match].append(current_logits[match])
+        current_actions[match] = 0
+        current_logits[match] = []
       restart = match_ids[match_steps[match_ids] % recurrent_horizon == 0]
       if len(restart):
         fresh = torch.as_tensor(
@@ -268,7 +310,6 @@ def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
             device=device)
         agent_h[fresh] = 0
         agent_c[fresh] = 0
-      match_steps[match_ids] += 1
       index = torch.as_tensor(agent_ids, device=device)
       observation_tensor = torch.as_tensor(observations, device=device)
       active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
@@ -278,27 +319,36 @@ def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
         logits, _ = policy.forward_eval(observation_tensor, state)
         agent_h[index] = state['lstm_h']
         agent_c[index] = state['lstm_c']
-        active_logits_rows.append(logits[active].float().cpu())
         if greedy:
           actions = logits.argmax(dim=-1)
         else:
-          actions = torch.multinomial(
-              torch.softmax(logits.float(), dim=-1), 1,
-              generator=generator).squeeze(-1)
-      active_actions = actions[active].cpu()
-      action_counts += torch.bincount(
-          active_actions, minlength=len(ACTION_NAMES))
-      decisions += active_actions.numel()
-      for info in infos:
-        if 'curriculum_success' not in info:
+          noise = torch.as_tensor(_match_gumbel_noise(
+              seed, match_ids, match_steps[match_ids], per_env,
+              logits.shape[-1]), device=device)
+          actions = (logits.float() + noise).argmax(dim=-1)
+      match_steps[match_ids] += 1
+      active_rows = active.view(len(match_ids), per_env).cpu().numpy()
+      match_actions = actions.view(len(match_ids), per_env).cpu().numpy()
+      match_logits = logits.view(len(match_ids), per_env, -1).float().cpu()
+      for position, match in enumerate(match_ids):
+        if len(taken[match]) >= quota:
           continue
-        taken = by_match[info['env_seed']]
-        if len(taken) < quota:
-          taken.append(info)
-          rows.append(info)
+        rows = active_rows[position]
+        current_actions[match] += np.bincount(
+            match_actions[position][rows], minlength=len(ACTION_NAMES))
+        current_logits[match].append(match_logits[position][rows])
       vecenv.send(actions.cpu().numpy())
   finally:
     policy.train(was_training)
+  rows = [row for match in range(matches) for row in taken[match][:limit]]
+  action_counts = torch.as_tensor(sum(
+      (counts for match in range(matches)
+       for counts in episode_actions[match][:limit]),
+      np.zeros(len(ACTION_NAMES), dtype=np.int64)))
+  active_logits_rows = [
+      step for match in range(matches)
+      for episode in episode_logits[match][:limit] for step in episode]
+  decisions = max(1, int(action_counts.sum()))
   return _promotion_metrics(rows, action_counts, decisions,
                             active_logits_rows, recurrent_horizon, greedy,
                             aborted)
@@ -847,16 +897,24 @@ def build_parser():
   parser.add_argument('--envs-per-worker', type=int, default=1,
                       help='matches stepped by each worker process')
   parser.add_argument('--async-collection',
-                      action=argparse.BooleanOptionalAction, default=False,
+                      action=argparse.BooleanOptionalAction, default=True,
                       help='collect training segments from whichever '
                            'matches are ready, so engine resets never stall '
                            'other matches')
   parser.add_argument('--async-promotion',
-                      action=argparse.BooleanOptionalAction, default=False,
-                      help='run promotion evaluation asynchronously too; '
-                           'faster, but sampled results then depend on '
-                           'timing, while the synchronous gate replays the '
-                           'same episodes and random numbers every check')
+                      action=argparse.BooleanOptionalAction, default=True,
+                      help='run promotion evaluation asynchronously too; it '
+                           'stays deterministic (per-match episode quotas '
+                           'and per-match sampling noise)')
+  parser.add_argument('--gpu-filler', action=argparse.BooleanOptionalAction,
+                      default=True,
+                      help='keep reported GPU utilization up with small '
+                           'side-stream matmuls inside the trainer (Torch '
+                           'warns below 75%%); replaces the external '
+                           'heartbeat, which time-sliced the GPU')
+  parser.add_argument('--gpu-filler-matrix-size', type=int, default=1024,
+                      help='filler matmul size; 1024 held 99%% mean '
+                           'utilization on an L40S at no measurable SPS cost')
   parser.add_argument('--async-batch-workers', type=int, default=None,
                       help='workers per policy batch with --async-collection '
                            '(default: a third of the workers)')
@@ -926,8 +984,9 @@ def build_config(args, num_agents):
 def benchmark(trainer, epochs, warmup=5):
   """Steady-state rollout and update time per epoch, promotion excluded."""
   def synchronize():
+    # Only the trainer's stream: the GPU filler has its own.
     if trainer.config['device'] == 'cuda':
-      torch.cuda.synchronize()
+      torch.cuda.current_stream().synchronize()
 
   for _ in range(warmup):
     trainer.evaluate()
@@ -1037,6 +1096,10 @@ def main():
   trainer = FootballPuffeRL(
       config, env, policy, logger=logger,
       log_interval_seconds=args.log_interval_seconds)
+  filler = None
+  if args.gpu_filler and args.device == 'cuda':
+    from gfootball.examples.gpu_filler import GpuFiller
+    filler = GpuFiller(matrix_size=args.gpu_filler_matrix_size).start()
   if args.benchmark_epochs:
     try:
       print('BENCHMARK ' + json.dumps(
@@ -1113,6 +1176,8 @@ def main():
       trainer.evaluate()
       trainer.train()
   finally:
+    if filler is not None:
+      filler.stop()
     close_promotion_pools()
     model_path = trainer.close()
     if logger is not None:

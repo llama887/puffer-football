@@ -94,9 +94,22 @@ if [[ ${COMPILE:-1} == 0 ]]; then
   COMPILE_ARGS=(--no-compile)
 fi
 LOG_INTERVAL_SECONDS=${LOG_INTERVAL_SECONDS:-5}
-# The heartbeat fills idle GPU time with 6144^2 matmuls.  Every policy step
-# queues behind them: collection fell from ~10k to ~9k steps/s and the PPO
-# update took 2.4x longer.  GPU_HEARTBEAT=1 turns it back on.
+ASYNC_PROMOTION_ARGS=(--async-promotion)
+if [[ ${ASYNC_PROMOTION:-1} == 0 ]]; then
+  ASYNC_PROMOTION_ARGS=(--no-async-promotion)
+fi
+# Torch warns about GPU jobs below 75% utilization.  The trainer keeps it up
+# itself with small matmuls on a side stream (GPU_FILLER=1): kernels from one
+# process share the GPU, so this barely slows training.  The old external
+# heartbeat (GPU_HEARTBEAT=1) is a separate process; processes time-slice the
+# GPU, and its 6144^2 matmuls made the PPO update 2.4x slower.
+# Measured on an L40S: filler size 1024 held 99% mean utilization at no
+# measurable SPS cost (38.5k either way); the external heartbeat gave 83% and
+# cut SPS to 17.7k.
+GPU_FILLER_ARGS=(--gpu-filler --gpu-filler-matrix-size "${GPU_FILLER_MATRIX_SIZE:-1024}")
+if [[ ${GPU_FILLER:-1} == 0 ]]; then
+  GPU_FILLER_ARGS=(--no-gpu-filler)
+fi
 GPU_HEARTBEAT=${GPU_HEARTBEAT:-0}
 ANNEAL_LR_ARGS=(--no-anneal-lr)
 if [[ ${ANNEAL_LR:-0} == 1 ]]; then
@@ -182,6 +195,8 @@ cd "$RUN_ROOT"
   --num-workers "$NUM_WORKERS" \
   --envs-per-worker "$ENVS_PER_WORKER" \
   "${ASYNC_COLLECTION_ARGS[@]}" \
+  "${ASYNC_PROMOTION_ARGS[@]}" \
+  "${GPU_FILLER_ARGS[@]}" \
   "${COMPILE_ARGS[@]}" \
   --log-interval-seconds "$LOG_INTERVAL_SECONDS" \
   --frame-stack "$FRAME_STACK" \
