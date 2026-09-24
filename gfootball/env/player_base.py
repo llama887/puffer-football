@@ -42,3 +42,12 @@ class PlayerBase(object):
 
   def can_play_right(self):
     return self._can_play_right
+
+  def needs_observations(self):
+    """Whether take_action actually reads the observations it is handed.
+
+    Converting the raw engine observation into per-player observations is the
+    single most expensive thing FootballEnv does per step, and a player that
+    ignores the argument makes the environment pay for it twice per step.
+    """
+    return True

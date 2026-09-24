@@ -115,6 +115,48 @@ class Simple115StateWrapper(gym.ObservationWrapper):
     """Converts an observation into simple115 (or simple115v2) format."""
     return Simple115StateWrapper.convert_observation(observation, self._fixed_positions)
 
+  # simple115 field layout.
+  _PLAYERS_END = 88
+  _BALL = 88
+  _BALL_DIRECTION = 91
+  _BALL_OWNED_TEAM = 94
+  _ACTIVE = 97
+  _GAME_MODE = 108
+  _SIZE = 115
+  _TEAM_FIELDS = ('left_team', 'left_team_direction',
+                  'right_team', 'right_team_direction')
+
+  @staticmethod
+  def _shared_features(obs, fixed_positions):
+    """Everything in a simple115 row except the controlled-player one-hot."""
+    features = np.zeros(Simple115StateWrapper._SIZE, dtype=np.float32)
+    # If there were less than 11vs11 players we backfill missing values with
+    # -1.  88 = 11 players * 2 teams * 2 (positions & directions) * 2 (x & y).
+    offset = 0
+    for i, name in enumerate(Simple115StateWrapper._TEAM_FIELDS):
+      values = np.asarray(obs[name], dtype=np.float32).ravel()
+      if fixed_positions:
+        # Each team block always occupies its own 22 fields.
+        offset = i * 22
+      end = offset + values.size
+      features[offset:end] = values
+      if fixed_positions:
+        features[end:offset + 22] = -1
+      offset = end
+    if not fixed_positions:
+      features[offset:Simple115StateWrapper._PLAYERS_END] = -1
+
+    features[Simple115StateWrapper._BALL:
+             Simple115StateWrapper._BALL + 3] = obs['ball']
+    features[Simple115StateWrapper._BALL_DIRECTION:
+             Simple115StateWrapper._BALL_DIRECTION + 3] = obs['ball_direction']
+    # One hot encoding of which team owns the ball: none, left, right.
+    owned_team = obs['ball_owned_team']
+    assert -1 <= owned_team <= 1, owned_team
+    features[Simple115StateWrapper._BALL_OWNED_TEAM + owned_team + 1] = 1
+    features[Simple115StateWrapper._GAME_MODE + obs['game_mode']] = 1
+    return features
+
   @staticmethod
   def convert_observation(observation, fixed_positions):
     """Converts an observation into simple115 (or simple115v2) format.
@@ -134,58 +176,26 @@ class Simple115StateWrapper(gym.ObservationWrapper):
       (N, 115) shaped representation, where N stands for the number of players
       being controlled.
     """
-
-    def do_flatten(obj):
-      """Run flatten on either python list or numpy array."""
-      if type(obj) == list:
-        return np.array(obj).flatten()
-      return obj.flatten()
-
-    final_obs = []
-    for obs in observation:
-      o = []
-      if fixed_positions:
-        for i, name in enumerate(['left_team', 'left_team_direction',
-                                  'right_team', 'right_team_direction']):
-          o.extend(do_flatten(obs[name]))
-          # If there were less than 11vs11 players we backfill missing values
-          # with -1.
-          if len(o) < (i + 1) * 22:
-            o.extend([-1] * ((i + 1) * 22 - len(o)))
-      else:
-        o.extend(do_flatten(obs['left_team']))
-        o.extend(do_flatten(obs['left_team_direction']))
-        o.extend(do_flatten(obs['right_team']))
-        o.extend(do_flatten(obs['right_team_direction']))
-
-      # If there were less than 11vs11 players we backfill missing values with
-      # -1.
-      # 88 = 11 (players) * 2 (teams) * 2 (positions & directions) * 2 (x & y)
-      if len(o) < 88:
-        o.extend([-1] * (88 - len(o)))
-
-      # ball position
-      o.extend(obs['ball'])
-      # ball direction
-      o.extend(obs['ball_direction'])
-      # one hot encoding of which team owns the ball
-      if obs['ball_owned_team'] == -1:
-        o.extend([1, 0, 0])
-      if obs['ball_owned_team'] == 0:
-        o.extend([0, 1, 0])
-      if obs['ball_owned_team'] == 1:
-        o.extend([0, 0, 1])
-
-      active = [0] * 11
-      if obs['active'] != -1:
-        active[obs['active']] = 1
-      o.extend(active)
-
-      game_mode = [0] * 7
-      game_mode[obs['game_mode']] = 1
-      o.extend(game_mode)
-      final_obs.append(o)
-    return np.array(final_obs, dtype=np.float32)
+    final_obs = np.zeros(
+        (len(observation), Simple115StateWrapper._SIZE), dtype=np.float32)
+    # Only the controlled-player one-hot differs between players that share a
+    # view of the pitch, so an 11-a-side match has two distinct prefixes rather
+    # than 22.  Keyed on identity, which is valid for the life of this call
+    # because `observation` holds the references.
+    shared = {}
+    for row, obs in zip(final_obs, observation):
+      key = tuple(id(obs[name]) for name in Simple115StateWrapper._TEAM_FIELDS)
+      key += (id(obs['ball']), id(obs['ball_direction']),
+              obs['ball_owned_team'], obs['game_mode'])
+      features = shared.get(key)
+      if features is None:
+        features = Simple115StateWrapper._shared_features(obs, fixed_positions)
+        shared[key] = features
+      row[:] = features
+      active = obs['active']
+      if active != -1:
+        row[Simple115StateWrapper._ACTIVE + active] = 1
+    return final_obs
 
 
 class PixelsStateWrapper(gym.ObservationWrapper):

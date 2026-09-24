@@ -121,11 +121,31 @@ class FootballPolicy(torch.nn.Module):
             segments, horizon, self.hidden_size)
     hidden, cell = self._recurrent_state(state, segments, observations)
     done = state.get('done')
+    keep = (None if done is None else
+            (~done.bool()).to(hidden.dtype).unsqueeze(-1))
+    # The input half of every LSTM gate depends only on the encoder output,
+    # so it is one GEMM over the whole window instead of one per step.  Only
+    # the recurrent half stays inside the loop.  Same math as LSTMCell.
+    input_gates = torch.nn.functional.linear(encoded, self.cell.weight_ih)
+    fused = encoded.is_cuda
     outputs = []
     for step in range(horizon):
-      hidden, cell = self._reset_finished(
-          hidden, cell, None if done is None else done[:, step])
-      hidden, cell = self.cell(encoded[:, step], (hidden, cell))
+      if keep is not None:
+        hidden = hidden * keep[:, step]
+        cell = cell * keep[:, step]
+      hidden_gates = torch.nn.functional.linear(hidden, self.cell.weight_hh)
+      if fused:
+        # The kernel LSTMCell itself dispatches to on CUDA.
+        hidden, cell, _ = torch.ops.aten._thnn_fused_lstm_cell(
+            input_gates[:, step], hidden_gates, cell,
+            self.cell.bias_ih, self.cell.bias_hh)
+      else:
+        gates = (input_gates[:, step] + hidden_gates +
+                 self.cell.bias_ih + self.cell.bias_hh)
+        in_gate, forget_gate, cell_gate, out_gate = gates.chunk(4, dim=-1)
+        cell = (torch.sigmoid(forget_gate) * cell +
+                torch.sigmoid(in_gate) * torch.tanh(cell_gate))
+        hidden = torch.sigmoid(out_gate) * torch.tanh(cell)
       outputs.append(hidden)
     hidden = torch.stack(outputs, dim=1).reshape(
         segments * horizon, self.hidden_size)

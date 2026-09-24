@@ -48,6 +48,11 @@ except ImportError:
 
 
 
+# Shared placeholder for matches that do not expose sticky actions.  Read-only
+# by contract: every consumer either ignores it or only reads its length.
+_NO_STICKY_ACTIONS = np.zeros(0, dtype=np.uint8)
+
+
 class EnvState(object):
 
   def __init__(self):
@@ -62,6 +67,13 @@ class FootballEnvCore(object):
     global _unused_engines
     self._config = config
     self._fast_mode = bool(config['fast_mode'])
+    # Outside fast mode the trace and video writers read the sticky-action
+    # bits, so the flag only applies where nothing consumes them.  Write the
+    # effective value back so observation_rotation agrees about whether there
+    # is anything to rotate.
+    if not self._fast_mode:
+      config['needs_sticky_actions'] = True
+    self._needs_sticky_actions = bool(config['needs_sticky_actions'])
     self._sticky_actions = football_action_set.get_sticky_actions(config)
     self._use_rendering_engine = False
     if _unused_engines:
@@ -307,20 +319,17 @@ class FootballEnvCore(object):
 
     self._convert_players_observation(info.left_team, 'left_team', result)
     self._convert_players_observation(info.right_team, 'right_team', result)
-    result['left_agent_sticky_actions'] = []
-    result['left_agent_controlled_player'] = []
-    result['right_agent_sticky_actions'] = []
-    result['right_agent_controlled_player'] = []
-    for i in range(self._env.config.left_agents):
-      result['left_agent_controlled_player'].append(
-          info.left_controllers[i].controlled_player)
-      result['left_agent_sticky_actions'].append(
-          np.array(self.sticky_actions_state(True, i), dtype=np.uint8))
-    for i in range(self._env.config.right_agents):
-      result['right_agent_controlled_player'].append(
-          info.right_controllers[i].controlled_player)
-      result['right_agent_sticky_actions'].append(
-          np.array(self.sticky_actions_state(False, i), dtype=np.uint8))
+    for team, controllers, agents in (
+        ('left', info.left_controllers, self._env.config.left_agents),
+        ('right', info.right_controllers, self._env.config.right_agents)):
+      result['{}_agent_controlled_player'.format(team)] = [
+          controllers[i].controlled_player for i in range(agents)]
+      # Each sticky_actions_state call queries the engine once per sticky
+      # action, so this is 10 * 22 engine round trips per step for a 22-agent
+      # match.  Keep the field shaped the same when it is switched off.
+      result['{}_agent_sticky_actions'.format(team)] = (
+          [self.sticky_actions_state(team == 'left', i) for i in range(agents)]
+          if self._needs_sticky_actions else [_NO_STICKY_ACTIONS] * agents)
     result['game_mode'] = int(info.game_mode)
     result['score'] = [info.left_goals, info.right_goals]
     result['ball_owned_team'] = info.ball_owned_team
@@ -380,12 +389,10 @@ class FootballEnvCore(object):
     return copy.deepcopy(self._observation)
 
   def sticky_actions_state(self, left_team, player_id):
-    result = []
-    for a in self._sticky_actions:
-      result.append(
-          self._env.sticky_action_state(a._backend_action, left_team,
-                                        player_id))
-    return np.uint8(result)
+    return np.fromiter(
+        (self._env.sticky_action_state(a._backend_action, left_team, player_id)
+         for a in self._sticky_actions),
+        dtype=np.uint8, count=len(self._sticky_actions))
 
   def get_state(self, to_pickle):
     assert (self._env.state == GameState.game_running or

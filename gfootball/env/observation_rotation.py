@@ -56,6 +56,29 @@ def rotate_points(points):
   return -points
 
 
+_sticky_rotation_cache = {}
+
+
+def sticky_rotation_permutation(config):
+  """Index permutation that rotates a sticky-action bit vector.
+
+  The permutation depends only on the action set, which is fixed for the whole
+  run, but rotate_sticky_actions used to rederive it for all 22 players on
+  every environment step -- each rederivation running flip_single_action ten
+  times, and each of those chaining CoreAction comparisons.  Compute it once.
+  """
+  action_set_name = config['action_set']
+  permutation = _sticky_rotation_cache.get(action_set_name)
+  if permutation is None:
+    sticky_actions = football_action_set.get_sticky_actions(config)
+    position = {action: i for i, action in enumerate(sticky_actions)}
+    permutation = tuple(
+        position[flip_single_action(action, config)]
+        for action in sticky_actions)
+    _sticky_rotation_cache[action_set_name] = permutation
+  return permutation
+
+
 def rotate_sticky_actions(sticky_actions_state, config):
   """Rotate the sticky bits of directional actions.
 
@@ -70,16 +93,9 @@ def rotate_sticky_actions(sticky_actions_state, config):
     Array of bits corresponding to the same active actions for a player
     who would play from the opposite side.
   """
-  sticky_actions = football_action_set.get_sticky_actions(config)
-  assert len(sticky_actions) == len(sticky_actions_state), len(sticky_actions)
-  action_to_state = {}
-  for i in range(len(sticky_actions)):
-    action_to_state[sticky_actions[i]] = sticky_actions_state[i]
-  rotated_sticky_actions = []
-  for i in range(len(sticky_actions)):
-    rotated_sticky_actions.append(action_to_state[flip_single_action(
-        sticky_actions[i], config)])
-  return rotated_sticky_actions
+  permutation = sticky_rotation_permutation(config)
+  assert len(permutation) == len(sticky_actions_state), len(permutation)
+  return [sticky_actions_state[i] for i in permutation]
 
 
 def flip_team_observation(observation, result, config, from_team, to_team):
@@ -104,10 +120,12 @@ def flip_team_observation(observation, result, config, from_team, to_team):
     result['{}_agent_controlled_player'.format(to_team)] = observation[
         '{}_agent_controlled_player'.format(from_team)]
   if '{}_agent_sticky_actions'.format(from_team) in observation:
-    result['{}_agent_sticky_actions'.format(to_team)] = [
-        rotate_sticky_actions(sticky, config)
-        for sticky in observation['{}_agent_sticky_actions'.format(from_team)]
-    ]
+    source = observation['{}_agent_sticky_actions'.format(from_team)]
+    # When the representation does not consume sticky actions the environment
+    # hands us empty placeholders; there is nothing to rotate.
+    result['{}_agent_sticky_actions'.format(to_team)] = (
+        [rotate_sticky_actions(sticky, config) for sticky in source]
+        if config['needs_sticky_actions'] else list(source))
 
 
 def flip_observation(observation, config):
@@ -132,27 +150,30 @@ def flip_observation(observation, config):
   return flipped_observation
 
 
+# Opposite direction for every directional action; everything else rotates to
+# itself.  A dict lookup rather than a chain of comparisons, because this runs
+# once per controlled player per step.
+_FLIPPED_ACTION = {
+    football_action_set.action_left: football_action_set.action_right,
+    football_action_set.action_top_left:
+        football_action_set.action_bottom_right,
+    football_action_set.action_top: football_action_set.action_bottom,
+    football_action_set.action_top_right:
+        football_action_set.action_bottom_left,
+    football_action_set.action_right: football_action_set.action_left,
+    football_action_set.action_bottom_right:
+        football_action_set.action_top_left,
+    football_action_set.action_bottom: football_action_set.action_top,
+    football_action_set.action_bottom_left:
+        football_action_set.action_top_right,
+}
+
+
 def flip_single_action(action, config):
   """Actions corresponding to the field rotated by 180 degrees."""
   action = football_action_set.named_action_from_action_set(
       football_action_set.get_action_set(config), action)
-  if action == football_action_set.action_left:
-    return football_action_set.action_right
-  if action == football_action_set.action_top_left:
-    return football_action_set.action_bottom_right
-  if action == football_action_set.action_top:
-    return football_action_set.action_bottom
-  if action == football_action_set.action_top_right:
-    return football_action_set.action_bottom_left
-  if action == football_action_set.action_right:
-    return football_action_set.action_left
-  if action == football_action_set.action_bottom_right:
-    return football_action_set.action_top_left
-  if action == football_action_set.action_bottom:
-    return football_action_set.action_top
-  if action == football_action_set.action_bottom_left:
-    return football_action_set.action_top_right
-  return action
+  return _FLIPPED_ACTION.get(action, action)
 
 
 def flip_action(action, config):

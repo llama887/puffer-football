@@ -94,6 +94,10 @@ class Config(object):
         'fast_mode': False,
         'players': ['agent:left_players=1'],
         'level': '11_vs_11_stochastic',
+        # Sticky-action bits cost 10 engine queries per controlled player per
+        # step and are read by nothing in the simple115v2 pipeline, so a
+        # representation that does not need them can switch them off.
+        'needs_sticky_actions': True,
         'physics_steps_per_frame': 10,
         'render_resolution_x': 1280,
         'real_time': False,
