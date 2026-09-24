@@ -144,15 +144,15 @@ def closest_player_potential(positions, ball_position, scale):
   return -float(scale) * float(distance.min())
 
 
-def centralized_score_rewards(score_reward, active_mask):
+def centralized_score_rewards(score_reward, active_mask, out=None):
   """Share the zero-sum match score with every active player on each team."""
   active_mask = np.asarray(active_mask, dtype=bool)
   if active_mask.shape != (22,):
     raise ValueError('active_mask must have shape (22,)')
   score_reward = float(score_reward)
-  rewards = np.concatenate((
-      np.full(11, score_reward, dtype=np.float32),
-      np.full(11, -score_reward, dtype=np.float32)))
+  rewards = np.empty(22, dtype=np.float32) if out is None else out
+  rewards[:11] = score_reward
+  rewards[11:] = -score_reward
   rewards[~active_mask] = 0
   return rewards
 
@@ -215,6 +215,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._episode_template = 0
     self._attacking_left = True
     self._active_mask = np.ones(self.num_agents, dtype=bool)
+    self._episode_active_mask = np.ones(self.num_agents, dtype=bool)
+    self._step_actions = np.zeros(self.num_agents, dtype=np.int64)
+    self._step_rewards = np.zeros(self.num_agents, dtype=np.float32)
     # A frozen policy plays the whole defending side, so the learner (and the
     # promotion gate) faces a FIXED opponent instead of its own moving self.
     # It runs inside this worker process on the CPU; the defending rows are
@@ -301,6 +304,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
             'curriculum_evaluation': self._curriculum_evaluation,
             'fast_mode': not self._render,
             'game_engine_random_seed': self._seed,
+            # simple115v2 does not encode sticky actions, and producing them
+            # costs ten engine queries per controlled player per step.
+            'needs_sticky_actions': False,
             'real_time': False,
         })
 
@@ -397,14 +403,25 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     if observations.shape != self.observations.shape:
       raise ValueError('Expected observations with shape {}, got {}'.format(
           self.observations.shape, observations.shape))
-    self.observations[:] = observations
-    normalize_egocentric(self.observations)
+    active = self._active_mask
+    if self._frozen_defence_path is not None or active.all():
+      self.observations[:] = observations
+      normalize_egocentric(self.observations)
+      if self._sort_players:
+        sort_players_by_distance(self.observations)
+      if self._frozen_defence_path is not None:
+        # The frozen side needs its own rows before they are hidden below.
+        self._full_observations = self.observations.copy()
+      self.observations[~active] = 0
+      return
+    # Inactive rows are zeroed either way, so normalizing and sorting them
+    # is wasted work.
+    self.observations[~active] = 0
+    rows = observations[active]
+    normalize_egocentric(rows)
     if self._sort_players:
-      sort_players_by_distance(self.observations)
-    if self._frozen_defence_path is not None:
-      # The frozen side needs its own rows before they are hidden below.
-      self._full_observations = self.observations.copy()
-    self.observations[~self._active_mask] = 0
+      sort_players_by_distance(rows)
+    self.observations[active] = rows
 
   def reset(self, seed=None):
     if seed is not None:
@@ -435,14 +452,19 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     return self.observations, []
 
   def step(self, actions):
-    episode_active_mask = self._active_mask.copy()
-    actions = np.asarray(actions).reshape(self.num_agents).copy()
+    # _reset_match rewrites _active_mask mid-step, so the mask that governs
+    # this transition is snapshotted first, into buffers reused every step.
+    episode_active_mask = self._episode_active_mask
+    np.copyto(episode_active_mask, self._active_mask)
+    np.copyto(self._step_actions, np.asarray(actions).reshape(self.num_agents),
+              casting='unsafe')
+    actions = self._step_actions
     actions[~episode_active_mask] = 0
     if self._frozen_defence_path is not None:
       actions[self._defending_rows()] = self._frozen_actions()
     observations, _, done, info = self._env.step(actions)
     rewards = centralized_score_rewards(
-        info['score_reward'], episode_active_mask)
+        info['score_reward'], episode_active_mask, out=self._step_rewards)
     for team, team_slice in enumerate((slice(0, 11), slice(11, 22))):
       team_active = episode_active_mask[team_slice]
       if team_active.any():

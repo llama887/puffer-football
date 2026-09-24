@@ -38,27 +38,31 @@ class CoreAction(object):
   def is_in_actionset(self, config):
     return self in get_action_set(config)
 
+  # These comparisons sit in the per-step observation path (flip_single_action
+  # chains up to eight of them per rotated action), so they have to stay cheap.
+  # They used to assert on `set(other.__dict__) == set(self.__dict__)`, which
+  # built two sets per comparison; isinstance is the same duck-type guard.
   def __eq__(self, other):
-    assert set(other.__dict__) == set(self.__dict__)
+    assert isinstance(other, CoreAction)
     return self._name == other._name
 
   def __ne__(self, other):
     return not self.__eq__(other)
 
   def __lt__(self, other):
-    assert set(other.__dict__) == set(self.__dict__)
+    assert isinstance(other, CoreAction)
     return self._backend_action < other._backend_action
 
   def __le__(self, other):
-    assert set(other.__dict__) == set(self.__dict__)
+    assert isinstance(other, CoreAction)
     return self._backend_action <= other._backend_action
 
   def __gt__(self, other):
-    assert set(other.__dict__) == set(self.__dict__)
+    assert isinstance(other, CoreAction)
     return self._backend_action > other._backend_action
 
   def __ge__(self, other):
-    assert set(other.__dict__) == set(self.__dict__)
+    assert isinstance(other, CoreAction)
     return self._backend_action >= other._backend_action
 
   def __hash__(self):
@@ -185,19 +189,23 @@ def get_action_set(config):
   action_set_name = config["action_set"]
   return action_set_dict[action_set_name]
 
+_sticky_actions_cache = {}
+
+
 def get_sticky_actions(config):
   """Returns list of sticky actions for the currently used action set."""
-  sticky_actions = []
-  for a in get_action_set(config):
-    if a._sticky:
-      sticky_actions.append(a)
+  action_set_name = config["action_set"]
+  sticky_actions = _sticky_actions_cache.get(action_set_name)
+  if sticky_actions is None:
+    sticky_actions = tuple(
+        a for a in action_set_dict[action_set_name] if a._sticky)
+    _sticky_actions_cache[action_set_name] = sticky_actions
   return sticky_actions
 
 
 # Converts different action representation to an action from a given action set.
 def named_action_from_action_set(action_set, action):
-  if (hasattr(action, "__dict__") and action_set and
-      set(action.__dict__) == set(action_set[0].__dict__)):
+  if isinstance(action, CoreAction):
     return action
 
   if (isinstance(action, numpy.int32) or isinstance(action, numpy.int64) or
@@ -212,7 +220,7 @@ def named_action_from_action_set(action_set, action):
 
 
 def disable_action(action):
-  assert set(action.__dict__) == set(action_left.__dict__)
+  assert isinstance(action, CoreAction)
   if action._directional:
     return action_release_direction
   return reverse_action_mapping[action]
