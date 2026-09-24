@@ -73,6 +73,31 @@ SELFPLAY_PROMOTION_EPISODES=${SELFPLAY_PROMOTION_EPISODES:-64}
 # Set SCORED_PROMOTION_LEVELS=4 to restore the old escalator.
 SCORED_PROMOTION_LEVELS=${SCORED_PROMOTION_LEVELS:-21}
 TIMED_PROMOTION_EPOCHS=${TIMED_PROMOTION_EPOCHS:-200}
+# Throughput.  Measured on one L40S + 32 CPUs at level 0 (agent steps/s):
+# main as it was 4.8k; game data in node-local memory 17k; + no GPU
+# heartbeat, sync-free PPO update 20k; + async collection 23k (collection
+# alone ~80k, the CPU ceiling for 32 cores); + CUDA-graph update 36k.  None
+# of these change what PPO computes; MINIBATCH_SEGMENTS does (fewer, larger
+# optimizer steps) and is left at 32.
+#
+# Async collection takes each batch from whichever workers are ready, so an
+# engine reset in one match never stalls the others.
+ASYNC_COLLECTION_ARGS=(--async-collection)
+if [[ ${ASYNC_COLLECTION:-1} == 0 ]]; then
+  ASYNC_COLLECTION_ARGS=(--no-async-collection)
+fi
+ENVS_PER_WORKER=${ENVS_PER_WORKER:-1}
+# CUDA graphs remove the kernel-launch overhead that dominates small LSTM
+# minibatches; COMPILE=0 falls back to eager.
+COMPILE_ARGS=(--compile --compile-mode "${COMPILE_MODE:-reduce-overhead}")
+if [[ ${COMPILE:-1} == 0 ]]; then
+  COMPILE_ARGS=(--no-compile)
+fi
+LOG_INTERVAL_SECONDS=${LOG_INTERVAL_SECONDS:-5}
+# The heartbeat fills idle GPU time with 6144^2 matmuls.  Every policy step
+# queues behind them: collection fell from ~10k to ~9k steps/s and the PPO
+# update took 2.4x longer.  GPU_HEARTBEAT=1 turns it back on.
+GPU_HEARTBEAT=${GPU_HEARTBEAT:-0}
 ANNEAL_LR_ARGS=(--no-anneal-lr)
 if [[ ${ANNEAL_LR:-0} == 1 ]]; then
   ANNEAL_LR_ARGS=(--anneal-lr)
@@ -97,6 +122,15 @@ export PATH="$ENV_PREFIX/bin:$PATH"
 export LD_LIBRARY_PATH="$TOOLCHAIN_PREFIX/lib:$ENV_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="$REPO:$REPO/third_party"
 export GFOOTBALL_DATA_DIR="$REPO/third_party/gfootball_engine/data"
+# Every engine reset re-reads animations, meshes and bitmaps from the data
+# dir.  From /scratch that is ~280 ms per reset with multi-second stragglers
+# when 30 workers reset at once; from node-local memory it is ~28 ms.
+if [[ ${LOCAL_GAME_DATA:-1} == 1 ]]; then
+  LOCAL_DATA=/dev/shm/gfootball-data-${SLURM_JOB_ID}
+  mkdir -p "$LOCAL_DATA"
+  cp -r "$GFOOTBALL_DATA_DIR/." "$LOCAL_DATA/"
+  export GFOOTBALL_DATA_DIR="$LOCAL_DATA"
+fi
 export GFOOTBALL_FONT="$REPO/third_party/fonts/AlegreyaSansSC-ExtraBold.ttf"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -122,6 +156,9 @@ export GPU_HEARTBEAT_MATRIX_SIZE=6144
 export GPU_HEARTBEAT_DTYPE=bfloat16
 
 cleanup() {
+  if [[ -n ${LOCAL_DATA:-} ]]; then
+    rm -rf "$LOCAL_DATA"
+  fi
   if [ -n "${HEARTBEAT_PID:-}" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
     kill "$HEARTBEAT_PID"
     wait "$HEARTBEAT_PID" 2>/dev/null || true
@@ -130,10 +167,12 @@ cleanup() {
 trap cleanup EXIT
 
 nvidia-smi
-nice -n 19 /scratch/wz2445/Puffer-Soccer/.venv/bin/python -u \
-  /scratch/wz2445/Puffer-Soccer/sbatch/gpu_heartbeat.py &
-HEARTBEAT_PID=$!
-echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
+if [[ $GPU_HEARTBEAT == 1 ]]; then
+  nice -n 19 /scratch/fyy2003/repos/Puffer-Soccer/.venv/bin/python -u \
+    /scratch/fyy2003/repos/Puffer-Soccer/sbatch/gpu_heartbeat.py &
+  HEARTBEAT_PID=$!
+  echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
+fi
 
 cd "$RUN_ROOT"
 "$ENV_PREFIX/bin/python" -u -m gfootball.examples.train_puffer \
@@ -141,6 +180,10 @@ cd "$RUN_ROOT"
   --device cuda \
   --env-name "$ENV_NAME" \
   --num-workers "$NUM_WORKERS" \
+  --envs-per-worker "$ENVS_PER_WORKER" \
+  "${ASYNC_COLLECTION_ARGS[@]}" \
+  "${COMPILE_ARGS[@]}" \
+  --log-interval-seconds "$LOG_INTERVAL_SECONDS" \
   --frame-stack "$FRAME_STACK" \
   --hidden-size "$HIDDEN_SIZE" \
   --curriculum-window 20 \

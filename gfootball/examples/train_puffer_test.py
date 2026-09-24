@@ -10,8 +10,8 @@ import torch
 
 from gfootball.examples.train_puffer import (
     ACTION_NAMES, SHOT_ACTION, FootballPolicy, build_config, build_parser,
-    evaluate_promotion, explained_variance, generalized_advantages,
-    normalize_advantages,
+    evaluate_promotion, evaluate_promotion_async, explained_variance,
+    generalized_advantages, normalize_advantages,
     policy_diagnostics, promotion_passes, promotion_statistics)
 
 
@@ -379,6 +379,88 @@ def test_update_epochs_cover_the_active_data_at_least_once():
           4 * num_segments / segments_per_minibatch))
       sampled = minibatches * segments_per_minibatch
       assert sampled >= 4 * num_segments
+
+
+class _AsyncScriptedPool:
+  """Matches of one agent each, returned in whatever order they finish.
+
+  Match m's episodes last `lengths[m]` steps and succeed iff `successes[m]`.
+  recv() hands back the `batch` matches that are furthest behind in time,
+  like a pool whose fast matches finish more steps.
+  """
+
+  def __init__(self, lengths, successes, batch=2):
+    self.lengths, self.successes, self.batch = lengths, successes, batch
+    self.num_agents = len(lengths)
+    self.driver_env = SimpleNamespace(num_agents=1)
+
+  def async_reset(self, seed):
+    self.clock = np.zeros(self.num_agents)
+    self.steps = np.zeros(self.num_agents, dtype=int)
+    self.pending = []
+
+  def recv(self):
+    # A short-episode match steps twice as fast in wall time.
+    order = np.argsort(self.clock, kind='stable')[:self.batch]
+    self.pending = order
+    infos = []
+    terminals = np.zeros(len(order), dtype=bool)
+    for position, match in enumerate(order):
+      if self.steps[match] and self.steps[match] % self.lengths[match] == 0:
+        terminals[position] = True
+        infos.append({'curriculum_success': float(self.successes[match]),
+                      'curriculum_template': int(match) % 8,
+                      'episode_length': int(self.lengths[match]),
+                      'env_seed': float(match)})
+    observations = np.ones((len(order), 115), dtype=np.float32)
+    return (observations, np.zeros(len(order)), terminals,
+            np.zeros(len(order), dtype=bool), infos, order.copy(),
+            np.ones(len(order), dtype=bool))
+
+  def send(self, actions):
+    for match in self.pending:
+      self.steps[match] += 1
+      self.clock[match] += self.lengths[match] / 10
+
+
+def test_async_promotion_takes_a_fixed_quota_from_every_match():
+  """Short (successful) episodes must not crowd out long (failed) ones."""
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  # Half the matches score in 2 steps, half fail after 20.
+  lengths = [2, 2, 20, 20]
+  pool = _AsyncScriptedPool(lengths, successes=[1, 1, 0, 0])
+  metrics = evaluate_promotion_async(policy, pool, 8, 3, 'cpu', 4)
+  assert metrics['promotion_episodes'] == 8
+  assert metrics['promotion_success_rate'] == 0.5
+
+
+def test_masked_losses_equal_the_indexed_losses():
+  """The trainer's masked means are the same numbers as indexing first."""
+  torch.manual_seed(0)
+  mask = torch.rand(6, 5) < 0.6
+  weight = mask.float()
+  advantages = torch.randn(6, 5)
+  ratio = torch.rand(6, 5) + 0.5
+
+  def masked_mean(values):
+    return (values * weight).sum() / weight.sum()
+
+  indexed = normalize_advantages(advantages[mask])
+  expected = torch.max(-indexed * ratio[mask],
+                       -indexed * ratio[mask].clamp(0.8, 1.2)).mean()
+  mean = masked_mean(advantages)
+  std = masked_mean((advantages - mean).square()).sqrt()
+  normalized = (advantages - mean) / std
+  actual = masked_mean(torch.max(-normalized * ratio,
+                                 -normalized * ratio.clamp(0.8, 1.2)))
+  assert torch.isclose(actual, expected, atol=1e-6)
+
+
+def test_async_collection_doubles_the_rollout_buffer():
+  args = build_parser().parse_args(['--device', 'cpu', '--async-collection'])
+  config = build_config(args, 660)
+  assert config['batch_size'] // config['bptt_horizon'] == 2 * 660
 
 
 if __name__ == '__main__':

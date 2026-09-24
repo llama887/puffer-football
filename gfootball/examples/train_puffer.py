@@ -184,6 +184,13 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device,
           rows.append(info)
   finally:
     policy.train(was_training)
+  return _promotion_metrics(rows, action_counts, decisions,
+                            active_logits_rows, recurrent_horizon, greedy,
+                            aborted)
+
+
+def _promotion_metrics(rows, action_counts, decisions, active_logits_rows,
+                       recurrent_horizon, greedy, aborted):
   metrics = promotion_statistics(rows)
   diagnostics = policy_diagnostics(torch.cat(active_logits_rows))
   metrics.update({
@@ -213,16 +220,241 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device,
   return metrics
 
 
+def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
+                             recurrent_horizon, greedy=False,
+                             early_abort=None):
+  """evaluate_promotion for a pool whose matches run at their own pace.
+
+  Every match contributes its first ceil(episodes / matches) episodes and
+  nothing else.  Taking the first `episodes` to finish overall would favour
+  short episodes, and at the scoring levels a short episode is a goal.
+  Recurrent memory restarts every `recurrent_horizon` of a match's own steps
+  and at episode ends, as the asynchronous training collector does.
+  """
+  if recurrent_horizon < 1:
+    raise ValueError('recurrent_horizon must be positive')
+  per_env = vecenv.driver_env.num_agents
+  matches = vecenv.num_agents // per_env
+  quota = -(-episodes // matches)
+  vecenv.async_reset(seed)
+  generator = torch.Generator(device=device).manual_seed(seed)
+  hidden = policy.hidden_size
+  agent_h = torch.zeros(vecenv.num_agents, hidden, device=device)
+  agent_c = torch.zeros_like(agent_h)
+  match_steps = np.zeros(matches, dtype=np.int64)
+  by_match = defaultdict(list)
+  rows = []
+  action_counts = torch.zeros(len(ACTION_NAMES), dtype=torch.long)
+  active_logits_rows = []
+  decisions = 0
+  aborted = False
+  was_training = policy.training
+  policy.eval()
+  try:
+    while len(by_match) < matches or any(
+        len(taken) < quota for taken in by_match.values()):
+      if early_abort is not None and len(rows) >= early_abort[0]:
+        rate = sum(float(row['curriculum_success']) for row in rows) / len(rows)
+        if rate < early_abort[1]:
+          aborted = True
+          break
+      observations, _, terminals, _, infos, agent_ids, _ = vecenv.recv()
+      agent_ids = np.asarray(agent_ids)
+      match_ids = agent_ids[::per_env] // per_env
+      restart = match_ids[match_steps[match_ids] % recurrent_horizon == 0]
+      if len(restart):
+        fresh = torch.as_tensor(
+            (restart[:, None] * per_env + np.arange(per_env)).ravel(),
+            device=device)
+        agent_h[fresh] = 0
+        agent_c[fresh] = 0
+      match_steps[match_ids] += 1
+      index = torch.as_tensor(agent_ids, device=device)
+      observation_tensor = torch.as_tensor(observations, device=device)
+      active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
+      state = {'lstm_h': agent_h[index], 'lstm_c': agent_c[index],
+               'done': torch.as_tensor(np.asarray(terminals), device=device)}
+      with torch.no_grad():
+        logits, _ = policy.forward_eval(observation_tensor, state)
+        agent_h[index] = state['lstm_h']
+        agent_c[index] = state['lstm_c']
+        active_logits_rows.append(logits[active].float().cpu())
+        if greedy:
+          actions = logits.argmax(dim=-1)
+        else:
+          actions = torch.multinomial(
+              torch.softmax(logits.float(), dim=-1), 1,
+              generator=generator).squeeze(-1)
+      active_actions = actions[active].cpu()
+      action_counts += torch.bincount(
+          active_actions, minlength=len(ACTION_NAMES))
+      decisions += active_actions.numel()
+      for info in infos:
+        if 'curriculum_success' not in info:
+          continue
+        taken = by_match[info['env_seed']]
+        if len(taken) < quota:
+          taken.append(info)
+          rows.append(info)
+      vecenv.send(actions.cpu().numpy())
+  finally:
+    policy.train(was_training)
+  return _promotion_metrics(rows, action_counts, decisions,
+                            active_logits_rows, recurrent_horizon, greedy,
+                            aborted)
+
+
 class FootballPuffeRL(pufferl.PuffeRL):
   """PPO restricted to the agent rows the curriculum actually controls."""
 
-  def __init__(self, config, vecenv, policy, logger=None):
+  # Loss statistics accumulated on the GPU inside the minibatch loop and read
+  # back once, when the epoch is logged.
+  LOSS_NAMES = ('policy_loss', 'value_loss', 'entropy', 'gradient_norm',
+                'old_approx_kl', 'approx_kl', 'clipfrac', 'importance',
+                'minibatch_transitions')
+
+  def __init__(self, config, vecenv, policy, logger=None,
+               log_interval_seconds=0.25):
     super().__init__(config, vecenv, policy, logger=logger)
+    self.async_collection = bool(getattr(vecenv, 'is_async', False))
+    if self.async_collection:
+      self._init_async_collection()
     self.optimizer_steps = 0
-    self.active_steps = 0
+    self.active_steps = torch.zeros((), dtype=torch.long,
+                                    device=config['device'])
     self.last_active_steps = 0
     self.last_active_log_time = time.time()
     self.promotion_metrics = {}
+    # Diagnostics are only computed on epochs that are logged, so this also
+    # sets how often the trainer pays for them.
+    self.log_interval_seconds = float(log_interval_seconds)
+
+  def _init_async_collection(self):
+    """Buffers for collecting segments from envs that run at their own pace.
+
+    PuffeRL's collector steps every env exactly `horizon` times per epoch in
+    a fixed order, so one env in a 0.25 s engine reset holds up the rest.
+    Here each match fills its own `horizon`-step segment (22 agent rows) as
+    fast as it runs.  The buffer has room for two segments per match: an
+    epoch ends once one segment per match's worth is complete, and segments
+    still in progress carry over into the next epoch.  Recurrent memory still
+    starts from zero at every segment and every episode end, exactly as in
+    PuffeRL's rollout, so BPTT replays what the policy saw.
+    """
+    config = self.config
+    device = config['device']
+    self.agents_per_env = self.vecenv.driver_env.num_agents
+    self.num_matches = self.total_agents // self.agents_per_env
+    self.num_blocks = self.segments // self.agents_per_env
+    if self.num_blocks < 2 * self.num_matches:
+      raise ValueError('async collection needs a buffer of two segments per '
+                       'match; set batch_size accordingly')
+    self.blocks_per_epoch = self.num_matches
+    self.free_blocks = list(range(self.num_blocks))
+    self.complete_blocks = []
+    self.match_block = np.full(self.num_matches, -1, dtype=np.int64)
+    self.match_step = np.zeros(self.num_matches, dtype=np.int64)
+    hidden = self.uncompiled_policy.hidden_size
+    self.agent_h = torch.zeros(self.total_agents, hidden, device=device)
+    self.agent_c = torch.zeros(self.total_agents, hidden, device=device)
+    self.row_complete = torch.zeros(self.segments, dtype=torch.bool,
+                                    device=device)
+    self.agent_offsets = np.arange(self.agents_per_env)
+
+  def _evaluate_async(self):
+    profile = self.profile
+    epoch = self.epoch
+    profile('eval', epoch)
+    profile('eval_misc', epoch, nest=True)
+    config = self.config
+    device = config['device']
+    horizon = config['bptt_horizon']
+    per_env = self.agents_per_env
+
+    # Last epoch's complete segments were trained on; recycle their rows.
+    self.free_blocks.extend(self.complete_blocks)
+    self.complete_blocks = []
+    self.row_complete.zero_()
+
+    while len(self.complete_blocks) < self.blocks_per_epoch:
+      profile('env', epoch)
+      o, r, d, t, info, agent_ids, mask = self.vecenv.recv()
+
+      profile('eval_misc', epoch)
+      agent_ids = np.asarray(agent_ids)
+      matches = agent_ids[::per_env] // per_env
+      starting = matches[self.match_block[matches] < 0]
+      for match in starting:
+        self.match_block[match] = self.free_blocks.pop()
+        self.match_step[match] = 0
+      agent_index = torch.as_tensor(agent_ids, device=device)
+      if len(starting):
+        # Every segment starts from zero memory, as PuffeRL's windows do.
+        fresh = torch.as_tensor(
+            (starting[:, None] * per_env + self.agent_offsets).ravel(),
+            device=device)
+        self.agent_h[fresh] = 0
+        self.agent_c[fresh] = 0
+      rows = torch.as_tensor(
+          (self.match_block[matches][:, None] * per_env +
+           self.agent_offsets).ravel(), device=device)
+      steps = torch.as_tensor(
+          np.repeat(self.match_step[matches], per_env), device=device)
+      self.global_step += int(mask.sum())
+
+      profile('eval_copy', epoch)
+      o_device = torch.as_tensor(o).to(device)
+      r = torch.as_tensor(r).to(device)
+      d = torch.as_tensor(d).to(device)
+
+      profile('eval_forward', epoch)
+      with torch.no_grad(), self.amp_context:
+        state = {'lstm_h': self.agent_h[agent_index],
+                 'lstm_c': self.agent_c[agent_index], 'done': d}
+        logits, value = self.policy.forward_eval(o_device, state)
+        action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+        r = torch.clamp(r, -1, 1)
+
+      profile('eval_copy', epoch)
+      with torch.no_grad():
+        self.agent_h[agent_index] = state['lstm_h']
+        self.agent_c[agent_index] = state['lstm_c']
+        # Indexed writes, unlike PuffeRL's slice writes, do not cast.
+        self.observations[rows, steps] = o_device.to(self.observations.dtype)
+        self.actions[rows, steps] = action.to(self.actions.dtype)
+        self.logprobs[rows, steps] = logprob.to(self.logprobs.dtype)
+        self.rewards[rows, steps] = r.to(self.rewards.dtype)
+        self.terminals[rows, steps] = d.to(self.terminals.dtype)
+        self.values[rows, steps] = value.flatten().to(self.values.dtype)
+        action = action.cpu().numpy()
+
+      self.match_step[matches] += 1
+      for match in matches[self.match_step[matches] >= horizon]:
+        block = int(self.match_block[match])
+        self.complete_blocks.append(block)
+        self.row_complete[block * per_env:(block + 1) * per_env] = True
+        self.match_block[match] = -1
+
+      profile('eval_misc', epoch)
+      for i in info:
+        for k, v in pufferlib.unroll_nested_dict(i):
+          if isinstance(v, np.ndarray):
+            v = v.tolist()
+          elif isinstance(v, (list, tuple)):
+            self.stats[k].extend(v)
+          else:
+            self.stats[k].append(v)
+
+      profile('env', epoch)
+      self.vecenv.send(action)
+
+    profile.end()
+    return self.stats
+
+  def evaluate(self):
+    if self.async_collection:
+      return self._evaluate_async()
+    return super().evaluate()
 
   def record_promotion(self, level, metrics, advanced):
     self.promotion_metrics = {
@@ -238,7 +470,11 @@ class FootballPuffeRL(pufferl.PuffeRL):
     profile('train_misc', epoch, nest=True)
     config = self.config
     device = config['device']
-    losses = defaultdict(float)
+    done_training = (
+        self.global_step >= config['total_timesteps'])
+    log_epoch = (done_training or self.global_step == 0 or
+                 time.time() > self.last_log_time + self.log_interval_seconds)
+    losses = {}
 
     rollout_values = self.values.clone()
     advantages, returns, valid = generalized_advantages(
@@ -246,6 +482,9 @@ class FootballPuffeRL(pufferl.PuffeRL):
         config['gamma'], config['gae_lambda'])
     active = self.observations.flatten(2).abs().sum(dim=-1) > 0
     trainable = active & valid
+    if self.async_collection:
+      # Segments still being filled carry over to the next epoch.
+      trainable &= self.row_complete[:, None]
     segment_index = trainable.any(dim=1).nonzero().flatten()
     num_segments = int(segment_index.numel())
     if num_segments == 0:
@@ -257,132 +496,141 @@ class FootballPuffeRL(pufferl.PuffeRL):
     # Statistics come only from training rollouts, never from the held-out
     # promotion evaluation, so evaluation stays a clean measurement.
     self.uncompiled_policy.normalizer.update(self.observations[trainable])
-    losses['observation_scale_mean'] = float(
-        self.uncompiled_policy.normalizer.var.sqrt().mean().item())
-    losses['pre_update_explained_variance'] = explained_variance(
-        rollout_values[trainable], returns[trainable])
+    if log_epoch:
+      losses['observation_scale_mean'] = float(
+          self.uncompiled_policy.normalizer.var.sqrt().mean().item())
+      losses['pre_update_explained_variance'] = explained_variance(
+          rollout_values[trainable], returns[trainable])
 
+    # Every loss is a masked mean over the (segment, step) grid, which is the
+    # same number as indexing out the trainable rows first, without the
+    # data-dependent shapes that force a GPU sync on every minibatch.
+    trainable_weight = trainable.float()
+    clip = config['clip_coef']
+    totals = torch.zeros(len(self.LOSS_NAMES), device=device)
     for _ in range(num_minibatches):
       profile('train_copy', epoch)
       order = torch.randperm(num_segments, device=device)
       index = segment_index[order[:segments_per_minibatch]]
-      mask = trainable[index]
-      observations = self.observations[index]
-      actions = self.actions[index]
+      mask = trainable_weight[index]
+      count = mask.sum()
+      denominator = count.clamp_min(1)
+
+      def masked_mean(values):
+        return (values * mask).sum() / denominator
 
       profile('train_forward', epoch)
       logits, new_values = self.policy(
-          observations, {'done': self.terminals[index]})
+          self.observations[index], {'done': self.terminals[index]})
       _, new_logprobs, entropy = pufferlib.pytorch.sample_logits(
-          logits, action=actions)
+          logits, action=self.actions[index])
 
       profile('train_misc', epoch)
-      new_logprobs = new_logprobs.view(mask.shape)[mask]
-      entropy = entropy.view(mask.shape)[mask]
-      old_logprobs = self.logprobs[index][mask]
-      old_values = rollout_values[index][mask]
-      mb_returns = returns[index][mask]
-      mb_values = new_values[mask]
-
-      log_ratio = new_logprobs - old_logprobs
+      new_logprobs = new_logprobs.view(mask.shape)
+      entropy = entropy.view(mask.shape)
+      old_values = rollout_values[index]
+      mb_returns = returns[index]
+      log_ratio = new_logprobs - self.logprobs[index]
       ratio = log_ratio.exp()
-      with torch.no_grad():
-        losses['old_approx_kl'] += (-log_ratio).mean().item()
-        losses['approx_kl'] += ((ratio - 1) - log_ratio).mean().item()
-        losses['clipfrac'] += (
-            (ratio - 1).abs() > config['clip_coef']).float().mean().item()
-        losses['importance'] += ratio.mean().item()
 
-      mb_advantages = normalize_advantages(advantages[index][mask])
-      policy_loss = torch.max(
+      mb_advantages = advantages[index].float()
+      advantage_mean = masked_mean(mb_advantages)
+      advantage_std = masked_mean(
+          (mb_advantages - advantage_mean).square()).sqrt().clamp_min(1e-8)
+      mb_advantages = (mb_advantages - advantage_mean) / advantage_std
+      policy_loss = masked_mean(torch.max(
           -mb_advantages * ratio,
-          -mb_advantages * ratio.clamp(
-              1 - config['clip_coef'], 1 + config['clip_coef'])).mean()
-      clipped_values = old_values + (mb_values - old_values).clamp(
+          -mb_advantages * ratio.clamp(1 - clip, 1 + clip)))
+      clipped_values = old_values + (new_values - old_values).clamp(
           -config['vf_clip_coef'], config['vf_clip_coef'])
-      value_loss = 0.5 * torch.max(
-          (mb_values - mb_returns) ** 2,
-          (clipped_values - mb_returns) ** 2).mean()
-      entropy_loss = entropy.mean()
+      value_loss = 0.5 * masked_mean(torch.max(
+          (new_values - mb_returns) ** 2,
+          (clipped_values - mb_returns) ** 2))
+      entropy_loss = masked_mean(entropy)
       loss = (policy_loss + config['vf_coef'] * value_loss -
               config['ent_coef'] * entropy_loss)
 
       profile('learn', epoch)
-      self.optimizer.zero_grad()
+      self.optimizer.zero_grad(set_to_none=True)
       loss.backward()
       gradient_norm = torch.nn.utils.clip_grad_norm_(
           self.policy.parameters(), config['max_grad_norm'])
       self.optimizer.step()
       self.optimizer_steps += 1
 
-      losses['policy_loss'] += policy_loss.item()
-      losses['value_loss'] += value_loss.item()
-      losses['entropy'] += entropy_loss.item()
-      losses['gradient_norm'] += gradient_norm.item()
-      losses['minibatch_transitions'] += float(mask.sum().item())
+      with torch.no_grad():
+        totals += torch.stack((
+            policy_loss, value_loss, entropy_loss, gradient_norm,
+            masked_mean(-log_ratio),
+            masked_mean((ratio - 1) - log_ratio),
+            masked_mean(((ratio - 1).abs() > clip).float()),
+            masked_mean(ratio),
+            count)).detach()
 
     profile('train_misc', epoch)
-    for name in ('policy_loss', 'value_loss', 'entropy', 'gradient_norm',
-                 'old_approx_kl', 'approx_kl', 'clipfrac', 'importance',
-                 'minibatch_transitions'):
-      losses[name] /= num_minibatches
-
     if config['anneal_lr']:
       self.scheduler.step()
+    self.active_steps += trainable.sum()
 
-    active_transitions = int(trainable.sum().item())
-    self.active_steps += active_transitions
-    now = time.time()
-    losses.update({
-        'optimizer_steps': float(self.optimizer_steps),
-        'ppo_minibatches': float(num_minibatches),
-        'active_agent_fraction': active.float().mean().item(),
-        'active_transitions': float(active_transitions),
-        'active_segments': float(num_segments),
-        'advantage_mean': advantages[trainable].mean().item(),
-        'advantage_std': advantages[trainable].std(unbiased=False).item(),
-        'positive_reward_fraction': (
-            self.rewards[active] > 0).float().mean().item(),
-        'negative_reward_fraction': (
-            self.rewards[active] < 0).float().mean().item(),
-        'learning_rate': self.optimizer.param_groups[0]['lr'],
-        'active_SPS': (
-            (self.active_steps - self.last_active_steps) /
-            max(1e-6, now - self.last_active_log_time)),
-    })
-    self.last_active_steps = self.active_steps
-    self.last_active_log_time = now
+    if log_epoch:
+      for name, value in zip(self.LOSS_NAMES,
+                             (totals / num_minibatches).tolist()):
+        losses[name] = value
+      active_steps = int(self.active_steps.item())
+      now = time.time()
+      reward_signs = torch.stack((
+          (self.rewards[active] > 0).float().mean(),
+          (self.rewards[active] < 0).float().mean(),
+          advantages[trainable].mean(),
+          advantages[trainable].std(unbiased=False),
+          active.float().mean())).tolist()
+      losses.update({
+          'optimizer_steps': float(self.optimizer_steps),
+          'ppo_minibatches': float(num_minibatches),
+          'active_agent_fraction': reward_signs[4],
+          'active_transitions': float(trainable.sum().item()),
+          'active_segments': float(num_segments),
+          'advantage_mean': reward_signs[2],
+          'advantage_std': reward_signs[3],
+          'positive_reward_fraction': reward_signs[0],
+          'negative_reward_fraction': reward_signs[1],
+          'learning_rate': self.optimizer.param_groups[0]['lr'],
+          'active_SPS': (
+              (active_steps - self.last_active_steps) /
+              max(1e-6, now - self.last_active_log_time)),
+      })
+      self.last_active_steps = active_steps
+      self.last_active_log_time = now
 
-    # Post-update health has to replay whole segments: a recurrent critic
-    # scored from a zeroed hidden state is not the critic that acts.
-    with torch.no_grad():
-      index = segment_index[:min(64, num_segments)]
-      sample_mask = trainable[index]
-      post_logits, post_values = self.policy(
-          self.observations[index], {'done': self.terminals[index]})
-      post_logits = post_logits.view(*sample_mask.shape, -1)[sample_mask]
-      for name, value in policy_diagnostics(post_logits).items():
-        losses[name] = value.item()
-      losses['post_update_explained_variance'] = explained_variance(
-          post_values[sample_mask], returns[index][sample_mask])
-    losses['explained_variance'] = losses['pre_update_explained_variance']
+      # Post-update health has to replay whole segments: a recurrent critic
+      # scored from a zeroed hidden state is not the critic that acts.
+      with torch.no_grad():
+        index = segment_index[:min(64, num_segments)]
+        sample_mask = trainable[index]
+        post_logits, post_values = self.policy(
+            self.observations[index], {'done': self.terminals[index]})
+        post_logits = post_logits.view(*sample_mask.shape, -1)[sample_mask]
+        for name, value in policy_diagnostics(post_logits).items():
+          losses[name] = value.item()
+        losses['post_update_explained_variance'] = explained_variance(
+            post_values[sample_mask], returns[index][sample_mask])
+      losses['explained_variance'] = losses['pre_update_explained_variance']
 
-    active_actions = self.actions[active]
-    action_fractions = [
-        (active_actions == index).float().mean().item()
-        for index in range(len(ACTION_NAMES))]
-    for index, name in enumerate(ACTION_NAMES):
-      losses['action_{}_fraction'.format(name)] = action_fractions[index]
-    losses['max_action_fraction'] = max(action_fractions)
-    losses['shot_fraction'] = action_fractions[SHOT_ACTION]
-    losses.update(self.promotion_metrics)
+      action_counts = torch.bincount(
+          self.actions[active].long().flatten(),
+          minlength=len(ACTION_NAMES)).float()
+      action_fractions = (
+          action_counts / action_counts.sum().clamp_min(1)).tolist()
+      for index, name in enumerate(ACTION_NAMES):
+        losses['action_{}_fraction'.format(name)] = action_fractions[index]
+      losses['max_action_fraction'] = max(action_fractions)
+      losses['shot_fraction'] = action_fractions[SHOT_ACTION]
+      losses.update(self.promotion_metrics)
 
     profile.end()
     logs = None
     self.epoch += 1
-    done_training = self.global_step >= config['total_timesteps']
-    if (done_training or self.global_step == 0 or
-        time.time() > self.last_log_time + 0.25):
+    if log_epoch:
       self.losses = losses
       logs = self.mean_and_log()
       self.print_dashboard()
@@ -405,10 +653,21 @@ def _base_config():
     sys.argv = original_argv
 
 
+def _async_batch_workers(args, num_workers, promotion=False):
+  flag = 'async_promotion' if promotion else 'async_collection'
+  if not getattr(args, flag, False):
+    return None
+  if args.async_batch_workers is not None:
+    return args.async_batch_workers
+  return max(1, num_workers // 3)
+
+
 def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
   return make_vector_env(
       num_envs=args.promotion_workers, num_workers=args.promotion_workers,
       batch_size=args.promotion_workers, reserved_cpus=0,
+      async_batch_workers=_async_batch_workers(
+          args, args.promotion_workers, promotion=True),
       seed=args.seed + 1000000, env_name=args.env_name,
       frame_stack=args.frame_stack,
       curriculum_levels=args.curriculum_levels,
@@ -422,24 +681,73 @@ def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
       frozen_defence_horizon=args.bptt_horizon)
 
 
+def rearm_for_reset(vecenv):
+  """Let a synchronous Multiprocessing vecenv be reset() again.
+
+  After a completed step() every worker is idle and its infos have already
+  been read, but a worker that reported an episode end still has its
+  semaphore at INFO.  PufferLib's async_reset flushes waiting workers by
+  reading the pipe of every INFO worker a second time, which blocks forever;
+  that was the promotion deadlock.  Nothing is in flight, so there is
+  nothing to flush.
+  """
+  # An asynchronous pool has workers in flight; PufferLib's own flush waits
+  # for them and reads each pending INFO exactly once.
+  if hasattr(vecenv, 'waiting_workers') and not getattr(
+      vecenv, 'is_async', False):
+    vecenv.waiting_workers = []
+    vecenv.ready_workers = []
+
+
+_PROMOTION_POOLS = {}
+
+
+def _promotion_pool(args, level_value, frozen_defence_path):
+  """One persistent worker pool per opponent type (frozen or self-play).
+
+  Building a pool starts 30 processes and a game engine in each, 10-20 s
+  apiece, and the gate used to build three per check.
+  """
+  key = frozen_defence_path
+  if key not in _PROMOTION_POOLS:
+    _PROMOTION_POOLS[key] = _make_promotion_env(
+        args, level_value, frozen_defence_path)
+  return _PROMOTION_POOLS[key]
+
+
+def close_promotion_pools():
+  while _PROMOTION_POOLS:
+    _, pool = _PROMOTION_POOLS.popitem()
+    pool.close()
+
+
 def _run_promotion(args, policy, level_value, level, device, episodes,
                    frozen_defence_path=None, greedy=False, early_abort=None):
-  """One held-out evaluation on a fresh promotion env.
+  """One held-out evaluation.
 
-  A fresh env per evaluation is deliberate.  Reusing one deadlocks:
-  evaluate_promotion returns as soon as it has enough episodes, so the vecenv
-  is left mid-flight with outstanding send/recv pairs and the next reset()
-  never completes.
+  With --reuse-promotion-envs the worker pool persists across evaluations and
+  each reset(seed) reseeds the engines in place, which replays exactly the
+  episodes a freshly built pool would.  Otherwise a fresh pool is built and
+  torn down every time.
   """
-  promotion_env = _make_promotion_env(args, level_value, frozen_defence_path)
+  reuse = getattr(args, 'reuse_promotion_envs', False)
+  if reuse:
+    promotion_env = _promotion_pool(args, level_value, frozen_defence_path)
+    rearm_for_reset(promotion_env)
+  else:
+    promotion_env = _make_promotion_env(args, level_value, frozen_defence_path)
+  evaluate = (evaluate_promotion_async
+              if getattr(promotion_env, 'is_async', False)
+              else evaluate_promotion)
   try:
-    return evaluate_promotion(
+    return evaluate(
         policy, promotion_env, episodes,
         args.seed + 1000000 + 10000 * level, device,
         recurrent_horizon=args.bptt_horizon, greedy=greedy,
         early_abort=early_abort)
   finally:
-    promotion_env.close()
+    if not reuse:
+      promotion_env.close()
 
 
 def _prefixed(prefix, metrics):
@@ -534,6 +842,37 @@ def build_parser():
   parser.add_argument('--wandb-project', default='google-football-fast-rl')
   parser.add_argument('--wandb-group', default='self-play-lstm-ppo')
   parser.add_argument('--wandb-tag', default=None)
+  # Throughput.  None of these change what PPO computes except
+  # --minibatch-segments, which sets how many optimizer steps a rollout gets.
+  parser.add_argument('--envs-per-worker', type=int, default=1,
+                      help='matches stepped by each worker process')
+  parser.add_argument('--async-collection',
+                      action=argparse.BooleanOptionalAction, default=False,
+                      help='collect training segments from whichever '
+                           'matches are ready, so engine resets never stall '
+                           'other matches')
+  parser.add_argument('--async-promotion',
+                      action=argparse.BooleanOptionalAction, default=False,
+                      help='run promotion evaluation asynchronously too; '
+                           'faster, but sampled results then depend on '
+                           'timing, while the synchronous gate replays the '
+                           'same episodes and random numbers every check')
+  parser.add_argument('--async-batch-workers', type=int, default=None,
+                      help='workers per policy batch with --async-collection '
+                           '(default: a third of the workers)')
+  parser.add_argument('--compile', action=argparse.BooleanOptionalAction,
+                      default=False,
+                      help='torch.compile the BPTT forward pass')
+  parser.add_argument('--compile-mode', default='max-autotune-no-cudagraphs')
+  parser.add_argument('--log-interval-seconds', type=float, default=0.25,
+                      help='log and compute diagnostics at most this often')
+  parser.add_argument('--reuse-promotion-envs',
+                      action=argparse.BooleanOptionalAction, default=True,
+                      help='keep the promotion worker pools alive between '
+                           'checks instead of rebuilding three per check')
+  parser.add_argument('--benchmark-epochs', type=int, default=0,
+                      help='time this many training epochs after a warmup, '
+                           'print BENCHMARK json and exit; skips promotion')
   return parser
 
 
@@ -546,11 +885,16 @@ def build_config(args, num_agents):
       'adam_beta2': 0.999,
       'adam_eps': 1e-5,
       'anneal_lr': args.anneal_lr,
-      'batch_size': num_agents * horizon,
+      # Async collection keeps room for two segments per agent so matches
+      # that run ahead keep writing while slow ones finish theirs.
+      'batch_size': num_agents * horizon * (
+          2 if getattr(args, 'async_collection', False) else 1),
       'bptt_horizon': horizon,
       'checkpoint_interval': 200,
       'clip_coef': args.clip_coef,
-      'compile': False,
+      'compile': args.compile,
+      'compile_mode': args.compile_mode,
+      'compile_fullgraph': False,
       'cpu_offload': False,
       'data_dir': os.path.abspath(args.data_dir),
       'device': args.device,
@@ -579,6 +923,40 @@ def build_config(args, num_agents):
   return config
 
 
+def benchmark(trainer, epochs, warmup=5):
+  """Steady-state rollout and update time per epoch, promotion excluded."""
+  def synchronize():
+    if trainer.config['device'] == 'cuda':
+      torch.cuda.synchronize()
+
+  for _ in range(warmup):
+    trainer.evaluate()
+    trainer.train()
+  rollout = update = 0.0
+  steps = trainer.global_step
+  for _ in range(epochs):
+    synchronize()
+    started = time.perf_counter()
+    trainer.evaluate()
+    synchronize()
+    middle = time.perf_counter()
+    trainer.train()
+    synchronize()
+    rollout += middle - started
+    update += time.perf_counter() - middle
+  steps = trainer.global_step - steps
+  return {
+      'epochs': epochs,
+      'agent_steps': steps,
+      'rollout_seconds': rollout,
+      'update_seconds': update,
+      'sps': steps / (rollout + update),
+      'rollout_sps': steps / rollout,
+      'update_fraction': update / (rollout + update),
+      'optimizer_steps': trainer.optimizer_steps,
+  }
+
+
 def main():
   args = build_parser().parse_args()
   advantage_schedule = args.env_name == ADVANTAGE_ENV_NAME
@@ -597,9 +975,11 @@ def main():
   torch.manual_seed(args.seed)
   np.random.seed(args.seed)
 
+  num_envs = args.num_workers * args.envs_per_worker
   env = make_vector_env(
-      num_envs=args.num_workers, num_workers=args.num_workers,
-      batch_size=args.num_workers, reserved_cpus=0, seed=args.seed,
+      num_envs=num_envs, num_workers=args.num_workers, batch_size=num_envs,
+      async_batch_workers=_async_batch_workers(args, args.num_workers),
+      reserved_cpus=0, seed=args.seed,
       env_name=args.env_name, frame_stack=args.frame_stack,
       curriculum_levels=args.curriculum_levels,
       curriculum_window=args.curriculum_window,
@@ -640,6 +1020,10 @@ def main():
       'frozen_defence_gate': args.frozen_defence_gate,
       'greedy_promotion_episodes': args.greedy_promotion_episodes,
       'selfplay_promotion_episodes': args.selfplay_promotion_episodes,
+      'envs_per_worker': args.envs_per_worker,
+      'async_collection': args.async_collection,
+      'compile': args.compile,
+      'reuse_promotion_envs': args.reuse_promotion_envs,
   }, sort_keys=True), flush=True)
 
   policy = FootballPolicy(env, hidden_size=args.hidden_size).to(args.device)
@@ -650,7 +1034,21 @@ def main():
         'wandb_group': args.wandb_group,
         'tag': args.wandb_tag,
     })
-  trainer = FootballPuffeRL(config, env, policy, logger=logger)
+  trainer = FootballPuffeRL(
+      config, env, policy, logger=logger,
+      log_interval_seconds=args.log_interval_seconds)
+  if args.benchmark_epochs:
+    try:
+      print('BENCHMARK ' + json.dumps(
+          benchmark(trainer, args.benchmark_epochs), sort_keys=True),
+          flush=True)
+    except BaseException:
+      import traceback
+      traceback.print_exc()
+      os._exit(1)
+    # PufferLib's Multiprocessing close can hang at interpreter exit once the
+    # workers are gone; a benchmark has nothing to save.
+    os._exit(0)
   level_entry_epoch = 0
   # The gate opponent is the policy as it was on entering the level.  Against
   # the live self-play opponent, "attackers score 60%" was a moving target:
@@ -715,6 +1113,7 @@ def main():
       trainer.evaluate()
       trainer.train()
   finally:
+    close_promotion_pools()
     model_path = trainer.close()
     if logger is not None:
       logger.close(model_path)

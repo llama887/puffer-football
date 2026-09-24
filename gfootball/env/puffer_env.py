@@ -226,6 +226,10 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._frozen_steps = 0
     self._full_observations = None
     self._env = self._make_env()
+    # Where a freshly built engine's episode counter starts, so an in-place
+    # reseed can put it back there.
+    self._initial_episode_number = self._env.unwrapped._config[
+        'episode_number']
     self._episode_return = np.zeros(2, dtype=np.float32)
     self._episode_length = 0
     # Goals are far too rare to read progress from: a whole evaluation yields
@@ -403,10 +407,22 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self.observations[~self._active_mask] = 0
 
   def reset(self, seed=None):
-    if seed is not None and int(seed) != self._seed:
-      self._env.close()
+    if seed is not None:
+      # Reseed in place instead of rebuilding the engine (10-20 s).  A fresh
+      # engine is fully determined by these two values: the engine reseeds
+      # its RNG from the scenario seed at every kickoff, and spawns depend
+      # only on (seed, episode number).  This runs even for an unchanged
+      # seed, so a reused promotion pool replays the same episodes each time.
       self._seed = int(seed)
-      self._env = self._make_env()
+      config = self._env.unwrapped._config
+      config['game_engine_random_seed'] = self._seed
+      config['episode_number'] = self._initial_episode_number
+      self._curriculum_results.clear()
+    if self._frozen_defence_path is not None:
+      # A persistent promotion pool outlives promotions; the snapshot on disk
+      # changes when a level is cleared, so reload it on every reset.
+      self._frozen_policy = None
+      self._frozen_steps = 0
     self._write_observations(self._reset_match())
     self.rewards.fill(0)
     self.terminals.fill(False)
@@ -494,6 +510,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
           'curriculum_frozen_defence': float(
               self._frozen_defence_path is not None),
           'curriculum_evaluation': float(self._curriculum_evaluation),
+          # Identifies the match, so an asynchronous evaluator can take a
+          # fixed quota of episodes from every match.
+          'env_seed': float(self._seed),
           'episode_length': self._episode_length,
           'possession_fraction': (
               self._possession_steps / max(1, self._episode_length)),
@@ -523,8 +542,14 @@ class FootballPufferEnv(pufferlib.PufferEnv):
 
 def make_vector_env(num_envs=None, num_workers=None, batch_size=None,
                     reserved_cpus=2, seed=0, centralized_curriculum=False,
-                    **env_kwargs):
-  """Create one headless match per PufferLib multiprocessing worker."""
+                    async_batch_workers=None, **env_kwargs):
+  """Create one headless match per PufferLib multiprocessing worker.
+
+  `async_batch_workers` switches PufferLib to its fully asynchronous path:
+  every recv() returns whichever that many workers finished first, in any
+  order, so a worker stuck in a 0.25 s engine reset delays nobody else.  The
+  caller must then track agents by the ids recv() returns.
+  """
   if num_workers is None:
     available_cpus = (len(psutil.Process().cpu_affinity())
                       if hasattr(psutil.Process(), 'cpu_affinity') else
@@ -537,13 +562,24 @@ def make_vector_env(num_envs=None, num_workers=None, batch_size=None,
       raise ValueError('centralized curriculum already has a shared level')
     from multiprocessing import RawValue
     env_kwargs['curriculum_level_value'] = RawValue('i', 0)
+  is_async = async_batch_workers is not None
+  if is_async:
+    if not 0 < async_batch_workers < num_workers:
+      raise ValueError('async_batch_workers must be between 1 and '
+                       'num_workers - 1')
+    batch_size = async_batch_workers * (num_envs // num_workers)
   vecenv = pufferlib.vector.make(
       partial(FootballPufferEnv, **env_kwargs),
       backend=pufferlib.vector.Multiprocessing,
       num_envs=num_envs,
       num_workers=num_workers,
       batch_size=batch_size,
-      zero_copy=True,
+      zero_copy=not is_async,
       seed=seed)
+  if is_async:
+    # recv() reads these per call; make() does not accept sync_traj.
+    vecenv.zero_copy = False
+    vecenv.sync_traj = False
+  vecenv.is_async = is_async
   vecenv.curriculum_level_value = env_kwargs.get('curriculum_level_value')
   return vecenv
