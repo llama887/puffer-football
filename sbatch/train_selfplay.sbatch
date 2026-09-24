@@ -8,17 +8,29 @@
 #SBATCH --time=48:00:00
 #SBATCH --account=torch_pr_355_tandon_advanced
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=wz2445@nyu.edu
-#SBATCH --chdir=/scratch/wz2445/puffer-football
-#SBATCH --output=/scratch/wz2445/puffer-football/sbatch/logs/%x-%j.out
-#SBATCH --error=/scratch/wz2445/puffer-football/sbatch/logs/%x-%j.err
+# Submit from the repo root; logs land in its sbatch/logs.  Slurm mails the
+# submitting user.  Override account and GPU on the command line, e.g.
+# sbatch --account=... --partition=l40s_public --gres=gpu:1 ...
+#SBATCH --output=sbatch/logs/%x-%j.out
+#SBATCH --error=sbatch/logs/%x-%j.err
 
 set -euo pipefail
 
-REPO=/scratch/wz2445/puffer-football
-ENV_PREFIX="$REPO/.venv"
-TOOLCHAIN_PREFIX=/scratch/wz2445/.conda/envs/football-fast
-RUN_ROOT=/scratch/wz2445/experiments/football-selfplay-${SLURM_JOB_ID}
+# Paths follow whoever submits: the repo is the submit directory and runs go
+# under /scratch/$USER/experiments.  Each one can be overridden.
+REPO=${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}
+ENV_PREFIX=${ENV_PREFIX:-$REPO/.venv}
+TOOLCHAIN_PREFIX=${TOOLCHAIN_PREFIX:-/scratch/$USER/.conda/envs/football-fast}
+EXPERIMENTS_DIR=${EXPERIMENTS_DIR:-/scratch/$USER/experiments}
+if [[ -z ${PUFFER_SOCCER:-} ]]; then
+  for candidate in /scratch/$USER/repos/Puffer-Soccer /scratch/$USER/Puffer-Soccer; do
+    if [[ -d $candidate ]]; then
+      PUFFER_SOCCER=$candidate
+      break
+    fi
+  done
+fi
+PUFFER_SOCCER=${PUFFER_SOCCER:-/scratch/$USER/Puffer-Soccer}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 
 # Single-seed results on this task are not reliable: the same configuration
@@ -29,10 +41,10 @@ NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 SEED_BASE=${SEED_BASE:-20260917}
 if [[ -n ${SLURM_ARRAY_TASK_ID:-} ]]; then
   SEED=${SEED:-$((SEED_BASE + SLURM_ARRAY_TASK_ID))}
-  RUN_ROOT=/scratch/fyy2003/experiments/football-selfplay-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}
+  RUN_ROOT=$EXPERIMENTS_DIR/football-selfplay-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}
 else
   SEED=${SEED:-$SEED_BASE}
-  RUN_ROOT=/scratch/fyy2003/experiments/football-selfplay-${SLURM_JOB_ID}
+  RUN_ROOT=$EXPERIMENTS_DIR/football-selfplay-${SLURM_JOB_ID}
 fi
 
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
@@ -151,9 +163,9 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
-if [ -f /scratch/wz2445/Puffer-Soccer/.env ]; then
+if [ -f "$PUFFER_SOCCER/.env" ]; then
   set -a
-  source /scratch/wz2445/Puffer-Soccer/.env
+  source "$PUFFER_SOCCER/.env"
   set +a
 fi
 
@@ -181,8 +193,8 @@ trap cleanup EXIT
 
 nvidia-smi
 if [[ $GPU_HEARTBEAT == 1 ]]; then
-  nice -n 19 /scratch/fyy2003/repos/Puffer-Soccer/.venv/bin/python -u \
-    /scratch/fyy2003/repos/Puffer-Soccer/sbatch/gpu_heartbeat.py &
+  nice -n 19 "$PUFFER_SOCCER/.venv/bin/python" -u \
+    "$PUFFER_SOCCER/sbatch/gpu_heartbeat.py" &
   HEARTBEAT_PID=$!
   echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
 fi
