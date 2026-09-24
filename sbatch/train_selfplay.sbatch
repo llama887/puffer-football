@@ -32,11 +32,6 @@ if [[ -z ${PUFFER_SOCCER:-} ]]; then
 fi
 PUFFER_SOCCER=${PUFFER_SOCCER:-/scratch/$USER/Puffer-Soccer}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
-# Matches held per worker.  Above 1, PufferLib collects the next batch while
-# the policy consumes the current one, so a match resetting -- which costs far
-# more than a step -- no longer stalls every other worker.  Each extra match is
-# another resident GRF engine, so watch memory before raising this.
-ENVS_PER_WORKER=${ENVS_PER_WORKER:-2}
 
 # Single-seed results on this task are not reliable: the same configuration
 # clears level 0 anywhere between 175 and 2275 epochs depending on the seed.
