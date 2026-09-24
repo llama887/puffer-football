@@ -39,6 +39,14 @@ def summarize(path, rows):
       epoch += row['epochs_on_level']
       cleared[level] = epoch
   last = rows[-1] if rows else {}
+
+  def latest(key):
+    # Diagnostic evaluations run only on some checks; report the newest.
+    for row in reversed(rows):
+      if key in row:
+        return row[key]
+    return None
+
   return {
       'path': path,
       'evaluations': len(rows),
@@ -49,8 +57,8 @@ def summarize(path, rows):
       'success': last.get('promotion_success_rate'),
       'worst': last.get('promotion_worst_template_success_rate'),
       'worst_two': last.get('promotion_worst_two_template_success_rate'),
-      'greedy_success': last.get('greedy_promotion_success_rate'),
-      'selfplay_success': last.get('selfplay_promotion_success_rate'),
+      'greedy_success': latest('greedy_promotion_success_rate'),
+      'selfplay_success': latest('selfplay_promotion_success_rate'),
       'entropy': last.get('promotion_policy_entropy_fraction'),
       'max_probability': last.get('promotion_policy_max_probability'),
       'eval_seconds': last.get('promotion_wall_seconds'),

@@ -54,7 +54,8 @@ def configuration(index):
       GREEDY_PROMOTION_EPISODES=64, SELFPLAY_PROMOTION_EPISODES=64,
       ENV_NAME='11_vs_11_advantage',
       # Throughput only; recorded so a result says how it was trained.
-      ASYNC_COLLECTION=1, ASYNC_PROMOTION=1, COMPILE=1, GPU_FILLER=1,
+      ASYNC_COLLECTION=1, ASYNC_PROMOTION=1, OVERLAP_COLLECTION=1,
+      GRAPH_UPDATE=1, GRAPH_ACTOR=1, COMPILE=0, GPU_FILLER=1,
       LOCAL_GAME_DATA=1)
 
 

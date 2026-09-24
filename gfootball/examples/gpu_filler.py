@@ -11,7 +11,7 @@ This filler runs inside the trainer process instead.  Kernels from one
 process on different streams run side by side, so a filler that occupies a
 few SMs at a time keeps a kernel resident nearly always while the trainer's
 kernels keep the rest of the device.  The work is a captured CUDA graph of
-small matmuls, replayed from a background thread that waits with the GIL
+small kernels, replayed from a background thread that waits with the GIL
 released, so it costs the trainer almost no CPU either.  Two replays are
 kept queued, so the GPU still has filler work while the thread waits to
 get the GIL back from the trainer.
@@ -23,10 +23,19 @@ import torch
 
 
 class GpuFiller:
-  """Replay a graph of small matmuls on a side stream until stopped."""
+  """Replay a graph of filler kernels on a side stream until stopped.
+
+  kind='sleep' (default) chains single-thread spin kernels: the device
+  counts as busy while occupying one SM, so it barely touches training.
+  kind='matmul' chains matrix_size^2 matmuls, which spread over the device.
+  """
 
   def __init__(self, device='cuda', matrix_size=1024, matmuls_per_replay=400,
-               dtype=torch.bfloat16):
+               dtype=torch.bfloat16, kind='sleep', sleep_cycles=100_000):
+    if kind not in ('sleep', 'matmul'):
+      raise ValueError('kind must be sleep or matmul')
+    self.kind = kind
+    self.sleep_cycles = int(sleep_cycles)
     self.device = torch.device(device)
     self.matrix_size = int(matrix_size)
     self.matmuls_per_replay = int(matmuls_per_replay)
@@ -36,6 +45,16 @@ class GpuFiller:
     self.replays = 0
 
   def _capture(self):
+    if self.kind == 'sleep':
+      self._stream = torch.cuda.Stream(device=self.device)
+      with torch.cuda.stream(self._stream):
+        torch.cuda._sleep(self.sleep_cycles)
+      self._stream.synchronize()
+      self._graph = torch.cuda.CUDAGraph()
+      with torch.cuda.graph(self._graph, stream=self._stream):
+        for _ in range(self.matmuls_per_replay):
+          torch.cuda._sleep(self.sleep_cycles)
+      return
     size = self.matrix_size
     self._left = torch.randn(size, size, device=self.device, dtype=self.dtype)
     self._right = torch.randn(size, size, device=self.device, dtype=self.dtype)

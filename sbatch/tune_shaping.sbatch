@@ -1,12 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=football-shaping-tune
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH --time=04:00:00
-# Submit from the repo root.  Any GPU type works: training is CPU-bound and
-# the trainer keeps GPU utilization up itself.
+# Submit from the repo root.  48 CPUs: environment throughput scales with
+# cores (Torch allows 48 per L40S-class GPU).  Any GPU type works: training
+# is CPU-bound and the trainer keeps GPU utilization up itself.
 #SBATCH --output=sbatch/logs/%x-%A_%a.out
 #SBATCH --error=sbatch/logs/%x-%A_%a.err
 set -euo pipefail
