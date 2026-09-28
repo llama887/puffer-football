@@ -99,12 +99,17 @@ def sort_players_by_distance(observations):
 def ball_potential(advance, scale):
   """Potential of a state for the side attacking the goal at advance +1.
 
-  Ng, Harada and Russell (1999) shape the gridworld with minus the distance
-  to the goal, an estimate of V*.  Here the distance is the ball's from the
-  goal line it is being carried toward, in the [-1, 1] pitch coordinate, so
-  the potential is zero on that line and most negative at the far end.
+  Ng, Harada and Russell (1999) shape with an estimate of V*; here it is how
+  far the ball has been carried toward the attacked goal line, in the [-1, 1]
+  pitch coordinate: +scale on that line, -scale on the far one.  The other
+  team's potential is this at -advance, i.e. exactly its negative, so the
+  two teams' shaping cancels on every step, terminal correction included,
+  and the shaped game stays zero-sum like the score.  An earlier form,
+  -scale * (1 - advance), differed per team only by a constant but summed to
+  -2 * scale, which paid both teams together 2 * scale * (1 - gamma) per
+  step and 2 * scale at every episode end.
   """
-  return -float(scale) * (1.0 - float(advance))
+  return float(scale) * float(advance)
 
 
 def potential_shaping(previous, current, gamma, terminal):
@@ -167,9 +172,17 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                curriculum_evaluation=False, sort_players=True,
                frozen_defence_path=None, frozen_defence_horizon=32,
                ball_potential_scale=0.0, potential_gamma=0.99,
-               player_potential_scale=0.0):
+               player_potential_scale=0.0, spawn='curriculum'):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
+    # 'curriculum' spawns each level's scene; 'uniform' ignores levels and
+    # places the ball and players uniformly (see 11_vs_11_advantage).
+    if spawn not in ('curriculum', 'uniform'):
+      raise ValueError("spawn must be 'curriculum' or 'uniform'")
+    if spawn == 'uniform' and env_name != ADVANTAGE_ENV_NAME:
+      raise ValueError('uniform spawn needs ' + ADVANTAGE_ENV_NAME)
+    # Set before _make_env, which reads it when building the engine.
+    self._spawn = spawn
     if frozen_defence_horizon < 1:
       raise ValueError('frozen_defence_horizon must be positive')
     for name, scale in (('ball_potential_scale', ball_potential_scale),
@@ -309,6 +322,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
             # costs ten engine queries per controlled player per step.
             'needs_sticky_actions': False,
             'real_time': False,
+            'uniform_spawn': self._spawn == 'uniform',
         })
 
   def _reset_match(self):

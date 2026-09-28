@@ -373,6 +373,70 @@ def test_shaping_controls_share_discount_and_stay_out_of_promotion():
   assert 'player_potential_scale' not in make.call_args.kwargs
 
 
+def test_spawn_mode_defaults_to_curriculum_and_reaches_the_gate():
+  """The gate must score on the same spawn distribution the policy trains on."""
+  from gfootball.examples.train_puffer import _make_promotion_env
+  assert build_parser().parse_args([]).spawn == 'curriculum'
+  args = build_parser().parse_args(['--spawn', 'uniform'])
+  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
+    _make_promotion_env(args, SimpleNamespace(value=0))
+  assert make.call_args.kwargs['spawn'] == 'uniform'
+
+
+def test_learning_rate_decays_once_over_the_whole_run():
+  """The learning rate reaches zero at the end of the run and stays there.
+
+  PufferLib sizes its cosine schedule as total_timesteps // batch_size, but
+  async collection doubles batch_size as buffer room while an epoch still
+  consumes one segment per agent.  A 1B-step run then hit zero at ~500M and,
+  the cosine being periodic, climbed back to the full rate by 1B: measured
+  ~10% of the rate from 350M to 650M steps and 100% again at the end.
+  """
+  from gfootball.examples.train_puffer import cosine_learning_rate_schedule
+  config = build_config(build_parser().parse_args(['--device', 'cpu']), 660)
+  assert config['steps_per_epoch'] == 660 * config['bptt_horizon']
+  assert config['batch_size'] == 2 * config['steps_per_epoch']
+  parameter = torch.nn.Parameter(torch.zeros(1))
+  optimizer = torch.optim.Adam([parameter], lr=1e-3)
+  scheduler, total_epochs = cosine_learning_rate_schedule(
+      optimizer, 1_000_000_000, config['steps_per_epoch'])
+  assert total_epochs == math.ceil(1_000_000_000 / config['steps_per_epoch'])
+  rates = []
+  for _ in range(int(total_epochs * 1.2)):
+    rates.append(optimizer.param_groups[0]['lr'])
+    optimizer.step()
+    scheduler.step()
+  assert rates[0] == 1e-3
+  assert all(later <= earlier + 1e-15 for earlier, later in zip(rates, rates[1:]))
+  assert abs(rates[total_epochs // 2] - 5e-4) < 1e-6
+  assert rates[total_epochs] < 1e-12
+  assert max(rates[total_epochs:]) < 1e-12
+
+
+def test_gate_score_is_logged_per_level_against_the_level_entry_policy():
+  """Each gate result is also logged under its own level's name.
+
+  The gate opponent is the policy as it was on entering the level, fixed for
+  as long as the level trains, so each level's line should rise while that
+  level is learning and go flat when it stalls.
+  """
+  from gfootball.examples.train_puffer import FootballPuffeRL
+  trainer = object.__new__(FootballPuffeRL)
+  trainer.record_promotion(5, {
+      'promotion_success_rate': 0.4,
+      'promotion_worst_two_template_success_rate': 0.2,
+      'promotion_episodes': 256.0,
+      'promotion_mean_episode_length': 90.0}, advanced=False)
+  logged = trainer.promotion_metrics
+  assert logged['promotion_success_rate'] == 0.4
+  assert logged['level_entry/success_rate'] == 0.4
+  assert logged['level_entry/level_5/success_rate'] == 0.4
+  assert logged['level_entry/level_5/worst_two_template_success_rate'] == 0.2
+  assert logged['level_entry/level_5/episodes'] == 256.0
+  assert not any(key.startswith('level_entry/level_4') for key in logged)
+  assert not hasattr(build_parser().parse_args([]), 'initial_opponent_interval')
+
+
 def test_update_epochs_cover_the_active_data_at_least_once():
   for num_segments in (1, 7, 30, 60, 660):
     for requested in (1, 16, 64):

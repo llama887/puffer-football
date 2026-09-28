@@ -21,6 +21,17 @@ opponent's half the ball starts:
 Contrast with a positional handicap: deferring all opposition to the later
 levels teaches nothing but "shoot at an open goal", which is precisely what
 the previous schedule produced.
+
+With the config value 'uniform_spawn' set, levels are ignored instead: the
+ball and every outfield player are placed uniformly over the pitch, each
+keeper uniformly inside its own penalty area, and anyone who would start
+offside is moved back onside.  That is the no-curriculum alternative: some
+spawns land players next to the ball near a goal by chance, so there is
+always something scoreable without maintaining a level schedule.
+
+Every episode ends as soon as the ball goes out of play.  With the magnet off
+the engine never designates a set-piece taker, so a goal kick, corner or
+throw-in would otherwise freeze the match until the timeout.
 """
 
 import math
@@ -135,23 +146,100 @@ def _carrier_spawn(rank, ball_x, ball_y, direction, rng):
 
 
 # Lateral lane each successive blocker takes, as a multiple of _LANE_WIDTH.
-# The first blocker sits off to one side (the measured level-0 anchor, left
-# exactly as it was).  The second MIRRORS it on the other side, so the pair is
-# symmetric and the shot line between them stays open; only the third closes
-# the middle.  Before this the second blocker landed on the shot line itself.
+# The first blocker sits off to one side; which side is a per-episode coin
+# flip (see _blocker_spawn).  The second MIRRORS it on the other side, so the
+# pair is symmetric and the shot line between them stays open; only the third
+# closes the middle.  Before this the second blocker landed on the shot line.
 _BLOCKER_LANES = (-1, 1, 0)
 _LANE_WIDTH = 0.085
 
+# Uniform spawn: a keeper's own penalty area, as distance in from its goal
+# line and lateral half-width, in pitch units.
+_KEEPER_BOX_DEPTH = 0.15
+_KEEPER_BOX_HALF_WIDTH = 0.2
+_UNIFORM_DURATION = 400
 
-def _blocker_spawn(rank, ball_x, ball_y, direction, rng):
-  """A defensive line between the ball and the goal it protects."""
+
+def _blocker_spawn(rank, ball_x, ball_y, direction, side, rng):
+  """A defensive line between the ball and the goal it protects.
+
+  `side` (+1 or -1) mirrors the lanes.  With a fixed side a lone blocker
+  always stood on the world -y side of the ball, so it landed inside the
+  goal mouth only for balls on the +y side: one template of each mirror pair
+  was much harder than the other.
+  """
   row, slot = divmod(rank, len(_BLOCKER_LANES))
   depth = 0.07 + 0.04 * row
-  offset = _BLOCKER_LANES[slot] * _LANE_WIDTH
+  offset = side * _BLOCKER_LANES[slot] * _LANE_WIDTH
   forward_room = max(0.04, _PITCH_X - abs(ball_x))
   depth = min(depth, forward_room)
   return (ball_x + direction * depth,
           ball_y + offset + rng.uniform(-0.004, 0.004))
+
+
+def _onside(attackers, defenders, ball_x, sign, rng):
+  """Move every attacker that would start offside back to an onside spot.
+
+  `sign` is +1 for the team attacking +x.  In attacking-direction units an
+  attacker is offside when it is in the opponents' half and nearer their goal
+  line than both the ball and the second-last opponent; such an attacker gets
+  a new x drawn uniformly between its own end and that line.  Moving
+  attackers back only ever loosens the other team's line, so one pass per
+  team leaves both teams legal.
+  """
+  second_last = sorted((sign * x for x, _ in defenders), reverse=True)[1]
+  line = max(0.0, sign * ball_x, second_last)
+  return [(x, y) if sign * x <= line else
+          (sign * rng.uniform(-_PITCH_X, line), y) for x, y in attackers]
+
+
+def _build_uniform(builder, values, seed, episode, cycle):
+  """Uniform no-curriculum spawn: ball and players anywhere, all onside.
+
+  Positions are drawn in world coordinates (left team attacking +x), spread
+  apart, then made onside; the ball's half decides which side counts as
+  attacking for success statistics, as in the curriculum spawn.
+  """
+  rng = random.Random('{}:{}:uniform'.format(seed, episode))
+  ball_x = rng.uniform(-_PITCH_X, _PITCH_X)
+  ball_y = rng.uniform(-_PITCH_Y, _PITCH_Y)
+  attack_right = ball_x > 0
+  values['curriculum_episode_attackers'] = 11
+  values['curriculum_episode_template'] = cycle % SPAWN_TEMPLATE_COUNT
+  values['curriculum_goalside_defenders'] = 0
+  builder._config['reverse_team_processing'] = not attack_right
+  builder.SetBallPosition(ball_x, ball_y)
+  builder.config().game_duration = _UNIFORM_DURATION
+  builder.config().deterministic = False
+  builder.config().use_magnet = False
+  builder.config().offsides = True
+  builder.config().end_episode_on_score = True
+  builder.config().end_episode_on_out_of_play = True
+
+  # Order: left keeper, right keeper, 10 left outfield, 10 right outfield.
+  players = [
+      (side * rng.uniform(-1.0, -1.0 + _KEEPER_BOX_DEPTH),
+       rng.uniform(-_KEEPER_BOX_HALF_WIDTH, _KEEPER_BOX_HALF_WIDTH))
+      for side in (1.0, -1.0)]
+  players += [(rng.uniform(-_PITCH_X, _PITCH_X), rng.uniform(-_PITCH_Y, _PITCH_Y))
+              for _ in range(20)]
+  # Spreading players apart can nudge one offside and moving one onside can
+  # land it on another, so alternate until a pass moves nobody.
+  for _ in range(10):
+    players = _separate(players)
+    left = _onside(players[2:12], [players[1]] + players[12:22], ball_x,
+                   1.0, rng)
+    right = _onside(players[12:22], [players[0]] + left, ball_x, -1.0, rng)
+    moved = left != players[2:12] or right != players[12:22]
+    players = players[:2] + left + right
+    if not moved:
+      break
+  for team, keeper, outfield in ((Team.e_Left, players[0], players[2:12]),
+                                 (Team.e_Right, players[1], players[12:22])):
+    builder.SetTeam(team)
+    for index, (_, _, role) in enumerate(_FORMATION):
+      position = keeper if index == 0 else outfield[index - 1]
+      builder.AddPlayer(*_to_team_coordinates(team, *position), role)
 
 
 def build_scenario(builder):
@@ -162,13 +250,20 @@ def build_scenario(builder):
   evaluation = bool(values.get('curriculum_evaluation', False))
 
   cycle = seed + episode
+  if values.get('uniform_spawn', False):
+    _build_uniform(builder, values, seed, episode, cycle)
+    return
   attack_right = (cycle // SPAWN_TEMPLATE_COUNT) % 2 == 0
   template = cycle % SPAWN_TEMPLATE_COUNT
   values['curriculum_episode_attackers'] = 11
   values['curriculum_episode_template'] = template
   builder._config['reverse_team_processing'] = not attack_right
 
-  rng = random.Random(seed + episode)
+  # Template and direction follow seed + episode so they cycle evenly, but
+  # the rest of the scene is keyed on the (seed, episode) pair: evaluation
+  # workers run consecutive seeds through consecutive episodes, and a sum key
+  # made worker i's episode e the same scene as worker i+1's episode e-1.
+  rng = random.Random('{}:{}'.format(seed, episode))
   phase = 1 / 6 + 2 / 3 * (
       template + (0.5 if evaluation else rng.random())) / SPAWN_TEMPLATE_COUNT
   # phase covers [1/6, 5/6]; rescale it onto [-1, 1] so the band edges are
@@ -188,15 +283,19 @@ def build_scenario(builder):
   # attacking team at spawn.  It only comes on once formations are normal.
   builder.config().offsides = advantage <= 0.1
   builder.config().end_episode_on_score = True
+  builder.config().end_episode_on_out_of_play = True
 
   # Lay every outfield player out in world coordinates first, so overlaps can
   # be resolved across both teams before anyone is committed to the scenario.
   attacking_team = Team.e_Left if attack_right else Team.e_Right
-  # A separate generator for the blocker draw keeps every other spawn draw,
-  # and therefore level 0 itself, bit-identical to the measured anchor.
+  # A separate generator for the blocker draw, keyed like `rng`, so adding or
+  # removing blockers never shifts any other spawn draw.
   goalside = goalside_blockers(
-      advantage, random.Random((seed + episode) * 1000003 + 97).random())
+      advantage, random.Random('{}:{}:blockers'.format(seed, episode)).random())
   values['curriculum_goalside_defenders'] = goalside
+  # Own generator again, so the coin flip moves no other draw.
+  blocker_side = (1.0 if random.Random(
+      '{}:{}:blocker_side'.format(seed, episode)).random() < 0.5 else -1.0)
   outfield = []
   for team in (Team.e_Left, Team.e_Right):
     attacking = team == attacking_team
@@ -224,7 +323,7 @@ def build_scenario(builder):
             rank - 2, team_phase, ball_x, ball_y, direction, rng)
       elif rank < goalside:
         contested, pinned = _blocker_spawn(
-            rank, ball_x, ball_y, direction, rng), True
+            rank, ball_x, ball_y, direction, blocker_side, rng), True
       else:
         # The rest of the defence holds its normal shape; ringing every
         # defender around the ball leaves the carrier no room to shoot.

@@ -305,6 +305,92 @@ class PufferEnvTest(absltest.TestCase):
       self.assertAlmostEqual(
           phase, 1 / 6 + 2 / 3 * (template + 0.5) / 8)
 
+  def test_advantage_scenes_differ_for_every_seed_and_episode(self):
+    """Consecutive worker seeds through consecutive episodes are new scenes.
+
+    The promotion gate runs worker seeds s, s+1, ... through episodes 0, 1,
+    ...  When a scene's randomness depended only on seed + episode, worker
+    i's episode e and worker i+1's episode e-1 were the same scene: the
+    256-episode gate replayed 38 scenes and three training seeds one apart
+    shared 36 of them.
+    """
+    scenes = set()
+    for seed, episode in ((100, 5), (101, 4), (102, 3), (105, 0)):
+      cfg = _advantage_config(0.75, evaluation=True, seed=seed)
+      cfg.NewScenario(episode)
+      scenario = cfg.ScenarioConfig()
+      scenes.add((round(scenario.ball_position[0], 6),
+                  round(scenario.ball_position[1], 6)))
+    self.assertLen(scenes, 4)
+
+  def test_episodes_end_when_the_ball_goes_out_of_play(self):
+    """With the magnet off no set-piece taker is ever designated.
+
+    A goal kick, corner or throw-in then never restarts and the match sits
+    frozen until the timeout, so the episode ends as soon as play stops.
+    """
+    for advantage in (1.0, 0.5, 0.0):
+      cfg = _advantage_config(advantage)
+      cfg.NewScenario(0)
+      self.assertTrue(cfg.ScenarioConfig().end_episode_on_out_of_play)
+    cfg = _advantage_config(1.0)
+    cfg['uniform_spawn'] = True
+    cfg.NewScenario(0)
+    self.assertTrue(cfg.ScenarioConfig().end_episode_on_out_of_play)
+
+  def test_uniform_spawn_places_everyone_legally_across_the_pitch(self):
+    """Uniform spawn: whole pitch, keepers in their box, nobody offside."""
+    balls = []
+    for seed in range(150):
+      cfg = _advantage_config(1.0, evaluation=False, seed=seed)
+      cfg['uniform_spawn'] = True
+      cfg.NewScenario(seed % 5)
+      scenario = cfg.ScenarioConfig()
+      ball = (scenario.ball_position[0], scenario.ball_position[1])
+      balls.append(ball)
+      self.assertTrue(scenario.offsides)
+      self.assertLen(scenario.left_team, 11)
+      self.assertLen(scenario.right_team, 11)
+      # The left team is stored in world coordinates, the right team in its
+      # own mirrored frame.
+      left = [(p.position[0], p.position[1]) for p in scenario.left_team]
+      right = [(-p.position[0], -p.position[1]) for p in scenario.right_team]
+      for x, y in left + right + [ball]:
+        self.assertLessEqual(abs(x), 1.0)
+        self.assertLessEqual(abs(y), 0.42)
+      for keeper_x, keeper_y in ((-left[0][0], left[0][1]),
+                                 (right[0][0], right[0][1])):
+        self.assertGreaterEqual(keeper_x, 0.84)
+        self.assertLessEqual(abs(keeper_y), 0.2)
+      # The left team attacks +x, the right team -x.  An attacker in the
+      # opponents' half may be no nearer their goal line than both the ball
+      # and the second-last opponent.
+      for attackers, defenders, sign in ((left, right, 1.0),
+                                         (right, left, -1.0)):
+        second_last = sorted((sign * x for x, _ in defenders),
+                             reverse=True)[1]
+        line = max(0.0, sign * ball[0], second_last)
+        for x, _ in attackers:
+          self.assertLessEqual(sign * x, line + 1e-6)
+    xs = [x for x, _ in balls]
+    ys = [y for _, y in balls]
+    self.assertLess(min(xs), -0.6)
+    self.assertGreater(max(xs), 0.6)
+    self.assertLess(min(ys), -0.2)
+    self.assertGreater(max(ys), 0.2)
+
+  def test_spawn_mode_reaches_the_scenario(self):
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=3,
+        curriculum_levels=ADVANTAGE_LEVELS, spawn='uniform')
+    try:
+      env.reset()
+      self.assertTrue(env._env.unwrapped._config['uniform_spawn'])
+    finally:
+      env.close()
+    with self.assertRaisesRegex(ValueError, 'spawn'):
+      puffer_env.FootballPufferEnv(spawn='random')
+
   def test_inactive_curriculum_players_are_hidden_and_forced_idle(self):
     env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
     try:
@@ -535,13 +621,28 @@ class PufferEnvTest(absltest.TestCase):
     # Level 3 used to be a hard two-blocker level; now it is 60% likely.
     self.assertAlmostEqual(means[3], 1.6, places=2)
 
-  def test_level_zero_blocker_geometry_is_the_measured_anchor(self):
-    cfg = _advantage_config(1.0)
-    for _ in range(2 * SPAWN_TEMPLATE_COUNT):
-      cfg.NewScenario()
-      self.assertEqual(cfg._values['curriculum_goalside_defenders'], 1)
-      (offset,) = _blocker_world_offsets(cfg, 1)
-      self.assertAlmostEqual(offset, -0.085, delta=0.02)
+  def test_lone_blocker_side_is_mirrored_at_random(self):
+    """A lone blocker takes either lane, so mirror templates are equally hard.
+
+    It used to sit on the world -y side of the ball every time, which put it
+    inside the goal mouth only for balls spawned on the +y side: template 7
+    scored 0.50 at level 0 while its mirror, template 0, scored 0.64-0.97.
+    """
+    sides = {template: set() for template in range(SPAWN_TEMPLATE_COUNT)}
+    offsets = []
+    for seed in range(40):
+      cfg = _advantage_config(1.0, seed=seed)
+      for _ in range(SPAWN_TEMPLATE_COUNT):
+        cfg.NewScenario()
+        self.assertEqual(cfg._values['curriculum_goalside_defenders'], 1)
+        (offset,) = _blocker_world_offsets(cfg, 1)
+        self.assertAlmostEqual(abs(offset), 0.085, delta=0.02)
+        offsets.append(offset)
+        sides[cfg._values['curriculum_episode_template']].add(offset > 0)
+    self.assertAlmostEqual(
+        sum(offset > 0 for offset in offsets) / len(offsets), 0.5, delta=0.1)
+    for template, seen in sides.items():
+      self.assertEqual(seen, {True, False}, template)
 
   def test_second_blocker_mirrors_the_first_and_the_third_fills_the_middle(self):
     """Two blockers must leave the shot line open; only the third closes it."""
@@ -549,9 +650,10 @@ class PufferEnvTest(absltest.TestCase):
     for _ in range(2 * SPAWN_TEMPLATE_COUNT):
       cfg.NewScenario()
       self.assertEqual(cfg._values['curriculum_goalside_defenders'], 2)
-      first, second = _blocker_world_offsets(cfg, 2)
-      self.assertAlmostEqual(first, -0.085, delta=0.02)
-      self.assertAlmostEqual(second, 0.085, delta=0.02)
+      # Mirroring may swap which of the pair takes which lane.
+      low, high = sorted(_blocker_world_offsets(cfg, 2))
+      self.assertAlmostEqual(low, -0.085, delta=0.02)
+      self.assertAlmostEqual(high, 0.085, delta=0.02)
     cfg = _advantage_config(0.5)  # exactly three
     cfg.NewScenario()
     self.assertEqual(cfg._values['curriculum_goalside_defenders'], 3)
@@ -581,8 +683,8 @@ class PufferEnvTest(absltest.TestCase):
     This is the return identity required for policy invariance.
     """
     gamma, scale = 0.9, 2.0
-    self.assertEqual(puffer_env.ball_potential(1.0, scale), 0.0)
-    self.assertEqual(puffer_env.ball_potential(-1.0, scale), -4.0)
+    self.assertEqual(puffer_env.ball_potential(1.0, scale), 2.0)
+    self.assertEqual(puffer_env.ball_potential(-1.0, scale), -2.0)
     for advances in ([0.9, 0.95, 1.0], [0.9, 0.5, 0.2, 0.7], [0.3]):
       potentials = [puffer_env.ball_potential(a, scale) for a in advances]
       total = 0.0
@@ -601,6 +703,33 @@ class PufferEnvTest(absltest.TestCase):
     self.assertLess(puffer_env.potential_shaping(
         puffer_env.ball_potential(0.95, 1.0),
         puffer_env.ball_potential(0.9, 1.0), 1.0, False), 0)
+
+  def test_ball_shaping_is_zero_sum_between_the_teams(self):
+    """Each team's ball potential is the other's negative.
+
+    The score is zero-sum across the 22 players, so the shaping must be too:
+    on every step, including the terminal correction and across an episode
+    reset, all 22 rewards sum to zero.
+    """
+    for advance in (-1.0, -0.3, 0.0, 0.9, 1.0):
+      self.assertEqual(puffer_env.ball_potential(advance, 2.0) +
+                       puffer_env.ball_potential(-advance, 2.0), 0.0)
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
+        curriculum_levels=ADVANTAGE_LEVELS, ball_potential_scale=1.0,
+        potential_gamma=0.997)
+    try:
+      env.reset()
+      episodes = 0
+      for _ in range(1500):
+        _, rewards, terminals, _, _ = env.step(np.full(22, 5, dtype=np.int32))
+        self.assertAlmostEqual(float(np.sum(rewards)), 0.0, places=4)
+        episodes += int(np.asarray(terminals).any())
+        if episodes == 2:
+          break
+      self.assertEqual(episodes, 2, 'test must cross an episode reset')
+    finally:
+      env.close()
 
   def test_closest_player_potential_geometry_and_identity_changes(self):
     """Use the ball position, physical distance, and only present players."""
@@ -708,11 +837,14 @@ class PufferEnvTest(absltest.TestCase):
       attacking = slice(0, 11) if env._attacking_left else slice(11, 22)
       defending = slice(11, 22) if env._attacking_left else slice(0, 11)
       start_potential = env._attack_potential
-      self.assertLess(start_potential, 0.0)
+      # The ball spawns in the defenders' half: positive for the attackers.
+      self.assertGreater(start_potential, 0.0)
+      self.assertAlmostEqual(env._defence_potential, -start_potential)
       # Sprint toward the goal with everyone: the ball carrier advances it.
       shaped_total = 0.0
+      shaped_discounted = 0.0
       infos = []
-      for _ in range(400):
+      for step in range(400):
         previous_attack = env._attack_potential
         previous_defence = env._defence_potential
         _, rewards, _, _, infos = env.step(np.full(22, 5, dtype=np.int32))
@@ -724,17 +856,17 @@ class PufferEnvTest(absltest.TestCase):
         np.testing.assert_allclose(rewards[defending], defence, atol=1e-6)
         score = float(plain_rewards[attacking][0])
         shaped_total += attack - score
+        shaped_discounted += gamma ** step * (attack - score)
         if infos:
           # The absorbing state has zero potential, so the last step refunds
           # each side exactly its own potential, whatever the final frame.
           self.assertAlmostEqual(attack - score, -previous_attack, places=5)
           self.assertAlmostEqual(defence + score, -previous_defence, places=5)
           break
-        # ... and until then the two sides are shaped in opposite directions,
-        # up to the (1 - gamma) constant, on top of the zero-sum score.
+        # ... and until then the two sides are shaped in exactly opposite
+        # directions, so shaping is zero-sum like the score.
         self.assertAlmostEqual(
-            (attack - score) + (defence + score), 2 * scale * (1 - gamma),
-            places=5)
+            (attack - score) + (defence + score), 0.0, places=5)
       self.assertTrue(infos)
       info = infos[0]
       # Success and the score returns are untouched by shaping.
@@ -745,10 +877,9 @@ class PufferEnvTest(absltest.TestCase):
                      else 'right_episode_return'] > 0))
       self.assertAlmostEqual(
           info['attacking_shaping_return'], shaped_total, places=4)
-      # Telescoped: the episode's shaping is -Phi(s_0) plus the tiny drift,
-      # which for a spawn near the goal is a small number, not a goal's worth.
-      self.assertLess(abs(shaped_total + start_potential), 0.05 + 0.02)
-      self.assertLess(abs(shaped_total), 0.2)
+      # Telescoped: discounted, the episode's shaping is exactly
+      # -Phi(s_0), whatever happened in between.
+      self.assertAlmostEqual(shaped_discounted, -start_potential, places=5)
     finally:
       env.close()
       plain.close()

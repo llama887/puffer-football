@@ -59,12 +59,18 @@ GAMMA=${GAMMA:-0.997}
 GAE_LAMBDA=${GAE_LAMBDA:-0.98}
 # Potential-based shaping on ball progress toward the attacked goal
 # (Ng, Harada & Russell 1999): F = gamma*Phi(s') - Phi(s) with
-# Phi = -BALL_POTENTIAL * distance-to-goal-line.  Leaves the optimal policy
-# unchanged; 0 disables.  Uses GAMMA above as the discount.
+# Phi = BALL_POTENTIAL * ball x toward the attacked goal (in [-1, 1]); the
+# other team gets exactly the negative, so shaping is zero-sum.  Leaves the
+# optimal policy unchanged; 0 disables.  Uses GAMMA above as the discount,
+# which it must: a different discount leaves a real reward proportional
+# to Phi.
 BALL_POTENTIAL=${BALL_POTENTIAL:-0}
 # Distance of the nearest teammate to the ball, combined
 # with the ball potential before the same discounted potential difference.
 PLAYER_POTENTIAL=${PLAYER_POTENTIAL:-0}
+# SPAWN=uniform ignores curriculum levels and places the ball and players
+# uniformly over the pitch, all onside (advantage env only).
+SPAWN=${SPAWN:-curriculum}
 UPDATE_EPOCHS=${UPDATE_EPOCHS:-4}
 BPTT_HORIZON=${BPTT_HORIZON:-32}
 MINIBATCH_SEGMENTS=${MINIBATCH_SEGMENTS:-32}
@@ -136,6 +142,12 @@ FROZEN_GATE_ARGS=(--frozen-defence-gate)
 if [[ ${FROZEN_DEFENCE_GATE:-1} == 0 ]]; then
   FROZEN_GATE_ARGS=(--no-frozen-defence-gate)
 fi
+# FROZEN_DEFENCE_INIT: start the gate opponent from a fixed policy file.
+if [[ -n ${FROZEN_DEFENCE_INIT:-} ]]; then
+  FROZEN_GATE_ARGS+=(--frozen-defence-init "$FROZEN_DEFENCE_INIT")
+fi
+# Gate success needed to advance a level; above 1 keeps training on one level.
+CURRICULUM_SUCCESS_THRESHOLD=${CURRICULUM_SUCCESS_THRESHOLD:-0.6}
 
 mkdir -p "$RUN_ROOT/checkpoints" "$REPO/sbatch/logs"
 
@@ -215,7 +227,7 @@ cd "$RUN_ROOT"
   --frame-stack "$FRAME_STACK" \
   --hidden-size "$HIDDEN_SIZE" \
   --curriculum-window 20 \
-  --curriculum-success-threshold 0.6 \
+  --curriculum-success-threshold "$CURRICULUM_SUCCESS_THRESHOLD" \
   --learning-rate "$LEARNING_RATE" \
   --ent-coef "$ENT_COEF" \
   --vf-coef "$VF_COEF" \
@@ -223,6 +235,7 @@ cd "$RUN_ROOT"
   --gamma "$GAMMA" \
   --ball-potential "$BALL_POTENTIAL" \
   --player-potential "$PLAYER_POTENTIAL" \
+  --spawn "$SPAWN" \
   --gae-lambda "$GAE_LAMBDA" \
   --update-epochs "$UPDATE_EPOCHS" \
   --bptt-horizon "$BPTT_HORIZON" \

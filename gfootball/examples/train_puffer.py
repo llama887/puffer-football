@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 
 import numpy as np
@@ -58,6 +59,24 @@ def generalized_advantages(values, rewards, terminals, gamma, gae_lambda):
   valid = torch.ones_like(terminals, dtype=torch.bool)
   valid[:, -1] = False
   return advantages, advantages + values, valid
+
+
+def cosine_learning_rate_schedule(optimizer, total_timesteps, steps_per_epoch):
+  """Cosine decay to zero over the epochs the run actually takes, then zero.
+
+  Replaces PufferLib's CosineAnnealingLR, which it sizes as
+  total_timesteps // batch_size.  Async collection doubles batch_size as
+  buffer room while every epoch still consumes one segment per agent
+  (steps_per_epoch), so that schedule reached zero halfway through a run and,
+  being periodic, climbed back to the full rate by the end.  This one is
+  sized from steps_per_epoch and clamped at its last epoch, so it can only
+  ever decrease.  Returns (scheduler, total_epochs).
+  """
+  total_epochs = max(1, math.ceil(total_timesteps / steps_per_epoch))
+  scheduler = torch.optim.lr_scheduler.LambdaLR(
+      optimizer, lambda epoch: 0.5 * (
+          1 + math.cos(math.pi * min(epoch, total_epochs) / total_epochs)))
+  return scheduler, total_epochs
 
 
 def normalize_advantages(advantages):
@@ -400,6 +419,10 @@ class FootballPuffeRL(pufferl.PuffeRL):
   def __init__(self, config, vecenv, policy, logger=None,
                log_interval_seconds=0.25):
     super().__init__(config, vecenv, policy, logger=logger)
+    # PufferLib's scheduler assumes batch_size agent steps per epoch; see
+    # cosine_learning_rate_schedule for why that restarted the rate mid-run.
+    self.scheduler, self.total_epochs = cosine_learning_rate_schedule(
+        self.optimizer, config['total_timesteps'], config['steps_per_epoch'])
     self.async_collection = bool(getattr(vecenv, 'is_async', False))
     if self.async_collection:
       self._init_async_collection()
@@ -497,7 +520,9 @@ class FootballPuffeRL(pufferl.PuffeRL):
                  'lstm_c': self.agent_c[agent_index], 'done': d}
         logits, value = self.policy.forward_eval(o_device, state)
         action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
-        r = torch.clamp(r, -1, 1)
+        # Rewards are stored unclipped.  Clipping to [-1, 1] cut the terminal
+        # refund of potential-based shaping (up to 2 * ball scale), so the
+        # shaping stopped telescoping and changed what is optimal.
 
       profile('eval_copy', epoch)
       with torch.no_grad():
@@ -541,10 +566,12 @@ class FootballPuffeRL(pufferl.PuffeRL):
     return super().evaluate()
 
   def record_promotion(self, level, metrics, advanced):
+    """Keep the latest gate result, also keyed by its level, for the next log."""
     self.promotion_metrics = {
         'promotion_level': float(level),
         'promotion_advanced': float(advanced),
         **metrics,
+        **level_entry_metrics(level, metrics),
     }
 
   def train(self):
@@ -762,7 +789,9 @@ def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
       sort_players=args.sort_players,
       curriculum_evaluation=True,
       frozen_defence_path=frozen_defence_path,
-      frozen_defence_horizon=args.bptt_horizon)
+      frozen_defence_horizon=args.bptt_horizon,
+      # The gate scores on the same spawn distribution the policy trains on.
+      spawn=args.spawn)
 
 
 def rearm_for_reset(vecenv):
@@ -838,6 +867,27 @@ def _prefixed(prefix, metrics):
   return {prefix + name: value for name, value in metrics.items()}
 
 
+def level_entry_metrics(level, metrics):
+  """Name a gate result by its level so each level gets its own progress line.
+
+  The gate opponent is the policy as it was on entering the level (the one
+  that cleared the level before; for level 0 the untrained policy, or the
+  --frozen-defence-init file), fixed for as long as the level trains.  The
+  score rate against it should therefore rise while a level is learning and
+  go flat when it stalls; keying by level keeps each level's line separate
+  in the logger.  The un-keyed rate is one continuous series across levels.
+  """
+  prefix = 'level_entry/level_{}/'.format(int(level))
+  return {
+      'level_entry/level': float(level),
+      'level_entry/success_rate': metrics['promotion_success_rate'],
+      prefix + 'success_rate': metrics['promotion_success_rate'],
+      prefix + 'worst_two_template_success_rate':
+          metrics['promotion_worst_two_template_success_rate'],
+      prefix + 'episodes': metrics['promotion_episodes'],
+  }
+
+
 def build_parser():
   parser = argparse.ArgumentParser()
   parser.add_argument('--num-workers', type=int, default=30)
@@ -849,6 +899,12 @@ def build_parser():
   parser.add_argument('--total-timesteps', type=int, default=1_000_000_000)
   parser.add_argument('--env-name', default='11_vs_11_curriculum',
                       choices=('11_vs_11_curriculum', ADVANTAGE_ENV_NAME))
+  parser.add_argument('--spawn', default='curriculum',
+                      choices=('curriculum', 'uniform'),
+                      help='curriculum: each level spawns its own scene; '
+                           'uniform: ignore levels and place the ball and '
+                           'players uniformly over the pitch, all onside '
+                           '(advantage env only)')
   parser.add_argument('--curriculum-levels', type=int, default=None)
   parser.add_argument('--start-level', type=int, default=0,
                       help='begin at this curriculum level instead of 0')
@@ -879,6 +935,11 @@ def build_parser():
                       help='gate promotion against a frozen snapshot of the '
                            'policy taken on entering the level, instead of '
                            'the live self-play opponent')
+  parser.add_argument('--frozen-defence-init', default=None,
+                      help='start the gate opponent from this policy file '
+                           'instead of the untrained policy, so every gate '
+                           'evaluation on the starting level is scored '
+                           'against the same fixed defence')
   parser.add_argument('--greedy-promotion-episodes', type=int, default=64,
                       help='extra argmax-action evaluation per promotion '
                            'check (diagnostic only); 0 disables')
@@ -908,10 +969,12 @@ def build_parser():
   parser.add_argument('--gamma', type=float, default=0.99)
   parser.add_argument('--ball-potential', type=float, default=0.0,
                       help='potential-based shaping scale k: each side is '
-                           'rewarded gamma*Phi(s\')-Phi(s) with Phi = -k * '
-                           '(distance of the ball from the goal it attacks), '
-                           'which leaves the optimal policy unchanged (Ng, '
-                           'Harada & Russell 1999); 0 disables')
+                           'rewarded gamma*Phi(s\')-Phi(s) with Phi = k * '
+                           '(ball x toward the goal it attacks, in [-1, 1]); '
+                           'the other team gets exactly the negative, so '
+                           'shaping is zero-sum and leaves the optimal '
+                           'policy unchanged (Ng, Harada & Russell 1999); '
+                           '0 disables')
   parser.add_argument('--gae-lambda', type=float, default=0.95)
   parser.add_argument('--player-potential', type=float, default=0.0,
                       help='potential-based shaping scale for the closest '
@@ -999,6 +1062,9 @@ def build_config(args, num_agents):
       'batch_size': num_agents * horizon * (
           2 if getattr(args, 'async_collection', False) else 1),
       'bptt_horizon': horizon,
+      # Agent steps one epoch consumes: one segment per agent, whatever
+      # buffer room batch_size keeps for async collection.
+      'steps_per_epoch': num_agents * horizon,
       'checkpoint_interval': 200,
       'clip_coef': args.clip_coef,
       'compile': args.compile,
@@ -1101,7 +1167,8 @@ def main():
       # the evaluation envs are built without it.
       ball_potential_scale=args.ball_potential,
       player_potential_scale=args.player_potential,
-      potential_gamma=args.gamma)
+      potential_gamma=args.gamma,
+      spawn=args.spawn)
   if not 0 <= args.start_level < args.curriculum_levels:
     raise ValueError('start-level must be inside the curriculum')
   # The launcher exports OMP_NUM_THREADS=1 so the env workers do not each
@@ -1137,6 +1204,7 @@ def main():
       'promotion_early_abort_margin': args.promotion_early_abort_margin,
       'ball_potential': args.ball_potential,
       'player_potential': args.player_potential,
+      'spawn': args.spawn,
       'frozen_defence_gate': args.frozen_defence_gate,
       'greedy_promotion_episodes': args.greedy_promotion_episodes,
       'selfplay_promotion_episodes': args.selfplay_promotion_episodes,
@@ -1180,7 +1248,10 @@ def main():
   frozen_defence_path = None
   if args.frozen_defence_gate:
     frozen_defence_path = os.path.join(args.data_dir, 'frozen_defence.pt')
-    save_policy_snapshot(policy, frozen_defence_path)
+    if args.frozen_defence_init:
+      shutil.copyfile(args.frozen_defence_init, frozen_defence_path)
+    else:
+      save_policy_snapshot(policy, frozen_defence_path)
   early_abort = None
   if args.promotion_early_abort_margin > 0:
     early_abort = (
