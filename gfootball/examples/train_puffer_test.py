@@ -11,7 +11,8 @@ import torch
 from gfootball.env.puffer_policy import (
     hidden_size_from_state_dict, upgrade_state_dict)
 from gfootball.examples.train_puffer import (
-    ACTION_NAMES, SHOT_ACTION, FootballPolicy, build_config, build_parser,
+    ACTION_NAMES, SHOT_ACTION, FootballPolicy, FootballPuffeRL, GraphedActor,
+    build_config, build_parser,
     evaluate_promotion, evaluate_promotion_async, explained_variance,
     generalized_advantages, normalize_advantages,
     policy_diagnostics, promotion_passes, promotion_statistics)
@@ -383,34 +384,63 @@ def test_spawn_mode_defaults_to_curriculum_and_reaches_the_gate():
   assert make.call_args.kwargs['spawn'] == 'uniform'
 
 
-def test_learning_rate_decays_once_over_the_whole_run():
-  """The learning rate reaches zero at the end of the run and stays there.
+def test_learning_rate_follows_training_progress():
+  """Cosine decay by agent steps done, reaching zero exactly at the end.
 
-  PufferLib sizes its cosine schedule as total_timesteps // batch_size, but
-  async collection doubles batch_size as buffer room while an epoch still
-  consumes one segment per agent.  A 1B-step run then hit zero at ~500M and,
-  the cosine being periodic, climbed back to the full rate by 1B: measured
-  ~10% of the rate from 350M to 650M steps and 100% again at the end.
+  PufferLib sized its cosine schedule in epochs as total_timesteps //
+  batch_size, but batch_size is buffer room (2x for async collection, 3x
+  with overlap) while epochs consume one segment per agent, and overlap
+  drops surplus segments, so no epoch count is right.  A 1B-step run hit
+  zero at ~500M and, the cosine being periodic, climbed back to the full
+  rate by 1B.  Tying the rate to steps done fixes it for any batching.
   """
-  from gfootball.examples.train_puffer import cosine_learning_rate_schedule
-  config = build_config(build_parser().parse_args(['--device', 'cpu']), 660)
-  assert config['steps_per_epoch'] == 660 * config['bptt_horizon']
-  assert config['batch_size'] == 2 * config['steps_per_epoch']
-  parameter = torch.nn.Parameter(torch.zeros(1))
-  optimizer = torch.optim.Adam([parameter], lr=1e-3)
-  scheduler, total_epochs = cosine_learning_rate_schedule(
-      optimizer, 1_000_000_000, config['steps_per_epoch'])
-  assert total_epochs == math.ceil(1_000_000_000 / config['steps_per_epoch'])
-  rates = []
-  for _ in range(int(total_epochs * 1.2)):
-    rates.append(optimizer.param_groups[0]['lr'])
-    optimizer.step()
-    scheduler.step()
+  from gfootball.examples.train_puffer import cosine_learning_rate
+  total = 1_000_000
+  rates = [cosine_learning_rate(1e-3, step, total)
+           for step in range(0, 1_300_001, 1_000)]
   assert rates[0] == 1e-3
-  assert all(later <= earlier + 1e-15 for earlier, later in zip(rates, rates[1:]))
-  assert abs(rates[total_epochs // 2] - 5e-4) < 1e-6
-  assert rates[total_epochs] < 1e-12
-  assert max(rates[total_epochs:]) < 1e-12
+  assert all(later <= earlier for earlier, later in zip(rates, rates[1:]))
+  assert abs(cosine_learning_rate(1e-3, total // 2, total) - 5e-4) < 1e-12
+  assert cosine_learning_rate(1e-3, total, total) == 0.0
+  assert cosine_learning_rate(1e-3, 3 * total, total) == 0.0
+
+
+def test_gpu_filler_accepts_the_trainer_call_and_only_spins():
+  """main() builds GpuFiller(matrix_size=..., kind=args.gpu_filler_kind).
+
+  Only the spin-kernel filler is offered: a filler that replays a CUDA graph
+  advances the global CUDA generator and crashed alongside captured graphs.
+  """
+  from gfootball.examples.gpu_filler import GpuFiller
+  args = build_parser().parse_args([])
+  assert args.gpu_filler_kind == 'sleep'
+  GpuFiller(matrix_size=args.gpu_filler_matrix_size, kind=args.gpu_filler_kind)
+  try:
+    GpuFiller(kind='matmul')
+  except ValueError:
+    pass
+  else:
+    raise AssertionError('a graph-replaying filler must be rejected')
+  try:
+    build_parser().parse_args(['--gpu-filler-kind', 'matmul'])
+  except SystemExit:
+    pass
+  else:
+    raise AssertionError('--gpu-filler-kind matmul must not be accepted')
+
+
+def test_learning_rate_is_set_in_place_for_captured_updates():
+  """A captured update reads the rate tensor's memory, so it is filled in place."""
+  from gfootball.examples.train_puffer import set_learning_rate
+  rate = torch.tensor(1e-3)
+  optimizer = torch.optim.Adam([torch.nn.Parameter(torch.zeros(1))], lr=rate)
+  set_learning_rate(optimizer, 2.5e-4)
+  assert optimizer.param_groups[0]['lr'] is rate
+  # The rate tensor is float32.
+  assert abs(rate.item() - 2.5e-4) < 1e-10
+  eager = torch.optim.Adam([torch.nn.Parameter(torch.zeros(1))], lr=1e-3)
+  set_learning_rate(eager, 2.5e-4)
+  assert eager.param_groups[0]['lr'] == 2.5e-4
 
 
 def test_gate_score_is_logged_per_level_against_the_level_entry_policy():
@@ -543,18 +573,175 @@ def test_masked_losses_equal_the_indexed_losses():
   assert torch.isclose(actual, expected, atol=1e-6)
 
 
-def test_async_collection_doubles_the_rollout_buffer():
+def test_async_collection_sizes_the_rollout_buffer():
   args = build_parser().parse_args(['--device', 'cpu'])
   assert args.async_collection and args.async_promotion
+  assert args.overlap_collection
+  config = build_config(args, 660)
+  # Room for the epoch being trained, one segment in progress per match,
+  # and segments completed while the update runs.
+  assert config['batch_size'] // config['bptt_horizon'] == 3 * 660
+  args = build_parser().parse_args(['--device', 'cpu',
+                                    '--no-overlap-collection'])
   config = build_config(args, 660)
   assert config['batch_size'] // config['bptt_horizon'] == 2 * 660
 
 
-if __name__ == '__main__':
-  for name, test in sorted(dict(globals()).items()):
-    if name.startswith('test_'):
-      test()
-      print('ok', name)
+
+def test_graphed_actor_matches_the_eager_forward():
+  """Same value, memory and log-prob as forward_eval; skipped without CUDA."""
+  if not torch.cuda.is_available():
+    return
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=32).cuda()
+  actor = GraphedActor(policy, 44, 115, 'cuda', None)
+  for _ in range(2):
+    observations = torch.randn(44, 115, device='cuda')
+    hidden = torch.randn(44, 32, device='cuda')
+    cell = torch.randn(44, 32, device='cuda')
+    done = (torch.rand(44, device='cuda') < 0.3).float()
+    action, logprob, value, new_hidden, new_cell = (
+        t.clone() for t in actor(observations, hidden, cell, done))
+    state = {'lstm_h': hidden, 'lstm_c': cell, 'done': done}
+    with torch.no_grad():
+      logits, expected_value = policy.forward_eval(observations, state)
+    expected_logprob = torch.log_softmax(logits.float(), -1).gather(
+        1, action.long().view(-1, 1)).squeeze(1)
+    assert torch.allclose(value, expected_value, atol=1e-5)
+    assert torch.allclose(new_hidden, state['lstm_h'], atol=1e-5)
+    assert torch.allclose(new_cell, state['lstm_c'], atol=1e-5)
+    assert torch.allclose(logprob, expected_logprob, atol=1e-5)
+    # Parameters updated in place are picked up without recapturing.
+    with torch.no_grad():
+      for parameter in policy.parameters():
+        parameter.mul_(1.1)
+
+
+def test_graphed_update_matches_the_eager_minibatch_loop():
+  """Same parameters and loss statistics after several epochs; needs CUDA."""
+  if not torch.cuda.is_available():
+    return
+  import copy
+  matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+  torch.backends.cuda.matmul.allow_tf32 = False
+  try:
+    segments, horizon, device = 48, 8, 'cuda'
+    torch.manual_seed(0)
+    base = FootballPolicy(_env(), hidden_size=16).to(device)
+    config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5,
+                  ent_coef=0.001, max_grad_norm=0.5, device=device)
+    buffers = dict(
+        observations=torch.randn(segments, horizon, 115, device=device),
+        terminals=(torch.rand(segments, horizon, device=device) < 0.1).float(),
+        actions=torch.randint(0, 19, (segments, horizon), device=device),
+        logprobs=-3 * torch.rand(segments, horizon, device=device))
+    epoch = [torch.randn(segments, horizon, device=device) for _ in range(3)]
+    trainable = torch.rand(segments, horizon, device=device) < 0.9
+    segment_index = torch.arange(segments, device=device)
+    results = []
+    for graph in (False, True):
+      trainer = FootballPuffeRL.__new__(FootballPuffeRL)
+      trainer.config = config
+      for name, value in buffers.items():
+        setattr(trainer, name, value.clone())
+      trainer.uncompiled_policy = trainer.policy = copy.deepcopy(base)
+      trainer.optimizer = torch.optim.Adam(
+          trainer.policy.parameters(), lr=3e-4, eps=1e-5, capturable=graph)
+      trainer.optimizer_steps = 0
+      trainer.graph_update = graph
+      trainer._update_graph = trainer._update_graph_rows = None
+      trainer._epoch_values = None
+      for step in range(3):
+        trainer._stage_epoch(*epoch, trainable)
+        torch.manual_seed(100 + step)
+        if graph:
+          trainer._update_graphed(segment_index, 16, 6)
+        else:
+          orders = torch.argsort(torch.rand(6, segments, device=device), dim=1)
+          for index in segment_index[orders[:, :16]]:
+            trainer._minibatch_step(trainer.policy, index)
+      results.append((torch.cat([p.detach().flatten()
+                                 for p in trainer.policy.parameters()]),
+                      trainer._totals.clone(), trainer.optimizer_steps))
+    (eager, eager_totals, eager_steps), (graphed, graph_totals, graph_steps) = (
+        results)
+    assert eager_steps == graph_steps == 18
+    assert torch.allclose(eager, graphed, atol=1e-5)
+    assert torch.allclose(eager_totals, graph_totals, atol=1e-5)
+  finally:
+    torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+
+
+def test_graphed_update_follows_an_annealed_learning_rate():
+  """The captured update must use the rate set before each replay; needs CUDA.
+
+  The graph used to bake the learning rate in, so annealing switched the
+  graphed update off.  With the rate held in a tensor filled in place, the
+  graphed and eager loops must stay equal while the rate changes per epoch.
+  """
+  if not torch.cuda.is_available():
+    return
+  import copy
+  from gfootball.examples.train_puffer import set_learning_rate
+  matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+  torch.backends.cuda.matmul.allow_tf32 = False
+  try:
+    segments, horizon, device = 48, 8, 'cuda'
+    torch.manual_seed(0)
+    base = FootballPolicy(_env(), hidden_size=16).to(device)
+    config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5,
+                  ent_coef=0.001, max_grad_norm=0.5, device=device)
+    buffers = dict(
+        observations=torch.randn(segments, horizon, 115, device=device),
+        terminals=(torch.rand(segments, horizon, device=device) < 0.1).float(),
+        actions=torch.randint(0, 19, (segments, horizon), device=device),
+        logprobs=-3 * torch.rand(segments, horizon, device=device))
+    epoch = [torch.randn(segments, horizon, device=device) for _ in range(3)]
+    trainable = torch.rand(segments, horizon, device=device) < 0.9
+    segment_index = torch.arange(segments, device=device)
+    schedule = (3e-4, 1.5e-4, 0.0)
+    results = []
+    for graph in (False, True):
+      trainer = FootballPuffeRL.__new__(FootballPuffeRL)
+      trainer.config = config
+      for name, value in buffers.items():
+        setattr(trainer, name, value.clone())
+      trainer.uncompiled_policy = trainer.policy = copy.deepcopy(base)
+      rate = torch.tensor(schedule[0], device=device) if graph else schedule[0]
+      trainer.optimizer = torch.optim.Adam(
+          trainer.policy.parameters(), lr=rate, eps=1e-5, capturable=graph)
+      trainer.optimizer_steps = 0
+      trainer.graph_update = graph
+      trainer._update_graph = trainer._update_graph_rows = None
+      trainer._epoch_values = None
+      before_last = None
+      for step, learning_rate in enumerate(schedule):
+        set_learning_rate(trainer.optimizer, learning_rate)
+        trainer._stage_epoch(*epoch, trainable)
+        torch.manual_seed(100 + step)
+        if step == len(schedule) - 1:
+          before_last = torch.cat([p.detach().flatten().clone()
+                                   for p in trainer.policy.parameters()])
+        if graph:
+          trainer._update_graphed(segment_index, 16, 6)
+        else:
+          orders = torch.argsort(torch.rand(6, segments, device=device), dim=1)
+          for index in segment_index[orders[:, :16]]:
+            trainer._minibatch_step(trainer.policy, index)
+      final = torch.cat([p.detach().flatten()
+                         for p in trainer.policy.parameters()])
+      results.append((final, before_last))
+    (eager, eager_before), (graphed, graphed_before) = results
+    assert torch.allclose(eager, graphed, atol=1e-5)
+    # A zero rate in the last epoch must leave the parameters where they were.
+    assert torch.allclose(graphed, graphed_before, atol=1e-7)
+    assert not torch.allclose(eager_before, base_parameters(base), atol=1e-7)
+  finally:
+    torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+
+
+def base_parameters(policy):
+  return torch.cat([p.detach().flatten() for p in policy.parameters()])
 
 
 def test_nn_lstm_checkpoints_still_load():
@@ -571,3 +758,11 @@ def test_nn_lstm_checkpoints_still_load():
   restored.load_state_dict(upgrade_state_dict(legacy))
   for key, value in policy.state_dict().items():
     assert torch.equal(restored.state_dict()[key], value), key
+
+
+if __name__ == '__main__':
+  # At the end of the module so every test above is defined when it runs.
+  for name, test in sorted(dict(globals()).items()):
+    if name.startswith('test_'):
+      test()
+      print('ok', name)

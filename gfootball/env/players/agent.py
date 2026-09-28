@@ -18,6 +18,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import copy
+
 from gfootball.env import player_base
 
 
@@ -36,4 +38,6 @@ class Player(player_base.PlayerBase):
 
   def take_action(self, observations):
     # `observations` is deliberately unused -- the action comes from set_action.
-    return list(self._action)
+    # A shallow copy: the action may be a list, an array or a single
+    # CoreAction, and CoreActions are immutable singletons.
+    return copy.copy(self._action)

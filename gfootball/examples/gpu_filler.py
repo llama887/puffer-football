@@ -34,9 +34,14 @@ import torch
 class GpuFiller:
   """Keep one spinning single-block kernel resident on a side stream."""
 
-  def __init__(self, device='cuda', slice_ms=5.0, matrix_size=None):
-    # matrix_size is accepted for the existing --gpu-filler-matrix-size flag;
-    # the spin kernel has no matrices to size.
+  def __init__(self, device='cuda', slice_ms=5.0, matrix_size=None,
+               kind='sleep'):
+    # matrix_size and kind are accepted for the trainer's --gpu-filler-*
+    # flags.  Only the spin kernel exists: a filler that replays a CUDA graph
+    # advances the global CUDA generator and crashes alongside a captured
+    # update or actor graph (see the module docstring).
+    if kind != 'sleep':
+      raise ValueError("only the 'sleep' GPU filler is supported")
     del matrix_size
     self.device = torch.device(device)
     self.slice_ms = float(slice_ms)
