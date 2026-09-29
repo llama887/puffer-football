@@ -396,8 +396,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       # The frozen side is acted by this worker, never by the caller.
       self._active_mask[self._defending_rows()] = False
 
-  def _frozen_actions(self):
-    """Actions for the defending rows from the frozen policy."""
+  def _load_frozen_policy(self):
+    """Load the frozen defending policy once per reset (the snapshot changes
+    on disk when a level is cleared), single threaded on the CPU."""
     if self._frozen_policy is None:
       import torch
       from gfootball.env.puffer_policy import load_frozen_policy
@@ -405,6 +406,11 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._torch = torch
       self._frozen_policy = load_frozen_policy(self._frozen_defence_path, self)
       self._frozen_generator = torch.Generator().manual_seed(self._seed)
+    return self._frozen_policy
+
+  def _frozen_actions(self):
+    """Actions for the defending rows from the frozen policy."""
+    self._load_frozen_policy()
     torch = self._torch
     # Training resets the recurrent state at the start of every rollout
     # window regardless of episode boundaries, so a policy trained that way is
@@ -468,8 +474,21 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       if self._sort_players:
         sort_players_by_distance(self.observations)
     if self._frozen_defence_path is not None:
-      # The frozen side needs its own rows before they are hidden below.
-      self._full_observations = self.observations.copy()
+      # The frozen side needs its own rows before they are hidden below, in
+      # the observation its snapshot was trained on: the fixed gate opponent
+      # is a simple115 policy, and every learner must face the same one.
+      reads = self._load_frozen_policy().normalizer.mean.numel()
+      if reads == self.observations.shape[1]:
+        self._full_observations = self.observations.copy()
+      elif self._observation == 'entities' and reads == 115:
+        frames = np.array(observations, dtype=np.float32)
+        normalize_egocentric(frames)
+        if self._sort_players:
+          sort_players_by_distance(frames)
+        self._full_observations = frames
+      else:
+        raise ValueError('frozen defence reads {} features; this match '
+                         'gives {}'.format(reads, self.observations.shape[1]))
     self.observations[~self._active_mask] = 0
 
   def reset(self, seed=None):

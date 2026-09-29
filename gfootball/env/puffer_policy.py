@@ -6,6 +6,8 @@ during promotion evaluation.  Keeping it here avoids importing the whole PPO
 loop (and PufferLib's trainer) inside every environment process.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
@@ -68,9 +70,16 @@ class EntityEncoder(torch.nn.Module):
   present player tokens, projected to `output_size` for the LSTM.  Its
   input is the normalized row, plus the raw row for the present flags
   (the normalizer would move them off 0/1).
+
+  Size and precision are set by cost: a whole-rollout step is ~780k tokens
+  per layer and memory-bound, and has to stay near the ~260 ms it takes to
+  collect a rollout.  On an L40S one step takes 136 ms at width 64 in
+  float32, 47 ms at width 32 with bfloat16 autocast on the GPU (28 ms with
+  one layer).  The output returns to float32 for the LSTM; on the CPU
+  (frozen opponents) everything stays float32.
   """
 
-  def __init__(self, output_size, width=64, layers=2, heads=4):
+  def __init__(self, output_size, width=32, layers=2, heads=4):
     super().__init__()
     self.context = torch.nn.Linear(entity.CONTEXT_FEATURES, width)
     self.ball = torch.nn.Linear(entity.BALL_FEATURES, width)
@@ -89,6 +98,11 @@ class EntityEncoder(torch.nn.Module):
         torch.nn.LayerNorm(output_size))
 
   def forward(self, normalized, observations):
+    with torch.autocast('cuda', dtype=torch.bfloat16,
+                        enabled=normalized.is_cuda):
+      return self._attend(normalized, observations).float()
+
+  def _attend(self, normalized, observations):
     rows = normalized.shape[0]
     players = normalized[:, entity.PLAYERS_START:].reshape(
         rows, entity.PLAYERS, entity.PLAYER_FEATURES)
@@ -344,8 +358,14 @@ def save_policy_snapshot(policy, path):
 def load_frozen_policy(path, env):
   """Load a snapshot for inference only, on the CPU, single threaded."""
   state_dict = torch.load(path, map_location='cpu', weights_only=True)
+  # Built for the observation the snapshot was trained on, which can differ
+  # from `env`'s (a simple115 opponent in an entity-observation match).
+  spaces = SimpleNamespace(
+      single_observation_space=SimpleNamespace(
+          shape=tuple(state_dict['normalizer.mean'].shape)),
+      single_action_space=env.single_action_space)
   policy = FootballPolicy(
-      env, hidden_size=hidden_size_from_state_dict(state_dict),
+      spaces, hidden_size=hidden_size_from_state_dict(state_dict),
       network=network_from_state_dict(state_dict))
   policy.load_state_dict(upgrade_state_dict(state_dict))
   policy.eval()

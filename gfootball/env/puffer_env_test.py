@@ -953,6 +953,39 @@ class PufferEnvTest(absltest.TestCase):
       env.close()
       plain.close()
 
+  def test_frozen_defence_reads_the_observation_it_was_trained_on(self):
+    """A simple115 snapshot defends an entity-observation match.
+
+    The fixed gate opponent was trained on simple115, and every model must
+    face the same opponent, so its rows are simple115 whatever the learner
+    reads: exactly the rows a simple115 match would give it.
+    """
+    torch.manual_seed(0)
+    spaces = SimpleNamespace(
+        single_observation_space=gymnasium.spaces.Box(
+            low=-1, high=1, shape=(115,), dtype=np.float32),
+        single_action_space=gymnasium.spaces.Discrete(19))
+    snapshot = self.create_tempfile('simple_defence.pt').full_path
+    save_policy_snapshot(FootballPolicy(spaces, hidden_size=16), snapshot)
+    matches = [puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=11,
+        curriculum_levels=ADVANTAGE_LEVELS, frozen_defence_path=snapshot,
+        observation=observation) for observation in ('entities', 'simple115')]
+    try:
+      (entity_rows, _), (simple_rows, _) = [m.reset() for m in matches]
+      self.assertEqual(entity_rows.shape[1], entity_observation.SIZE)
+      defending = matches[0]._defending_rows()
+      self.assertEqual(defending, matches[1]._defending_rows())
+      np.testing.assert_array_equal(
+          matches[0]._full_observations[defending],
+          matches[1]._full_observations[defending])
+      for _ in range(5):
+        for match in matches:
+          match.step(np.zeros(22, dtype=np.int32))
+    finally:
+      for match in matches:
+        match.close()
+
   def test_frozen_defence_plays_the_defending_side_from_a_snapshot(self):
     """The frozen side is hidden from the caller and acted in the worker."""
     torch.manual_seed(0)
