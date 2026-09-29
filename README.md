@@ -227,7 +227,7 @@ The throughput-related ones (defaults in brackets):
 | Variable | Meaning |
 |---|---|
 | `ENVS_PER_WORKER` [1] | matches stepped by each worker process |
-| `GRAPH_UPDATE` [1] | replay a whole PPO minibatch step (forward, loss, backward, clip, Adam) as one CUDA graph |
+| `GRAPH_UPDATE` [1] | capture one whole-rollout PPO step (forward, loss, backward, clip, Adam) as a CUDA graph per rollout and replay it `UPDATE_EPOCHS` times |
 | `GRAPH_ACTOR` [1] | replay the acting forward and sampling as one CUDA graph |
 | `OVERLAP_COLLECTION` [1] | keep the environments stepping while the update runs (data at most one update stale; the stored log-prob keeps PPO's ratio exact) |
 | `COMPILE` [0] | `torch.compile` the BPTT forward; redundant with the graphed update |
@@ -246,15 +246,43 @@ trial-36 settings below (`--benchmark-epochs`, promotion excluded):
 | 46 x 16 | 98k | 50 GB |
 | before the graphed update and overlap, 46 x 1 | 65k | 9 GB |
 
+With whole-rollout steps (the update graph captured once per layout
+capacity and replayed), 46 x 1 trains 121k-124k samples/s at 7, 16 or 32
+`UPDATE_EPOCHS` alike: the update overlaps collection completely, so more
+optimizer steps per rollout cost no throughput.  `OBSERVATION=entities` with
+the MLP runs at the same speed; `NETWORK=transformer` is update-bound (see
+below).
+
 More matches than CPUs gains at most a few percent, because collection
 (~275k steps/s) already outruns the update, and a bigger batch grows the
 update with it; more worker processes than CPUs is slower.  More matches also
 means a bigger batch and more optimizer steps per epoch, which changes
 learning, not just speed.
 
+Every optimizer step trains on the whole rollout (one 32-step segment per
+agent, ~0.6 GB on the GPU at 46 matches), so there is no minibatch size:
+`UPDATE_EPOCHS` is the number of optimizer steps per rollout.  The LSTM runs
+each training window as one packed cuDNN call: segments are cut at episode
+ends into pieces that each start from zero memory, exactly as the actor saw
+them.
+
 The learning rate anneals (`ANNEAL_LR=1`) on a cosine over training progress
 (agent steps done / `TOTAL_TIMESTEPS`), reaching exactly zero at the end.
 It lives in a GPU tensor updated in place, so the graphed update follows it.
+
+#### Observation and network
+
+`OBSERVATION=entities` replaces egocentric simple115v2 with per-entity rows
+(`gfootball/env/entity_observation.py`): the ball and all 22 players with
+absolute and relative positions, velocities, distances, who has the ball,
+keepers, offside positions and tiredness, plus the agent's held sticky
+buttons (direction, sprint, dribble), the game mode and the steps left before
+the episode times out.  `NETWORK=transformer` (needs `OBSERVATION=entities`)
+replaces the MLP trunk with two self-attention layers over the player, ball
+and context tokens, masked to present players and independent of player
+order; the LSTM and heads are unchanged.  No actions are masked: the engine
+buffers a kick press for up to 20 steps and it steers the player to the ball
+meanwhile, so no kick is provably a no-op from the observation.
 
 #### Curriculum, gate and metrics
 
@@ -310,8 +338,9 @@ ball term it is not zero-sum.  Both scales default to zero.  See
 #### Tuning level 0 with Optuna
 
 `scripts/tune_optuna.py` searches PPO settings (learning rate and annealing,
-entropy, discount, GAE lambda, clip, value coefficient, epochs, minibatch
-size, matches per worker, ball potential) with TPE, training and scoring on
+entropy, discount, GAE lambda, clip, value coefficient, optimizer steps per
+rollout, matches per worker, ball potential, and the model: observation and
+trunk) with TPE, training and scoring on
 level 0 only against a fixed opponent, and prunes the bottom quarter of
 trials after ~50M agent steps.  Optuna runs from its own small venv so the
 trainer's environment is untouched:
@@ -330,7 +359,9 @@ sbatch --array=0-39%10 --account=<account> --export=ALL,OPTUNA_STUDY=$STUDY \
 
 The September 25 study's winner (trial 36) is `LEARNING_RATE=5.04e-4
 ANNEAL_LR=1 ENT_COEF=1.36e-3 GAMMA=0.999 GAE_LAMBDA=0.947 CLIP_COEF=0.153
-VF_COEF=0.918 UPDATE_EPOCHS=7 MINIBATCH_SEGMENTS=128 BALL_POTENTIAL=0.571`.
+VF_COEF=0.918 UPDATE_EPOCHS=7 BALL_POTENTIAL=0.571` with 128-segment
+minibatches (about 55 optimizer steps per rollout), from before whole-rollout
+steps; the next study retunes for them.
 
 #### Earlier shaping screen
 

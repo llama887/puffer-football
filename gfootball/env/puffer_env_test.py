@@ -10,6 +10,8 @@ import torch
 
 from gfootball.env import puffer_env
 from gfootball.env import config
+from gfootball.env import entity_observation
+from gfootball.env import observation_rotation
 from gfootball.env.puffer_policy import FootballPolicy, save_policy_snapshot
 from gfootball.curriculum import (
     ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, ALIGNMENT_SCHEDULE,
@@ -111,6 +113,73 @@ class PufferEnvTest(absltest.TestCase):
       self.assertEqual(rewards.shape, (22,))
       self.assertEqual(terminals.shape, (22,))
       self.assertEqual(truncations.shape, (22,))
+    finally:
+      env.close()
+
+  def test_entity_observations_describe_one_world_from_both_sides(self):
+    """Entity rows come from the live engine, one view per team."""
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, seed=3, frame_stack=1,
+        observation='entities')
+    try:
+      self.assertEqual(env.single_observation_space.shape,
+                       (entity_observation.SIZE,))
+      observations, _ = env.reset()
+      ball = entity_observation.CONTEXT_FEATURES
+      steps_left = entity_observation.CONTEXT_FEATURE_INDEX['steps_left']
+      is_self = (entity_observation.PLAYERS_START +
+                 entity_observation.PLAYER_FEATURE_INDEX['is_self'])
+      for _ in range(3):
+        active = np.flatnonzero(observations.any(axis=1))
+        self.assertGreater(len(active), 0)
+        np.testing.assert_array_equal(observations[active, is_self], 1)
+        left = active[active < 11]
+        right = active[active >= 11]
+        if len(left) and len(right):
+          np.testing.assert_allclose(
+              observations[left[0], ball:ball + 2],
+              -observations[right[0], ball:ball + 2], atol=1e-6)
+        before = observations[active[0], steps_left]
+        observations, _, terminals, _, _ = env.step(
+            np.zeros(22, dtype=np.int32))
+        if not terminals[0]:
+          self.assertAlmostEqual(
+              before - observations[active[0], steps_left],
+              1 / entity_observation.STEPS_LEFT_SCALE, places=5)
+    finally:
+      env.close()
+    with self.assertRaises(ValueError):
+      puffer_env.FootballPufferEnv(
+          env_name=ADVANTAGE_ENV_NAME, frame_stack=4, observation='entities')
+
+  def test_tracked_sticky_buttons_match_the_engine(self):
+    """The buttons the observation reports are the ones the engine holds."""
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, seed=5, frame_stack=1,
+        observation='entities')
+    rng = np.random.default_rng(0)
+    sticky = entity_observation.CONTEXT_FEATURE_INDEX['sticky']
+    try:
+      observations, _ = env.reset()
+      core = env._env.unwrapped._env
+      checked = 0
+      for _ in range(60):
+        actions = rng.integers(0, 19, size=22)
+        observations, _, _, _, _ = env.step(actions)
+        for agent in range(22):
+          left_team = agent < 11
+          engine = core.sticky_actions_state(left_team, agent % 11)
+          if not left_team:
+            engine = observation_rotation.rotate_sticky_actions(
+                engine, env._env.unwrapped._config)
+          tracked = env._sticky[agent]
+          np.testing.assert_array_equal(tracked, engine, err_msg=str(agent))
+          if observations[agent].any():
+            np.testing.assert_array_equal(
+                observations[agent, sticky:sticky +
+                             entity_observation.STICKY_ACTIONS], tracked)
+          checked += int(np.asarray(engine).any())
+      self.assertGreater(checked, 100)
     finally:
       env.close()
 

@@ -11,6 +11,7 @@ import torch
 from gfootball.env import football_action_set
 from gfootball.env.puffer_env import FootballPufferEnv
 from gfootball.examples.train_puffer import FootballPolicy
+from gfootball.env.puffer_policy import upgrade_state_dict
 
 
 ACTION_NAMES = tuple(
@@ -47,8 +48,8 @@ def evaluate(checkpoint, episodes, greedy, seed, attacker_only_levels,
   episode_rows = []
   try:
     policy = FootballPolicy(env)
-    policy.load_state_dict(torch.load(
-        checkpoint, map_location='cpu', weights_only=True))
+    policy.load_state_dict(upgrade_state_dict(torch.load(
+        checkpoint, map_location='cpu', weights_only=True)))
     policy.eval()
     observations, _ = env.reset()
     for episode in range(episodes):

@@ -28,7 +28,8 @@ from gfootball.env.puffer_env import make_vector_env
 from gfootball.env import football_action_set
 # Re-exported: scripts and tests import the policy from this module.
 from gfootball.env.puffer_policy import (  # noqa: F401
-    FootballPolicy, RunningNormalizer, save_policy_snapshot)
+    FootballPolicy, RunningNormalizer, episode_batch_sizes, episode_pieces,
+    save_policy_snapshot)
 from gfootball.curriculum import (
     ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, ATTACKER_ONLY_LEVELS,
     SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS, curriculum_episode_duration)
@@ -82,8 +83,9 @@ def cosine_learning_rate(initial, global_step, total_timesteps):
 def set_learning_rate(optimizer, value):
   """Set every param group's rate; tensor rates are filled in place.
 
-  A captured CUDA-graph update reads the rate tensor's memory on every
-  replay, so replacing the tensor would leave the graph on the old value.
+  train() calls it before each update.  A captured update graph reads the
+  rate tensor's memory on every replay, so replacing the tensor would leave
+  the graph on the old value.
   """
   for group in optimizer.param_groups:
     if torch.is_tensor(group['lr']):
@@ -501,15 +503,16 @@ class FootballPuffeRL(pufferl.PuffeRL):
         graph_actor and self.async_collection and
         torch.device(config['device']).type == 'cuda')
     self.graphed_actor = None
+    self._epoch_values = None
     # A captured update replays Adam as recorded, so Adam keeps its step
     # count on the GPU (capturable) and the learning rate lives in a GPU
-    # tensor that set_learning_rate fills in place; annealing then works
-    # with the graph instead of switching it off.
+    # tensor that set_learning_rate fills in place.
     self.graph_update = bool(
         graph_update and torch.device(config['device']).type == 'cuda')
     self._update_graph = None
-    self._update_graph_rows = None
-    self._epoch_values = None
+    self._update_pool = None
+    self._update_capacity = None
+    self.update_captures = 0
     if self.graph_update:
       self.optimizer = torch.optim.Adam(
           self.uncompiled_policy.parameters(),
@@ -746,8 +749,9 @@ class FootballPuffeRL(pufferl.PuffeRL):
     self.complete_blocks = []
     rows = (np.asarray(self.training_blocks)[:, None] * per_env +
             self.agent_offsets).ravel()
+    self.training_rows = torch.as_tensor(rows, device=self.row_training.device)
     self.row_training.zero_()
-    self.row_training[torch.as_tensor(rows, device=self.row_training.device)] = True
+    self.row_training[self.training_rows] = True
     if self.acting_stream is not None:
       # Everything the actor wrote must land before PPO reads it.
       torch.cuda.current_stream().wait_stream(self.acting_stream)
@@ -772,8 +776,13 @@ class FootballPuffeRL(pufferl.PuffeRL):
     self._epoch_weight.copy_(trainable)
     self._totals.zero_()
 
-  def _minibatch_step(self, policy, index, zero_grad=True):
-    """One PPO minibatch: forward, masked losses, backward, clip, Adam."""
+  def _minibatch_step(self, policy, index, pieces):
+    """One PPO gradient step on the segments in `index`.
+
+    Forward (BPTT over whole segments, using the precomputed episode_pieces
+    layout of those segments), masked PPO losses, backward, gradient clip,
+    Adam.  _update calls it once per update epoch with the whole rollout.
+    """
     config = self.config
     clip = config['clip_coef']
     mask = self._epoch_weight[index]
@@ -784,7 +793,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
       return (values * mask).sum() / denominator
 
     logits, new_values = policy(
-        self.observations[index], {'done': self.terminals[index]})
+        self.observations[index], {'episode_pieces': pieces})
     _, new_logprobs, entropy = pufferlib.pytorch.sample_logits(
         logits, action=self.actions[index])
     new_logprobs = new_logprobs.view(mask.shape)
@@ -811,8 +820,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
     loss = (policy_loss + config['vf_coef'] * value_loss -
             config['ent_coef'] * entropy_loss)
 
-    if zero_grad:
-      self.optimizer.zero_grad(set_to_none=True)
+    self.optimizer.zero_grad(set_to_none=True)
     loss.backward()
     gradient_norm = torch.nn.utils.clip_grad_norm_(
         policy.parameters(), config['max_grad_norm'])
@@ -828,47 +836,89 @@ class FootballPuffeRL(pufferl.PuffeRL):
           masked_mean(ratio),
           count)).detach()
 
-  def _update_graphed(self, segment_index, segments_per_minibatch,
-                      num_minibatches):
-    """Run the epoch's minibatches as replays of one captured step.
+  def _update(self, rows):
+    """Train on this rollout: `update_epochs` steps over all its segments.
 
-    Each minibatch is otherwise ~50 kernels launched from Python, which kept
-    the main thread busy for the whole update and left no time to serve the
-    environments.  A replay is one launch.  The first minibatch of a new
-    shape runs eagerly (it doubles as the capture warmup); capturing does not
-    execute, so every minibatch still gets exactly one optimizer step.
+    `rows` are the rollout's buffer rows (a fixed number per epoch); rows
+    and steps that are not trainable are masked out of every loss.  The
+    minibatch is the whole rollout (~1000 segments at 46 matches, ~0.6 GB
+    of activations), so update_epochs is exactly the number of optimizer
+    steps per rollout.
+
+    With graph_update, the step is a captured CUDA graph replayed
+    update_epochs times.  The main thread also serves the environments while
+    the update runs; launching every kernel from Python kept it busy ~40 ms
+    per epoch (collection fell from ~280k to ~140k steps/s), and capturing
+    a new graph each rollout still cost ~30 ms.  So the graph reads its rows
+    and episode layout from fixed buffers, and the layout has a fixed
+    capacity per step (episode_pieces pads it exactly): each rollout copies
+    its layout in and replays.  The graph is captured again only when a
+    rollout needs more slots than the capacity, or leaves over half of it
+    unused.  Capturing does not execute, so the very first step runs
+    eagerly to create Adam's state first.
     """
-    device = self.config['device']
-    num_segments = int(segment_index.numel())
-    policy = self.uncompiled_policy
-    # All minibatch orders at once: a few launches for the whole epoch.
-    orders = torch.argsort(torch.rand(
-        num_minibatches, num_segments, device=device), dim=1)
-    indices = segment_index[orders[:, :segments_per_minibatch]]
-    start = 0
-    if self._update_graph_rows != segments_per_minibatch:
-      self._update_graph = None
-      self._update_index = torch.zeros(
-          segments_per_minibatch, dtype=torch.long, device=device)
-      side = torch.cuda.Stream(device=device)
-      side.wait_stream(torch.cuda.current_stream())
-      with torch.cuda.stream(side):
-        self._update_index.copy_(indices[0])
-        self._minibatch_step(policy, self._update_index)
-      torch.cuda.current_stream().wait_stream(side)
-      self.optimizer.zero_grad(set_to_none=True)
-      graph = torch.cuda.CUDAGraph()
-      steps = self.optimizer_steps
-      with torch.cuda.graph(graph, capture_error_mode='thread_local'):
-        self._minibatch_step(policy, self._update_index, zero_grad=False)
-      self.optimizer_steps = steps
-      self._update_graph = graph
-      self._update_graph_rows = segments_per_minibatch
-      start = 1
-    for minibatch in range(start, num_minibatches):
-      self._update_index.copy_(indices[minibatch])
+    done = self.terminals[rows]
+    epochs = self.config['update_epochs']
+    if not self.graph_update:
+      pieces = episode_pieces(done)
+      for _ in range(epochs):
+        self._minibatch_step(self.policy, rows, pieces)
+      return
+    needed = episode_batch_sizes(done)
+    capacity = self._update_capacity
+    if (self._update_graph is None or
+        rows.numel() != self._update_rows.numel() or
+        bool((needed > capacity).any()) or
+        2 * int(needed.sum()) < int(capacity.sum())):
+      capacity = (torch.ceil(needed * 1.25 / 64) * 64).long().clamp_min(64)
+      self._capture_update(rows, episode_pieces(done, capacity))
+      first = self._update_warmup_steps
+    else:
+      order, inverse, _ = episode_pieces(done, capacity)
+      self._update_rows.copy_(rows)
+      self._update_order.copy_(order)
+      self._update_inverse.copy_(inverse)
+      first = 0
+    for _ in range(first, epochs):
       self._update_graph.replay()
       self.optimizer_steps += 1
+
+  def _capture_update(self, rows, pieces):
+    """Capture one PPO step reading the fixed update buffers.
+
+    The very first capture is preceded by one real, eager step (on a side
+    stream) so Adam's state and the cuBLAS/cuDNN workspaces exist; that
+    step counts as the rollout's first (_update_warmup_steps).  Later
+    captures reuse the same memory pool.
+    """
+    policy = self.uncompiled_policy
+    order, inverse, capacity = pieces
+    self._update_rows = rows.clone()
+    self._update_order = order.clone()
+    self._update_inverse = inverse.clone()
+    self._update_capacity = capacity
+    static = (self._update_order, self._update_inverse, capacity)
+    self._update_warmup_steps = 0
+    if self._update_pool is None:
+      side = torch.cuda.Stream()
+      side.wait_stream(torch.cuda.current_stream())
+      with torch.cuda.stream(side):
+        self._minibatch_step(policy, self._update_rows, static)
+      torch.cuda.current_stream().wait_stream(side)
+      self._update_pool = torch.cuda.graph_pool_handle()
+      self._update_warmup_steps = 1
+    # Gradients are allocated inside the graph's pool during capture.
+    self.optimizer.zero_grad(set_to_none=True)
+    self._update_graph = None
+    graph = torch.cuda.CUDAGraph()
+    steps = self.optimizer_steps
+    # thread_local: the GPU filler thread keeps launching its own kernels.
+    with torch.cuda.graph(graph, pool=self._update_pool,
+                          capture_error_mode='thread_local'):
+      self._minibatch_step(policy, self._update_rows, static)
+    self.optimizer_steps = steps
+    self._update_graph = graph
+    self.update_captures += 1
 
   def evaluate(self):
     if self.async_collection:
@@ -913,9 +963,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
     num_segments = int(segment_index.numel())
     if num_segments == 0:
       raise RuntimeError('rollout contains no controlled agents')
-    segments_per_minibatch = min(self.minibatch_segments, num_segments)
-    num_minibatches = max(1, math.ceil(
-        config['update_epochs'] * num_segments / segments_per_minibatch))
+    num_minibatches = config['update_epochs']
 
     # Statistics come only from training rollouts, never from the held-out
     # promotion evaluation, so evaluation stays a clean measurement.
@@ -928,24 +976,16 @@ class FootballPuffeRL(pufferl.PuffeRL):
 
     # Every loss is a masked mean over the (segment, step) grid, which is the
     # same number as indexing out the trainable rows first, without the
-    # data-dependent shapes that force a GPU sync on every minibatch.  The
-    # epoch's tensors live in persistent buffers so a captured update graph
-    # can read them.
+    # data-dependent shapes that force a GPU sync on every step.
     self._stage_epoch(rollout_values, advantages, returns, trainable)
     if config['anneal_lr']:
-      # Before the update, in place: a captured update reads the rate tensor.
       set_learning_rate(self.optimizer, cosine_learning_rate(
           config['learning_rate'], self.global_step,
           config['total_timesteps']))
-    if self.graph_update:
-      self._update_graphed(segment_index, segments_per_minibatch,
-                           num_minibatches)
-    else:
-      for _ in range(num_minibatches):
-        profile('train_copy', epoch)
-        order = torch.randperm(num_segments, device=device)
-        self._minibatch_step(
-            self.policy, segment_index[order[:segments_per_minibatch]])
+    # Always the epoch's whole set of rows (a fixed count, so a captured
+    # update keeps its shapes); untrainable steps are masked in the loss.
+    self._update(self.training_rows if self.async_collection else
+                 torch.arange(self.segments, device=device))
     totals = self._totals
 
     if self.overlap_collection:
@@ -972,6 +1012,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
           active.float().mean())).tolist()
       losses.update({
           'optimizer_steps': float(self.optimizer_steps),
+          'update_captures': float(self.update_captures),
           'ppo_minibatches': float(num_minibatches),
           'active_agent_fraction': reward_signs[4],
           'active_transitions': float(trainable.sum().item()),
@@ -1063,6 +1104,7 @@ def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
       curriculum_level_value=curriculum_level_value,
       sort_players=args.sort_players,
       curriculum_evaluation=True,
+      observation=args.observation,
       frozen_defence_path=frozen_defence_path,
       frozen_defence_horizon=args.bptt_horizon,
       # The gate scores on the same spawn distribution the policy trains on.
@@ -1256,10 +1298,23 @@ def build_parser():
                            'teammate to the ball; added to '
                            'the ball potential with the same gamma and '
                            'zero terminal potential; 0 disables')
-  parser.add_argument('--update-epochs', type=int, default=4)
+  parser.add_argument('--update-epochs', type=int, default=4,
+                      help='optimizer steps per rollout; each step trains on '
+                           'the whole rollout (the minibatch is the rollout)')
   parser.add_argument('--bptt-horizon', type=int, default=32)
-  parser.add_argument('--minibatch-segments', type=int, default=16)
   parser.add_argument('--hidden-size', type=int, default=256)
+  parser.add_argument('--observation', default='simple115',
+                      choices=('simple115', 'entities'),
+                      help='simple115: egocentric simple115v2; entities: '
+                           'context, ball and per-player rows with absolute '
+                           'positions, ball owner, keepers, offside, '
+                           'sticky buttons and steps left '
+                           '(gfootball/env/entity_observation.py)')
+  parser.add_argument('--network', default='mlp',
+                      choices=('mlp', 'transformer'),
+                      help='trunk before the LSTM: a dense MLP over the '
+                           'whole row, or attention over the players and '
+                           'ball (needs --observation entities)')
   parser.add_argument('--frame-stack', type=int, default=1, choices=(1, 4))
   parser.add_argument('--sort-players',
                       action=argparse.BooleanOptionalAction, default=True,
@@ -1273,8 +1328,7 @@ def build_parser():
   parser.add_argument('--wandb-project', default='google-football-fast-rl')
   parser.add_argument('--wandb-group', default='self-play-lstm-ppo')
   parser.add_argument('--wandb-tag', default=None)
-  # Throughput.  None of these change what PPO computes except
-  # --minibatch-segments, which sets how many optimizer steps a rollout gets.
+  # Throughput.  None of these change what PPO computes.
   parser.add_argument('--envs-per-worker', type=int, default=1,
                       help='matches stepped by each worker process')
   parser.add_argument('--async-collection',
@@ -1309,9 +1363,10 @@ def build_parser():
                            'every update (needs --async-collection)')
   parser.add_argument('--graph-update', action=argparse.BooleanOptionalAction,
                       default=True,
-                      help='capture a whole PPO minibatch step (forward, '
-                           'loss, backward, clip, Adam) as one CUDA graph; '
-                           'needs a constant learning rate')
+                      help='capture one whole-rollout PPO step (forward, '
+                           'loss, backward, clip, Adam) as a CUDA graph per '
+                           'rollout and replay it update_epochs times, so the '
+                           'main thread keeps serving the environments')
   parser.add_argument('--graph-actor', action=argparse.BooleanOptionalAction,
                       default=True,
                       help='replay the acting forward and sampling as one '
@@ -1382,7 +1437,9 @@ def build_config(args, num_agents):
       'gamma': args.gamma,
       'learning_rate': args.learning_rate,
       'max_grad_norm': 0.5,
-      'minibatch_size': args.minibatch_segments * horizon,
+      # The minibatch is the whole epoch: one segment per agent.
+      'minibatch_size': num_agents * horizon,
+      'max_minibatch_size': num_agents * horizon,
       'optimizer': 'adam',
       'precision': 'float32',
       'seed': args.seed,
@@ -1472,6 +1529,7 @@ def main():
       attacker_only_levels=args.attacker_only_levels,
       sort_players=args.sort_players,
       centralized_curriculum=True,
+      observation=args.observation,
       # Shaping is a training signal only.  Promotion is judged on goals, so
       # the evaluation envs are built without it.
       ball_potential_scale=args.ball_potential,
@@ -1497,7 +1555,8 @@ def main():
       'attacker_only_levels': args.attacker_only_levels,
       'frame_stack': args.frame_stack,
       'hidden_size': args.hidden_size,
-      'minibatch_segments': args.minibatch_segments,
+      'observation': args.observation,
+      'network': args.network,
       'env_name': args.env_name,
       'num_workers': args.num_workers,
       'envs_per_worker': args.envs_per_worker,
@@ -1525,7 +1584,8 @@ def main():
       'reuse_promotion_envs': args.reuse_promotion_envs,
   }, sort_keys=True), flush=True)
 
-  policy = FootballPolicy(env, hidden_size=args.hidden_size).to(args.device)
+  policy = FootballPolicy(env, hidden_size=args.hidden_size,
+                          network=args.network).to(args.device)
   logger = None
   if args.wandb:
     logger = pufferl.WandbLogger({

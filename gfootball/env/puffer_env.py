@@ -10,7 +10,9 @@ import pufferlib
 import pufferlib.vector
 
 import gfootball.env as football_env
+from gfootball.env import entity_observation
 from gfootball.env import football_action_set
+from gfootball.env import wrappers
 from gfootball.curriculum import (
     ADVANTAGE_ENV_NAME, ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS,
     advantage_for_level, curriculum_state)
@@ -172,9 +174,17 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                curriculum_evaluation=False, sort_players=True,
                frozen_defence_path=None, frozen_defence_horizon=32,
                ball_potential_scale=0.0, potential_gamma=0.99,
-               player_potential_scale=0.0, spawn='curriculum'):
+               player_potential_scale=0.0, spawn='curriculum',
+               observation='simple115'):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
+    # 'simple115': simple115v2 made egocentric (and sorted); 'entities': the
+    # per-entity rows of entity_observation, built from the raw engine views.
+    if observation not in ('simple115', 'entities'):
+      raise ValueError("observation must be 'simple115' or 'entities'")
+    if observation == 'entities' and frame_stack != 1:
+      raise ValueError('entity observations need frame_stack=1')
+    self._observation = observation
     # 'curriculum' spawns each level's scene; 'uniform' ignores levels and
     # places the ball and players uniformly (see 11_vs_11_advantage).
     if spawn not in ('curriculum', 'uniform'):
@@ -202,8 +212,13 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self.num_envs = 1
     self.num_agents = 22
     self.agents_per_batch = self.num_agents
-    self.single_observation_space = gymnasium.spaces.Box(
-        low=-1, high=1, shape=(115 * frame_stack,), dtype=np.float32)
+    if observation == 'entities':
+      self.single_observation_space = gymnasium.spaces.Box(
+          low=-np.inf, high=np.inf, shape=(entity_observation.SIZE,),
+          dtype=np.float32)
+    else:
+      self.single_observation_space = gymnasium.spaces.Box(
+          low=-1, high=1, shape=(115 * frame_stack,), dtype=np.float32)
     self.single_action_space = gymnasium.spaces.Discrete(
         len(football_action_set.action_set_dict['default']))
     super().__init__(buf)
@@ -242,6 +257,11 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._frozen_state = None
     self._frozen_steps = 0
     self._full_observations = None
+    # Entity mode: the engine's raw per-agent views of the latest frame, and
+    # the sticky buttons each agent holds (entity_observation.press_buttons).
+    self._raw_views = None
+    self._sticky = np.zeros(
+        (self.num_agents, entity_observation.STICKY_ACTIONS), dtype=np.float32)
     self._env = self._make_env()
     # Where a freshly built engine's episode counter starts, so an in-place
     # reseed can put it back there.
@@ -299,7 +319,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
   def _make_env(self):
     return football_env.create_environment(
         env_name=self._env_name,
-        representation='simple115v2',
+        representation=('raw' if self._observation == 'entities'
+                        else 'simple115v2'),
         rewards='scoring',
         render=self._render,
         write_goal_dumps=False,
@@ -335,7 +356,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     if self._advantage_mode:
       self._env.unwrapped._config['advantage'] = advantage_for_level(
           self._curriculum_level, self._curriculum_levels)
-    observations = self._env.reset()
+    observations = self._from_engine(self._env.reset())
+    self._sticky.fill(0)
     raw_config = self._env.unwrapped._config
     ball_x = raw_config.ScenarioConfig().ball_position[0]
     self._attacking_left = ball_x > 0
@@ -413,15 +435,38 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._curriculum_results.clear()
     return success_rate, advanced
 
+  def _from_engine(self, observations):
+    """simple115v2 frames of what the engine returned, for this env's own use.
+
+    Shaping, possession and ball-advance bookkeeping read simple115v2 frames
+    in every mode.  In entity mode the engine returns raw per-agent views;
+    they are kept for _write_observations and converted here exactly as
+    the simple115v2 wrapper would.
+    """
+    if self._observation != 'entities':
+      return observations
+    self._raw_views = observations
+    return wrappers.Simple115StateWrapper.convert_observation(
+        observations, True)
+
   def _write_observations(self, observations):
-    observations = np.asarray(observations, dtype=np.float32)
-    if observations.shape != self.observations.shape:
-      raise ValueError('Expected observations with shape {}, got {}'.format(
-          self.observations.shape, observations.shape))
-    self.observations[:] = observations
-    normalize_egocentric(self.observations)
-    if self._sort_players:
-      sort_players_by_distance(self.observations)
+    """Fill the agent rows the trainer reads, then hide inactive agents.
+
+    `observations` are simple115v2 frames (made egocentric and sorted here);
+    in entity mode the rows come from the raw views kept by _from_engine.
+    """
+    if self._observation == 'entities':
+      entity_observation.build(self._raw_views, self._sticky,
+                               out=self.observations)
+    else:
+      observations = np.asarray(observations, dtype=np.float32)
+      if observations.shape != self.observations.shape:
+        raise ValueError('Expected observations with shape {}, got {}'.format(
+            self.observations.shape, observations.shape))
+      self.observations[:] = observations
+      normalize_egocentric(self.observations)
+      if self._sort_players:
+        sort_players_by_distance(self.observations)
     if self._frozen_defence_path is not None:
       # The frozen side needs its own rows before they are hidden below.
       self._full_observations = self.observations.copy()
@@ -467,7 +512,10 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     actions[~episode_active_mask] = 0
     if self._frozen_defence_path is not None:
       actions[self._defending_rows()] = self._frozen_actions()
+    if self._observation == 'entities':
+      entity_observation.press_buttons(self._sticky, actions)
     observations, _, done, info = self._env.step(actions)
+    observations = self._from_engine(observations)
     rewards = centralized_score_rewards(
         info['score_reward'], episode_active_mask, out=self._step_rewards)
     for team, team_slice in enumerate((slice(0, 11), slice(11, 22))):

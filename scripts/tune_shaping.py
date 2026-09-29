@@ -68,6 +68,7 @@ def run_trial(study, index, steps=STEPS, episodes=256):
   evaluation seeds, levels, and frozen opponents; their training seeds differ.
   """
   import torch
+  from gfootball.env.puffer_policy import upgrade_state_dict
   from gfootball.examples.train_puffer import (
       FootballPolicy, _make_promotion_env, build_parser, evaluate_promotion)
   from types import SimpleNamespace
@@ -111,8 +112,8 @@ def run_trial(study, index, steps=STEPS, episodes=256):
         frozen_defence_path=str(study / 'opponents/level{}.pt'.format(level)))
     try:
       policy = FootballPolicy(vector, hidden_size=256).to('cuda')
-      policy.load_state_dict(torch.load(
-          checkpoint, map_location='cuda', weights_only=True))
+      policy.load_state_dict(upgrade_state_dict(torch.load(
+          checkpoint, map_location='cuda', weights_only=True)))
       metrics = evaluate_promotion(
           policy, vector, episodes, 20261999 + level, 'cuda', 32)
       benchmark[str(level)] = metrics

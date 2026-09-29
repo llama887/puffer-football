@@ -73,10 +73,17 @@ PLAYER_POTENTIAL=${PLAYER_POTENTIAL:-0}
 # SPAWN=uniform ignores curriculum levels and places the ball and players
 # uniformly over the pitch, all onside (advantage env only).
 SPAWN=${SPAWN:-curriculum}
+# Optimizer steps per rollout.  Each step trains on the whole rollout (one
+# segment per agent, ~0.6 GB on the GPU at 46 matches), so there is no
+# minibatch size to set.
 UPDATE_EPOCHS=${UPDATE_EPOCHS:-4}
 BPTT_HORIZON=${BPTT_HORIZON:-32}
-MINIBATCH_SEGMENTS=${MINIBATCH_SEGMENTS:-32}
 HIDDEN_SIZE=${HIDDEN_SIZE:-256}
+# OBSERVATION=entities adds absolute positions, ball owner, keepers, offside,
+# sticky buttons and steps left (gfootball/env/entity_observation.py);
+# NETWORK=transformer runs attention over its players and ball (needs it).
+OBSERVATION=${OBSERVATION:-simple115}
+NETWORK=${NETWORK:-mlp}
 FRAME_STACK=${FRAME_STACK:-1}
 START_LEVEL=${START_LEVEL:-0}
 # 256 episodes every 25 epochs was ~40% of a job and 512+128+128 every 100
@@ -102,8 +109,9 @@ TIMED_PROMOTION_EPOCHS=${TIMED_PROMOTION_EPOCHS:-200}
 #   + env speedups from wesley-speed-improvement     40k
 #   + whole-step update graph + overlap (32 CPUs)    59k
 #   + 48 CPUs, 46 workers, graphed actor            143k  (env steps 143k)
-# None of these change what PPO computes; MINIBATCH_SEGMENTS does (fewer,
-# larger optimizer steps) and is left at 32.
+#   + whole-rollout steps, packed cuDNN LSTM       122k  (at 7-32 epochs)
+# None of these change what PPO computes except the last, which trains on
+# the whole rollout per optimizer step instead of 32-segment minibatches.
 #
 # Async collection takes each batch from whichever workers are ready, so an
 # engine reset in one match never stalls the others.  Overlap keeps the
@@ -119,10 +127,10 @@ if [[ ${OVERLAP_COLLECTION:-1} == 0 ]]; then
   OVERLAP_ARGS=(--no-overlap-collection)
 fi
 ENVS_PER_WORKER=${ENVS_PER_WORKER:-1}
-# A whole PPO minibatch step (forward, loss, backward, clip, Adam) replays as
-# one CUDA graph, and so does the acting forward.  GRAPH_UPDATE=0 and
-# GRAPH_ACTOR=0 fall back to eager.  COMPILE=1 adds torch.compile, which the
-# graphed update makes redundant.
+# The acting forward replays as one CUDA graph, and so does the update: one
+# whole-rollout step is captured per rollout and replayed UPDATE_EPOCHS
+# times, so the main thread keeps serving the environments.  GRAPH_UPDATE=0
+# and GRAPH_ACTOR=0 fall back to eager.  COMPILE=1 adds torch.compile.
 GRAPH_ARGS=(--graph-update --graph-actor)
 if [[ ${GRAPH_UPDATE:-1} == 0 ]]; then
   GRAPH_ARGS[0]=--no-graph-update
@@ -254,6 +262,8 @@ cd "$RUN_ROOT"
   --log-interval-seconds "$LOG_INTERVAL_SECONDS" \
   --frame-stack "$FRAME_STACK" \
   --hidden-size "$HIDDEN_SIZE" \
+  --observation "$OBSERVATION" \
+  --network "$NETWORK" \
   --curriculum-window 20 \
   --curriculum-success-threshold "$CURRICULUM_SUCCESS_THRESHOLD" \
   --learning-rate "$LEARNING_RATE" \
@@ -267,7 +277,6 @@ cd "$RUN_ROOT"
   --gae-lambda "$GAE_LAMBDA" \
   --update-epochs "$UPDATE_EPOCHS" \
   --bptt-horizon "$BPTT_HORIZON" \
-  --minibatch-segments "$MINIBATCH_SEGMENTS" \
   --seed "$SEED" \
   --start-level "$START_LEVEL" \
   --promotion-interval "$PROMOTION_INTERVAL" \

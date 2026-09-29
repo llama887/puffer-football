@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from gfootball.env.puffer_policy import (
-    hidden_size_from_state_dict, upgrade_state_dict)
+    hidden_size_from_state_dict, save_policy_snapshot, upgrade_state_dict)
 from gfootball.examples.train_puffer import (
     ACTION_NAMES, SHOT_ACTION, FootballPolicy, FootballPuffeRL, GraphedActor,
     build_config, build_parser,
@@ -58,32 +58,50 @@ def test_explained_variance_is_one_for_a_perfect_critic():
 
 
 def test_bptt_forward_matches_stepwise_rollout_with_episode_resets():
-  """Training and rollout must see the same recurrent state."""
+  """Training and rollout must see the same recurrent state and gradients.
+
+  The window forward splits segments at episode ends; this pins it to the
+  one-step acting forward for resets at the first step, back to back, at the
+  last step and on every step, for outputs and for every parameter gradient.
+  """
   torch.manual_seed(0)
   policy = FootballPolicy(_env(), hidden_size=16).eval()
-  segments, horizon = 3, 7
+  segments, horizon = 6, 7
   observations = torch.randn(segments, horizon, 115)
   done = torch.zeros(segments, horizon)
   done[0, 3] = 1
   done[2, 1] = 1
   done[2, 5] = 1
+  done[3, 0] = 1
+  done[4, 2] = done[4, 3] = 1
+  done[4, horizon - 1] = 1
+  done[5] = 1
 
-  with torch.no_grad():
-    logits, values = policy(observations, {'done': done})
-    state = {'lstm_h': None, 'lstm_c': None, 'done': None}
-    stepwise_logits, stepwise_values = [], []
-    for step in range(horizon):
-      state['done'] = done[:, step]
-      step_logits, step_values = policy.forward_eval(
-          observations[:, step], state)
-      stepwise_logits.append(step_logits)
-      stepwise_values.append(step_values)
+  def gradients_of(logits, values):
+    policy.zero_grad()
+    (logits.square().mean() + values.square().mean()).backward()
+    return {name: parameter.grad.clone()
+            for name, parameter in policy.named_parameters()}
 
+  logits, values = policy(observations, {'done': done})
+  gradients = gradients_of(logits, values)
+  state = {'lstm_h': None, 'lstm_c': None, 'done': None}
+  stepwise_logits, stepwise_values = [], []
+  for step in range(horizon):
+    state['done'] = done[:, step]
+    step_logits, step_values = policy.forward_eval(
+        observations[:, step], state)
+    stepwise_logits.append(step_logits)
+    stepwise_values.append(step_values)
   stepwise_logits = torch.stack(stepwise_logits, dim=1).reshape(
       segments * horizon, -1)
   stepwise_values = torch.stack(stepwise_values, dim=1)
+  stepwise_gradients = gradients_of(stepwise_logits, stepwise_values)
+
   assert torch.allclose(logits, stepwise_logits, atol=1e-5)
   assert torch.allclose(values, stepwise_values, atol=1e-5)
+  for name, gradient in gradients.items():
+    assert torch.allclose(gradient, stepwise_gradients[name], atol=1e-6), name
 
 
 def test_promotion_matches_training_across_rollout_and_episode_boundaries():
@@ -288,7 +306,7 @@ def test_policy_shapes_and_gradients_flow_to_every_head():
   assert values.shape == (4, 5)
   (logits.square().mean() + values.square().mean()).backward()
   named = dict(policy.named_parameters())
-  for name in ('actor.weight', 'critic.weight', 'cell.weight_ih',
+  for name in ('actor.weight', 'critic.weight', 'rnn.weight_ih_l0',
                'encoder.0.weight'):
     assert named[name].grad is not None
     assert named[name].grad.abs().sum() > 0
@@ -429,20 +447,6 @@ def test_gpu_filler_accepts_the_trainer_call_and_only_spins():
     raise AssertionError('--gpu-filler-kind matmul must not be accepted')
 
 
-def test_learning_rate_is_set_in_place_for_captured_updates():
-  """A captured update reads the rate tensor's memory, so it is filled in place."""
-  from gfootball.examples.train_puffer import set_learning_rate
-  rate = torch.tensor(1e-3)
-  optimizer = torch.optim.Adam([torch.nn.Parameter(torch.zeros(1))], lr=rate)
-  set_learning_rate(optimizer, 2.5e-4)
-  assert optimizer.param_groups[0]['lr'] is rate
-  # The rate tensor is float32.
-  assert abs(rate.item() - 2.5e-4) < 1e-10
-  eager = torch.optim.Adam([torch.nn.Parameter(torch.zeros(1))], lr=1e-3)
-  set_learning_rate(eager, 2.5e-4)
-  assert eager.param_groups[0]['lr'] == 2.5e-4
-
-
 def test_gate_score_is_logged_per_level_against_the_level_entry_policy():
   """Each gate result is also logged under its own level's name.
 
@@ -467,14 +471,72 @@ def test_gate_score_is_logged_per_level_against_the_level_entry_policy():
   assert not hasattr(build_parser().parse_args([]), 'initial_opponent_interval')
 
 
-def test_update_epochs_cover_the_active_data_at_least_once():
-  for num_segments in (1, 7, 30, 60, 660):
-    for requested in (1, 16, 64):
-      segments_per_minibatch = min(requested, num_segments)
-      minibatches = max(1, math.ceil(
-          4 * num_segments / segments_per_minibatch))
-      sampled = minibatches * segments_per_minibatch
-      assert sampled >= 4 * num_segments
+def test_padded_episode_layout_gives_the_same_window_forward():
+  """Extra packed slots per step change nothing but the capacity.
+
+  A captured update keeps one packed layout for many rollouts by giving
+  every step more slots than it needs; the spare slots read a zero row and
+  their outputs are dropped, so outputs and gradients must not move.
+  """
+  from gfootball.env.puffer_policy import (
+      episode_batch_sizes, episode_pieces)
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  observations = torch.randn(5, 7, 115)
+  done = torch.zeros(5, 7)
+  done[0, 3] = done[2, 1] = done[2, 5] = done[3, 0] = 1
+  done[4, 2] = done[4, 3] = 1
+
+  def run(state):
+    policy.zero_grad()
+    logits, values = policy(observations, state)
+    (logits.square().mean() + values.square().mean()).backward()
+    return [logits.detach(), values.detach()] + [
+        parameter.grad.clone() for parameter in policy.parameters()]
+
+  needed = episode_batch_sizes(done)
+  assert needed.tolist() == [10, 8, 6, 5, 2, 2, 2]
+  exact = run({'done': done})
+  padded = run({'episode_pieces': episode_pieces(done, needed + 3)})
+  for expected, actual in zip(exact, padded):
+    assert torch.allclose(expected, actual, atol=1e-6)
+
+
+def test_every_update_epoch_is_one_step_over_the_whole_rollout():
+  """A gradient step trains on every active transition of the rollout.
+
+  The minibatch is the whole rollout (it fits on the GPU many times over),
+  so update_epochs is exactly the number of optimizer steps per rollout.
+  """
+  torch.manual_seed(0)
+  segments, horizon = 12, 8
+  trainer = FootballPuffeRL.__new__(FootballPuffeRL)
+  trainer.config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5,
+                        ent_coef=0.001, max_grad_norm=0.5, device='cpu',
+                        update_epochs=3)
+  trainer.observations = torch.randn(segments, horizon, 115)
+  trainer.terminals = (torch.rand(segments, horizon) < 0.1).float()
+  trainer.actions = torch.randint(0, 19, (segments, horizon))
+  trainer.logprobs = -3 * torch.rand(segments, horizon)
+  trainer.uncompiled_policy = trainer.policy = FootballPolicy(
+      _env(), hidden_size=16)
+  trainer.optimizer = torch.optim.Adam(trainer.policy.parameters(), lr=3e-4)
+  trainer.optimizer_steps = 0
+  trainer.graph_update = False
+  trainer._epoch_values = None
+  trainable = torch.rand(segments, horizon) < 0.7
+  trainable[4] = False
+  segment_index = trainable.any(dim=1).nonzero().flatten()
+  trainer._stage_epoch(*(torch.randn(segments, horizon) for _ in range(3)),
+                       trainable)
+
+  trainer._update(segment_index)
+
+  transitions = trainer._totals[
+      FootballPuffeRL.LOSS_NAMES.index('minibatch_transitions')]
+  assert trainer.optimizer_steps == 3
+  assert transitions == 3 * trainable.sum()
+  assert '--minibatch-segments' not in build_parser().format_help()
 
 
 class _AsyncScriptedPool:
@@ -592,11 +654,19 @@ def test_graphed_actor_matches_the_eager_forward():
   """Same value, memory and log-prob as forward_eval; skipped without CUDA."""
   if not torch.cuda.is_available():
     return
+  from gfootball.env import entity_observation as entity
+  for network, size in (('mlp', 115), ('transformer', entity.SIZE)):
+    _check_graphed_actor(network, size)
+
+
+def _check_graphed_actor(network, size):
   torch.manual_seed(0)
-  policy = FootballPolicy(_env(), hidden_size=32).cuda()
-  actor = GraphedActor(policy, 44, 115, 'cuda', None)
+  policy = FootballPolicy(_env(size), hidden_size=32, network=network).cuda()
+  actor = GraphedActor(policy, 44, size, 'cuda', None)
   for _ in range(2):
-    observations = torch.randn(44, 115, device='cuda')
+    observations = (_entity_rows(44, absent_opponents=2).cuda()
+                    if network == 'transformer' else
+                    torch.randn(44, size, device='cuda'))
     hidden = torch.randn(44, 32, device='cuda')
     cell = torch.randn(44, 32, device='cuda')
     done = (torch.rand(44, device='cuda') < 0.3).float()
@@ -617,147 +687,195 @@ def test_graphed_actor_matches_the_eager_forward():
         parameter.mul_(1.1)
 
 
-def test_graphed_update_matches_the_eager_minibatch_loop():
-  """Same parameters and loss statistics after several epochs; needs CUDA."""
-  if not torch.cuda.is_available():
-    return
-  import copy
-  matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
-  torch.backends.cuda.matmul.allow_tf32 = False
-  try:
-    segments, horizon, device = 48, 8, 'cuda'
-    torch.manual_seed(0)
-    base = FootballPolicy(_env(), hidden_size=16).to(device)
-    config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5,
-                  ent_coef=0.001, max_grad_norm=0.5, device=device)
-    buffers = dict(
-        observations=torch.randn(segments, horizon, 115, device=device),
-        terminals=(torch.rand(segments, horizon, device=device) < 0.1).float(),
-        actions=torch.randint(0, 19, (segments, horizon), device=device),
-        logprobs=-3 * torch.rand(segments, horizon, device=device))
-    epoch = [torch.randn(segments, horizon, device=device) for _ in range(3)]
-    trainable = torch.rand(segments, horizon, device=device) < 0.9
-    segment_index = torch.arange(segments, device=device)
-    results = []
-    for graph in (False, True):
-      trainer = FootballPuffeRL.__new__(FootballPuffeRL)
-      trainer.config = config
-      for name, value in buffers.items():
-        setattr(trainer, name, value.clone())
-      trainer.uncompiled_policy = trainer.policy = copy.deepcopy(base)
-      trainer.optimizer = torch.optim.Adam(
-          trainer.policy.parameters(), lr=3e-4, eps=1e-5, capturable=graph)
-      trainer.optimizer_steps = 0
-      trainer.graph_update = graph
-      trainer._update_graph = trainer._update_graph_rows = None
-      trainer._epoch_values = None
-      for step in range(3):
-        trainer._stage_epoch(*epoch, trainable)
-        torch.manual_seed(100 + step)
-        if graph:
-          trainer._update_graphed(segment_index, 16, 6)
-        else:
-          orders = torch.argsort(torch.rand(6, segments, device=device), dim=1)
-          for index in segment_index[orders[:, :16]]:
-            trainer._minibatch_step(trainer.policy, index)
-      results.append((torch.cat([p.detach().flatten()
-                                 for p in trainer.policy.parameters()]),
-                      trainer._totals.clone(), trainer.optimizer_steps))
-    (eager, eager_totals, eager_steps), (graphed, graph_totals, graph_steps) = (
-        results)
-    assert eager_steps == graph_steps == 18
-    assert torch.allclose(eager, graphed, atol=1e-5)
-    assert torch.allclose(eager_totals, graph_totals, atol=1e-5)
-  finally:
-    torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+def test_graphed_update_matches_the_eager_update():
+  """One graph per rollout, replayed update_epochs times; needs CUDA.
 
-
-def test_graphed_update_follows_an_annealed_learning_rate():
-  """The captured update must use the rate set before each replay; needs CUDA.
-
-  The graph used to bake the learning rate in, so annealing switched the
-  graphed update off.  With the rate held in a tensor filled in place, the
-  graphed and eager loops must stay equal while the rate changes per epoch.
+  Every rollout has its own episode layout, so the graph is captured again
+  for each one; the learning rate is annealed between rollouts through a
+  tensor the graph reads.  Parameters, loss totals and step counts must
+  equal the eager update, and a zero rate must leave the weights alone.
   """
   if not torch.cuda.is_available():
     return
   import copy
   from gfootball.examples.train_puffer import set_learning_rate
   matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+  cudnn_tf32 = torch.backends.cudnn.allow_tf32
   torch.backends.cuda.matmul.allow_tf32 = False
+  torch.backends.cudnn.allow_tf32 = False
   try:
     segments, horizon, device = 48, 8, 'cuda'
     torch.manual_seed(0)
     base = FootballPolicy(_env(), hidden_size=16).to(device)
     config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5,
-                  ent_coef=0.001, max_grad_norm=0.5, device=device)
-    buffers = dict(
-        observations=torch.randn(segments, horizon, 115, device=device),
-        terminals=(torch.rand(segments, horizon, device=device) < 0.1).float(),
-        actions=torch.randint(0, 19, (segments, horizon), device=device),
-        logprobs=-3 * torch.rand(segments, horizon, device=device))
+                  ent_coef=0.001, max_grad_norm=0.5, device=device,
+                  update_epochs=3)
+    observations = torch.randn(segments, horizon, 115, device=device)
+    actions = torch.randint(0, 19, (segments, horizon), device=device)
+    logprobs = -3 * torch.rand(segments, horizon, device=device)
     epoch = [torch.randn(segments, horizon, device=device) for _ in range(3)]
     trainable = torch.rand(segments, horizon, device=device) < 0.9
     segment_index = torch.arange(segments, device=device)
+    layouts = [(torch.rand(segments, horizon, device=device) < rate).float()
+               for rate in (0.1, 0.1, 0.3)]
     schedule = (3e-4, 1.5e-4, 0.0)
     results = []
     for graph in (False, True):
       trainer = FootballPuffeRL.__new__(FootballPuffeRL)
       trainer.config = config
-      for name, value in buffers.items():
-        setattr(trainer, name, value.clone())
+      trainer.observations = observations.clone()
+      trainer.actions = actions.clone()
+      trainer.logprobs = logprobs.clone()
       trainer.uncompiled_policy = trainer.policy = copy.deepcopy(base)
       rate = torch.tensor(schedule[0], device=device) if graph else schedule[0]
       trainer.optimizer = torch.optim.Adam(
           trainer.policy.parameters(), lr=rate, eps=1e-5, capturable=graph)
       trainer.optimizer_steps = 0
       trainer.graph_update = graph
-      trainer._update_graph = trainer._update_graph_rows = None
+      trainer._update_graph = trainer._update_pool = None
+      trainer._update_capacity = None
+      trainer.update_captures = 0
       trainer._epoch_values = None
-      before_last = None
-      for step, learning_rate in enumerate(schedule):
+      totals = []
+      for terminals, learning_rate in zip(layouts, schedule):
+        trainer.terminals = terminals
         set_learning_rate(trainer.optimizer, learning_rate)
         trainer._stage_epoch(*epoch, trainable)
-        torch.manual_seed(100 + step)
-        if step == len(schedule) - 1:
-          before_last = torch.cat([p.detach().flatten().clone()
-                                   for p in trainer.policy.parameters()])
-        if graph:
-          trainer._update_graphed(segment_index, 16, 6)
-        else:
-          orders = torch.argsort(torch.rand(6, segments, device=device), dim=1)
-          for index in segment_index[orders[:, :16]]:
-            trainer._minibatch_step(trainer.policy, index)
+        before = torch.cat([p.detach().flatten().clone()
+                            for p in trainer.policy.parameters()])
+        trainer._update(segment_index)
+        totals.append(trainer._totals.clone())
       final = torch.cat([p.detach().flatten()
                          for p in trainer.policy.parameters()])
-      results.append((final, before_last))
-    (eager, eager_before), (graphed, graphed_before) = results
+      results.append((final, before, torch.stack(totals),
+                      trainer.optimizer_steps))
+      captures = trainer.update_captures
+    (eager, _, eager_totals, eager_steps), (graphed, graphed_before,
+                                           graph_totals, graph_steps) = results
+    assert eager_steps == graph_steps == 9
+    # The second layout fits the first's capacity; the third needs more.
+    assert captures == 2
     assert torch.allclose(eager, graphed, atol=1e-5)
-    # A zero rate in the last epoch must leave the parameters where they were.
-    assert torch.allclose(graphed, graphed_before, atol=1e-7)
-    assert not torch.allclose(eager_before, base_parameters(base), atol=1e-7)
+    assert torch.allclose(eager_totals, graph_totals, atol=1e-5)
+    assert torch.equal(graphed, graphed_before)
   finally:
     torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+    torch.backends.cudnn.allow_tf32 = cudnn_tf32
 
 
-def base_parameters(policy):
-  return torch.cat([p.detach().flatten() for p in policy.parameters()])
+def _entity_rows(rows, absent_opponents=0):
+  """Random entity rows with the flags a real row has."""
+  from gfootball.env import entity_observation as entity
+  observations = torch.randn(rows, entity.SIZE)
+  players = observations[:, entity.PLAYERS_START:].view(
+      rows, entity.PLAYERS, entity.PLAYER_FEATURES)
+  present = entity.PLAYER_FEATURE_INDEX['present']
+  players[..., present] = 1
+  if absent_opponents:
+    players[:, -absent_opponents:] = 0
+  return observations
 
 
-def test_nn_lstm_checkpoints_still_load():
-  """Runs from the nn.LSTM era wrote rnn.*_l0 keys; they must still load."""
+def test_transformer_policy_matches_stepwise_rollout():
+  """The attention encoder keeps training and acting on the same numbers."""
+  from gfootball.env import entity_observation as entity
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(entity.SIZE), hidden_size=16,
+                          network='transformer').eval()
+  segments, horizon = 3, 5
+  observations = _entity_rows(segments * horizon, absent_opponents=2).view(
+      segments, horizon, -1)
+  done = torch.zeros(segments, horizon)
+  done[1, 2] = 1
+  with torch.no_grad():
+    logits, values = policy(observations, {'done': done})
+    state = {'lstm_h': None, 'lstm_c': None, 'done': None}
+    stepwise = []
+    for step in range(horizon):
+      state['done'] = done[:, step]
+      stepwise.append(policy.forward_eval(observations[:, step], state)[0])
+  stepwise = torch.stack(stepwise, dim=1).reshape(segments * horizon, -1)
+  assert torch.allclose(logits, stepwise, atol=1e-5)
+  assert values.shape == (segments, horizon)
+
+
+def test_transformer_ignores_absent_players_and_their_order():
+  """Absent players change nothing; nor does the order of the others."""
+  from gfootball.env import entity_observation as entity
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(entity.SIZE), hidden_size=16,
+                          network='transformer').eval()
+  observations = _entity_rows(4, absent_opponents=3)
+  players = slice(entity.PLAYERS_START, None)
+  with torch.no_grad():
+    reference = policy.forward_eval(observations, {})[0]
+    garbage = observations.clone()
+    view = garbage[:, players].view(4, entity.PLAYERS, entity.PLAYER_FEATURES)
+    view[:, -3:, :entity.PLAYER_FEATURE_INDEX['present']] = torch.randn(
+        4, 3, entity.PLAYER_FEATURE_INDEX['present'])
+    shuffled = observations.clone()
+    view = shuffled[:, players].view(4, entity.PLAYERS, entity.PLAYER_FEATURES)
+    order = torch.cat([torch.tensor([0]), 1 + torch.randperm(entity.PLAYERS - 1)])
+    view.copy_(view[:, order].clone())
+    # The normalizer is per feature slot, so it must be the identity here.
+    assert policy.normalizer.count < 1
+    assert torch.allclose(policy.forward_eval(garbage, {})[0], reference,
+                          atol=1e-5)
+    assert torch.allclose(policy.forward_eval(shuffled, {})[0], reference,
+                          atol=1e-5)
+
+
+def test_frozen_snapshots_reload_as_the_network_they_were_saved_from():
+  import tempfile
+  from gfootball.env import entity_observation as entity
+  from gfootball.env.puffer_policy import load_frozen_policy
+  torch.manual_seed(0)
+  for network, size in (('mlp', 115), ('transformer', entity.SIZE)):
+    policy = FootballPolicy(_env(size), hidden_size=16, network=network).eval()
+    with tempfile.TemporaryDirectory() as directory:
+      path = directory + '/policy.pt'
+      save_policy_snapshot(policy, path)
+      restored = load_frozen_policy(path, _env(size))
+    observations = (_entity_rows(3) if network == 'transformer'
+                    else torch.randn(3, size))
+    with torch.no_grad():
+      assert torch.allclose(restored.forward_eval(observations, {})[0],
+                            policy.forward_eval(observations, {})[0])
+
+
+def test_transformer_network_needs_entity_observations():
+  args = build_parser().parse_args(
+      ['--network', 'transformer', '--observation', 'entities'])
+  assert args.network == 'transformer' and args.observation == 'entities'
+  assert build_parser().parse_args([]).network == 'mlp'
+  try:
+    FootballPolicy(_env(115), hidden_size=16, network='transformer')
+  except ValueError:
+    pass
+  else:
+    raise AssertionError('a transformer over simple115 must be rejected')
+
+
+def test_lstm_cell_checkpoints_still_load():
+  """Runs from the LSTMCell era wrote cell.* keys; they must still load.
+
+  Every checkpoint and level-entry snapshot before the packed cuDNN forward
+  holds the recurrence as LSTMCell parameters, the same tensors nn.LSTM
+  names rnn.*_l0.
+  """
   policy = FootballPolicy(_env(), hidden_size=16)
   legacy = {}
   for key, value in policy.state_dict().items():
-    if key.startswith('cell.'):
-      key = key.replace('cell.', 'rnn.') + '_l0'
+    if key.startswith('rnn.'):
+      key = key.replace('rnn.', 'cell.').removesuffix('_l0')
     legacy[key] = value
-  assert 'rnn.weight_hh_l0' in legacy and 'cell.weight_hh' not in legacy
+  assert 'cell.weight_hh' in legacy and 'rnn.weight_hh_l0' not in legacy
   assert hidden_size_from_state_dict(legacy) == 16
-  restored = FootballPolicy(_env(), hidden_size=16)
-  restored.load_state_dict(upgrade_state_dict(legacy))
-  for key, value in policy.state_dict().items():
-    assert torch.equal(restored.state_dict()[key], value), key
+  for checkpoint in (legacy, policy.state_dict()):
+    restored = FootballPolicy(_env(), hidden_size=16)
+    restored.load_state_dict(upgrade_state_dict(checkpoint))
+    for key, value in policy.state_dict().items():
+      assert torch.equal(restored.state_dict()[key], value), key
 
 
 if __name__ == '__main__':

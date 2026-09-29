@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optuna search over PPO settings, trained and scored on level 0 only.
+"""Optuna search over PPO settings and the model, scored on level 0 only.
 
 Why: the shaping study scored policies on levels 4/6/7 although every trial
 finished training at level 2-4, and probes of its best checkpoint showed a
@@ -8,8 +8,9 @@ opening first-touch strike. This search optimises level 0 alone before any
 later level is considered.
 
 How a trial works (one trial per Slurm array task):
-  * Optuna samples the PPO settings (TPE, multivariate, constant liar so
-    parallel workers do not sample the same point).
+  * Optuna samples the PPO settings and the model (observation and trunk,
+    MODELS) with TPE, multivariate, constant liar so parallel workers do
+    not sample the same point.
   * The unchanged trainer (repo/sbatch/train_selfplay.sbatch) runs with the
     curriculum threshold at 1.0 (256/256 wins), so it stays on level 0; a
     trial that ever reaches that is stopped as mastered. It runs with its
@@ -59,11 +60,22 @@ OPPONENT = 'opponents/level4.pt'
 FOOTBALL_PYTHON_ENV = os.environ.get(
     'FOOTBALL_ENV_PREFIX',
     '/scratch/{}/repos/football/.venv'.format(os.environ.get('USER', '')))
-# The shaping-study winner; enqueued as trial 0 so it is the reference point.
-BASELINE = dict(
-    learning_rate=3e-4, anneal_lr=0, ent_coef=1e-3, gamma=0.997,
-    gae_lambda=0.98, clip_coef=0.2, vf_coef=0.5, update_epochs=4,
-    minibatch_segments=32, envs_per_worker=1, ball_potential=1.0)
+# Observation and trunk of each searchable model (see train_puffer --help).
+MODELS = {
+    'simple115-mlp': dict(OBSERVATION='simple115', NETWORK='mlp'),
+    'entities-mlp': dict(OBSERVATION='entities', NETWORK='mlp'),
+    'entities-transformer': dict(OBSERVATION='entities',
+                                 NETWORK='transformer'),
+}
+# The September 25 winner (trial 36), with each model, enqueued first so
+# every model has a reference point.  Its 7 epochs of 128-segment
+# minibatches were ~55 optimizer steps per rollout; every step now trains
+# on the whole rollout, so update_epochs is steps per rollout.
+BASELINES = [dict(
+    learning_rate=5.04e-4, anneal_lr=1, ent_coef=1.36e-3, gamma=0.999,
+    gae_lambda=0.947, clip_coef=0.153, vf_coef=0.918, update_epochs=8,
+    envs_per_worker=1, ball_potential=0.571, model=model)
+    for model in MODELS]
 
 
 def storage(study_dir):
@@ -94,18 +106,17 @@ def load_study(study_dir):
 def suggest(trial):
   """Sample one full set of PPO settings; the search space lives only here."""
   return dict(
-      learning_rate=trial.suggest_float('learning_rate', 1e-4, 2e-3, log=True),
+      learning_rate=trial.suggest_float('learning_rate', 1e-4, 3e-3, log=True),
       anneal_lr=trial.suggest_categorical('anneal_lr', [0, 1]),
       ent_coef=trial.suggest_float('ent_coef', 1e-5, 1e-2, log=True),
       gamma=trial.suggest_categorical('gamma', [0.99, 0.995, 0.997, 0.999]),
       gae_lambda=trial.suggest_float('gae_lambda', 0.9, 0.99),
       clip_coef=trial.suggest_float('clip_coef', 0.1, 0.3),
       vf_coef=trial.suggest_float('vf_coef', 0.25, 1.0),
-      update_epochs=trial.suggest_int('update_epochs', 1, 8),
-      minibatch_segments=trial.suggest_categorical(
-          'minibatch_segments', [16, 32, 64, 128]),
+      update_epochs=trial.suggest_int('update_epochs', 1, 32, log=True),
       envs_per_worker=trial.suggest_categorical('envs_per_worker', [1, 2]),
-      ball_potential=trial.suggest_float('ball_potential', 0.0, 2.0))
+      ball_potential=trial.suggest_float('ball_potential', 0.0, 2.0),
+      model=trial.suggest_categorical('model', list(MODELS)))
 
 
 def trainer_environment(study_dir, params, seed, steps):
@@ -121,7 +132,7 @@ def trainer_environment(study_dir, params, seed, steps):
       ENT_COEF=params['ent_coef'], GAMMA=params['gamma'],
       GAE_LAMBDA=params['gae_lambda'], CLIP_COEF=params['clip_coef'],
       VF_COEF=params['vf_coef'], UPDATE_EPOCHS=params['update_epochs'],
-      MINIBATCH_SEGMENTS=params['minibatch_segments'],
+      **MODELS[params['model']],
       ENVS_PER_WORKER=params['envs_per_worker'],
       BALL_POTENTIAL=params['ball_potential'], PLAYER_POTENTIAL=0.0,
       SEED=seed, TOTAL_TIMESTEPS=steps, START_LEVEL=0,
@@ -132,7 +143,7 @@ def trainer_environment(study_dir, params, seed, steps):
       GREEDY_PROMOTION_EPISODES=64, SELFPLAY_PROMOTION_EPISODES=64,
       SCORED_PROMOTION_LEVELS=21, ENV_NAME='11_vs_11_advantage',
       BPTT_HORIZON=32, HIDDEN_SIZE=256, FRAME_STACK=1,
-      ASYNC_COLLECTION=1, ASYNC_PROMOTION=1, COMPILE=1, GPU_FILLER=1,
+      ASYNC_COLLECTION=1, ASYNC_PROMOTION=1, COMPILE=0, GPU_FILLER=1,
       LOCAL_GAME_DATA=1)
   environment = dict(os.environ, **{k: str(v) for k, v in settings.items()})
   environment.update(REPO=str(study_dir / 'repo'),
@@ -238,10 +249,11 @@ def run_trial(study_dir, steps):
 
 
 def init(study_dir):
-  """Create the shared study once and queue the baseline as trial 0."""
+  """Create the shared study once and queue one baseline per model first."""
   study = optuna.create_study(
       study_name=STUDY_NAME, storage=storage(study_dir), direction='maximize')
-  study.enqueue_trial(BASELINE)
+  for baseline in BASELINES:
+    study.enqueue_trial(baseline)
   print('created study {} in {}'.format(STUDY_NAME, study_dir))
 
 
@@ -267,8 +279,9 @@ def summarize(study_dir):
       counts=counts,
       top=[dict(number=t.number, value=t.value, params=t.params)
            for t in completed[:10]],
-      baseline=next((dict(number=t.number, value=t.value, state=t.state.name)
-                     for t in trials if t.number == 0), None),
+      baselines=[dict(number=t.number, value=t.value, state=t.state.name,
+                      model=t.params.get('model'))
+                 for t in trials if t.number < len(BASELINES)],
       importances=importances)
   (study_dir / 'summary.json').write_text(json.dumps(report, indent=2) + '\n')
   print(json.dumps(report, indent=2))
