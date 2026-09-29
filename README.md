@@ -197,44 +197,142 @@ curriculum also disables movement magnetism, automatic pass/shot aiming and
 power, and automatic standing interference. Stock scenarios and rendered
 evaluation keep the original features.
 
-The Torch job below runs recurrent shared-policy PPO self-play on the
-`11_vs_11_advantage` curriculum with 30 environment workers, one H100, and a
-low-priority GPU heartbeat.  Submit it as an array to train one seed per task;
-single-seed results on this task are inside the seed noise:
+#### Training on Torch
+
+`sbatch/train_selfplay.sbatch` runs recurrent shared-policy PPO self-play on
+the `11_vs_11_advantage` curriculum.  It asks for 48 CPUs and one GPU of any
+type (Torch allows 48 CPUs per L40S-class GPU, only 32 per H100) and runs
+`CPUs - 2` environment workers (46).  Submit it as an array to train one seed
+per task; single-seed results on this task are inside the seed noise:
 
 ```shell
-sbatch --array=0-2 sbatch/train_selfplay.sbatch
+cd /scratch/$USER/repos/football
+sbatch --array=0-2 --account=<account> sbatch/train_selfplay.sbatch
 python scripts/summarize_runs.py sbatch/logs/football-selfplay-<array id>-*.out
 ```
+
+Queue times differ a lot between Slurm accounts.  `--test-only` prints an
+estimated start without submitting, so check each account you can use first:
+
+```shell
+for A in <account> <account> ...; do
+  sbatch --test-only --account=$A --cpus-per-task=48 --gres=gpu:1 \
+    --time=24:00:00 --wrap=true 2>&1 | tail -1
+done
+```
+
+Every setting is an environment variable passed with `--export=ALL,...`.
+The throughput-related ones (defaults in brackets):
+
+| Variable | Meaning |
+|---|---|
+| `ENVS_PER_WORKER` [1] | matches stepped by each worker process |
+| `GRAPH_UPDATE` [1] | replay a whole PPO minibatch step (forward, loss, backward, clip, Adam) as one CUDA graph |
+| `GRAPH_ACTOR` [1] | replay the acting forward and sampling as one CUDA graph |
+| `OVERLAP_COLLECTION` [1] | keep the environments stepping while the update runs (data at most one update stale; the stored log-prob keeps PPO's ratio exact) |
+| `COMPILE` [0] | `torch.compile` the BPTT forward; redundant with the graphed update |
+| `GPU_FILLER` [1] | keep reported GPU utilization up with a single-block spin kernel on a side stream |
+
+Steady-state trained samples per second, one L40S + 48 CPUs, level 0,
+trial-36 settings below (`--benchmark-epochs`, promotion excluded):
+
+| Workers x matches per worker | Trained samples/s | Peak memory |
+|---|---|---|
+| 46 x 1 (default) | 121k-126k | 6 GB |
+| 46 x 2 | 130k | 12 GB |
+| 46 x 4 | 127k | 17 GB |
+| 46 x 8 | 109k | 28 GB |
+| 92 x 1 | 99k | 10 GB |
+| 46 x 16 | 98k | 50 GB |
+| before the graphed update and overlap, 46 x 1 | 65k | 9 GB |
+
+More matches than CPUs gains at most a few percent, because collection
+(~275k steps/s) already outruns the update, and a bigger batch grows the
+update with it; more worker processes than CPUs is slower.  More matches also
+means a bigger batch and more optimizer steps per epoch, which changes
+learning, not just speed.
+
+The learning rate anneals (`ANNEAL_LR=1`) on a cosine over training progress
+(agent steps done / `TOTAL_TIMESTEPS`), reaching exactly zero at the end.
+It lives in a GPU tensor updated in place, so the graphed update follows it.
+
+#### Curriculum, gate and metrics
 
 Promotion to the next level is gated on held-out evaluation against a
 *frozen* snapshot of the policy taken on entering the level, so the score
 target is fixed rather than the same network's improving defence
-(`FROZEN_DEFENCE_GATE=0` restores the live self-play gate).  Each check also
-logs a greedy (argmax) evaluation and a small live self-play evaluation as
-diagnostics, and a hopeless gate evaluation stops after a quarter of its
-episodes.  Goal-side blockers fade in by probability across levels instead of
-arriving one whole defender at a time.
+(`FROZEN_DEFENCE_GATE=0` restores the live self-play gate).  A level passes
+at 60% overall success with at least 40% on the two weakest spawn templates
+(`CURRICULUM_SUCCESS_THRESHOLD`; `1.0` keeps training on one level).
+`FROZEN_DEFENCE_INIT=/path/policy.pt` makes the level-0 gate play that fixed
+policy instead of the untrained one.  Each gate result is also logged per
+level as `level_entry/level_<L>/success_rate` (and `.../worst_two_...`): the
+opponent is fixed while a level trains, so a flat line marks a stalled level.
+Greedy and live self-play diagnostic evaluations run on every 4th check
+(`DIAGNOSTIC_PROMOTION_EVERY`), and a hopeless gate evaluation stops after a
+quarter of its episodes.  Evaluation scenes are keyed on each worker's
+(seed, episode) pair, so a 256-episode gate plays 256 distinct scenes.
 
-`BALL_POTENTIAL=k` adds potential-based reward shaping on the ball's progress
-toward the goal each side attacks: every step pays `gamma * Phi(s') - Phi(s)`
-with `Phi = -k * (distance of the ball from that goal line)` and `Phi = 0` in
-the absorbing state, which by Ng, Harada and Russell (1999, Theorem 1) leaves
-the optimal policy unchanged.  Promotion evaluation never uses it.
+Goal-side blockers fade in by probability across levels instead of arriving
+one whole defender at a time; the side a lone blocker takes is a per-episode
+coin flip, so mirror-image templates are equally hard.  Every episode ends
+as soon as the ball goes out of play: with the magnet off the engine never
+completes a set piece for agent-controlled players, so a goal kick, corner or
+throw-in would otherwise freeze the match until the timeout.
+
+`SPAWN=uniform` replaces the curriculum with uniformly random scenes: the
+ball and outfield players anywhere on the pitch, keepers inside their own
+penalty area, every attacker onside, offside on, 400-step episodes.  Use it
+with `CURRICULUM_SUCCESS_THRESHOLD=1.0`.
+
+#### Reward shaping
+
+`BALL_POTENTIAL=k` adds potential-based reward shaping on the ball's progress:
+every step pays `gamma * Phi(s') - Phi(s)` with `Phi = k * x`, where `x` is
+the ball's position toward the goal that side attacks (in [-1, 1]), and
+`Phi = 0` in the absorbing state.  The other team gets exactly `-Phi`, so
+shaping is zero-sum like the score, and by Ng, Harada and Russell (1999,
+Theorem 1) it leaves the optimal policy unchanged.  The trainer's `--gamma`
+is used for the whole potential difference; it must match PPO's discount for
+that guarantee.  Rewards are stored unclipped: clipping to [-1, 1] would cut
+the terminal refund of the potential and break the cancellation.  Thus the
+**discounted** sum of shaping rewards is exactly `-Phi(initial_state)`
+regardless of trajectory or outcome.  This preserves the underlying
+discounted objective; it does not guarantee PPO convergence or faster
+learning.  Promotion evaluation never uses shaping.
 
 `PLAYER_POTENTIAL=k` additionally shapes the distance of the closest teammate
-to the ball (including the goalkeeper, ignoring absent
-players). It uses Euclidean distance with the engine's x/y coordinate scales
-accounted for, expressed in pitch half-length units. The combined potential is
-`Phi = -BALL_POTENTIAL * ball_to_goal_line - PLAYER_POTENTIAL * nearest_to_ball`.
-Both scales default to zero. For example, submit with
-`--export=ALL,BALL_POTENTIAL=1,PLAYER_POTENTIAL=0.3` to enable both terms.
-The trainer's `--gamma` is used for the entire potential difference and all
-episode endings use zero terminal potential. Thus the **discounted** sum of
-shaping rewards is exactly `-Phi(initial_state)` regardless of trajectory or
-outcome. This preserves the underlying discounted objective; it does not
-guarantee PPO convergence or faster learning. Success and promotion remain
-goal-based. See [Ng, Harada and Russell (1999)](https://ai.stanford.edu/~ang/papers/shaping-icml99.pdf).
+to the ball (including the goalkeeper, ignoring absent players), in pitch
+half-length units with the engine's x/y scales accounted for.  Unlike the
+ball term it is not zero-sum.  Both scales default to zero.  See
+[Ng, Harada and Russell (1999)](https://ai.stanford.edu/~ang/papers/shaping-icml99.pdf).
+
+#### Tuning level 0 with Optuna
+
+`scripts/tune_optuna.py` searches PPO settings (learning rate and annealing,
+entropy, discount, GAE lambda, clip, value coefficient, epochs, minibatch
+size, matches per worker, ball potential) with TPE, training and scoring on
+level 0 only against a fixed opponent, and prunes the bottom quarter of
+trials after ~50M agent steps.  Optuna runs from its own small venv so the
+trainer's environment is untouched:
+
+```shell
+uv venv /scratch/$USER/envs/optuna && \
+  uv pip install --python /scratch/$USER/envs/optuna/bin/python optuna
+# A study directory holds repo/ (a copy of this source with third_party and
+# resources) and opponents/level4.pt (the fixed gate opponent).
+STUDY=/scratch/$USER/experiments/<study>
+/scratch/$USER/envs/optuna/bin/python $STUDY/repo/scripts/tune_optuna.py init --study $STUDY
+sbatch --array=0-39%10 --account=<account> --export=ALL,OPTUNA_STUDY=$STUDY \
+  $STUDY/repo/sbatch/tune_optuna.sbatch
+/scratch/$USER/envs/optuna/bin/python $STUDY/repo/scripts/tune_optuna.py summarize --study $STUDY
+```
+
+The September 25 study's winner (trial 36) is `LEARNING_RATE=5.04e-4
+ANNEAL_LR=1 ENT_COEF=1.36e-3 GAMMA=0.999 GAE_LAMBDA=0.947 CLIP_COEF=0.153
+VF_COEF=0.918 UPDATE_EPOCHS=7 MINIBATCH_SEGMENTS=128 BALL_POTENTIAL=0.571`.
+
+#### Earlier shaping screen
 
 The bounded screen in `scripts/tune_shaping.py` compares eight configurations
 over the same three seeds, at 50M agent steps each (1.2B total). It includes
