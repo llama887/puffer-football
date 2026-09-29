@@ -91,8 +91,9 @@ def storage(study_dir):
 def load_study(study_dir):
   """Open the shared study with the sampler and pruner every worker uses.
 
-  The pruner only acts after 24 evaluations (~50M agent steps) and only on
-  trials in the bottom quarter, because learning speed on level 0 varies a
+  The pruner only acts after 32 evaluations (~68M agent steps) and only on
+  trials in the bottom tenth (it compares against completed trials, the
+  survivors, so a bottom quarter pruned trials within noise of the best), because learning speed on level 0 varies a
   lot between seeds of the same settings.
   """
   return optuna.load_study(
@@ -100,7 +101,7 @@ def load_study(study_dir):
       sampler=optuna.samplers.TPESampler(
           n_startup_trials=10, multivariate=True, constant_liar=True),
       pruner=optuna.pruners.PercentilePruner(
-          25.0, n_startup_trials=8, n_warmup_steps=24, interval_steps=4,
+          10.0, n_startup_trials=8, n_warmup_steps=32, interval_steps=4,
           n_min_trials=4))
 
 
