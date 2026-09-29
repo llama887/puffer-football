@@ -274,11 +274,15 @@ It lives in a GPU tensor updated in place, so the graphed update follows it.
 #### Observation and network
 
 `OBSERVATION=entities` replaces egocentric simple115v2 with per-entity rows
-(`gfootball/env/entity_observation.py`): the ball and all 22 players with
-absolute and relative positions, velocities, distances, who has the ball,
-keepers, offside positions and tiredness, plus the agent's held sticky
-buttons (direction, sprint, dribble), the game mode and the steps left before
-the episode times out.  `NETWORK=transformer` (needs `OBSERVATION=entities`)
+(`gfootball/env/entity_observation.py`) in a normalized egocentric frame: the
+ball and all 22 players as offsets and distances from the agent, velocities,
+who has the ball, keepers, offside positions and tiredness, plus offsets from
+the agent to both goals and both touchlines, its held sticky buttons
+(direction, sprint, dribble), the game mode and the steps left before the
+episode times out.  No feature is an absolute pitch position; axes stay
+aligned with the pitch (+x toward the attacked goal) because the movement
+actions are pitch directions.
+`NETWORK=transformer` (needs `OBSERVATION=entities`)
 replaces the MLP trunk with two self-attention layers over the player, ball
 and context tokens, masked to present players and independent of player
 order; the LSTM and heads are unchanged.  No actions are masked: the engine

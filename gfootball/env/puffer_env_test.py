@@ -125,7 +125,8 @@ class PufferEnvTest(absltest.TestCase):
       self.assertEqual(env.single_observation_space.shape,
                        (entity_observation.SIZE,))
       observations, _ = env.reset()
-      ball = entity_observation.CONTEXT_FEATURES
+      height = (entity_observation.CONTEXT_FEATURES +
+                entity_observation.BALL_FEATURE_INDEX['height'])
       steps_left = entity_observation.CONTEXT_FEATURE_INDEX['steps_left']
       is_self = (entity_observation.PLAYERS_START +
                  entity_observation.PLAYER_FEATURE_INDEX['is_self'])
@@ -136,9 +137,8 @@ class PufferEnvTest(absltest.TestCase):
         left = active[active < 11]
         right = active[active >= 11]
         if len(left) and len(right):
-          np.testing.assert_allclose(
-              observations[left[0], ball:ball + 2],
-              -observations[right[0], ball:ball + 2], atol=1e-6)
+          np.testing.assert_allclose(observations[left[0], height],
+                                     observations[right[0], height], atol=1e-6)
         before = observations[active[0], steps_left]
         observations, _, terminals, _, _ = env.step(
             np.zeros(22, dtype=np.int32))

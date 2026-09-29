@@ -2,9 +2,9 @@
 
 The default observation (simple115v2, made egocentric by puffer_env) gives
 each player only a position and a velocity, relative to the agent.  It leaves
-out what the engine knows and the policy has to guess: where the agent is on
-the pitch (so where the goal and the touchlines are; an episode ends when
-the ball goes out), who has the ball, which players are keepers, who is in
+out what the engine knows and the policy has to guess: where the goals and
+the touchlines are from the agent (an episode ends when the ball goes out),
+who has the ball, which players are keepers, who is in
 an offside position, how tired each player is, the buttons the agent is
 still holding (direction, sprint and dribble are sticky), and how many steps
 are left before the episode times out, which the value of every state
@@ -14,13 +14,21 @@ layout: puffer_env writes rows with `build`, the policy reads them with the
 index tables below.
 
 One agent's row (SIZE floats) is three blocks:
-  context  CONTEXT_FEATURES   sticky buttons, game mode one-hot, steps left
+  context  CONTEXT_FEATURES   sticky buttons, game mode one-hot, steps left,
+                              offsets to both goals and both touchlines
   ball     BALL_FEATURES      see BALL_FEATURE_NAMES
   players  PLAYERS x PLAYER_FEATURES, see PLAYER_FEATURE_NAMES: the agent
            itself first, then its teammates nearest first, then the
            opponents nearest first; absent players are all zero.
-Coordinates are in the agent's own view (the engine turns the pitch for the
-right team), so +x is always the goal the agent attacks.
+The frame is egocentric: nothing is an absolute pitch position.  Players and
+ball are offsets from the agent, and the goals and touchlines are offsets
+from it too, so the same situation anywhere on the pitch gives the same
+tokens (better generalization) and only the landmark offsets say where it
+is.  Offsets are divided by the pitch's length and width (PITCH_SIZE), so
+they lie in [-1, 1].  The axes stay aligned with the pitch, +x toward the
+goal the agent attacks (the engine turns the pitch for the right team):
+the eight movement actions are pitch directions, so a frame that turned
+with the player would no longer match what an action does.
 """
 
 import numpy as np
@@ -35,6 +43,9 @@ STEPS_LEFT_SCALE = 100.0
 # Pitch units per step: players move up to ~0.015, the ball ~0.1.
 _PLAYER_VELOCITY_SCALE = 0.02
 _BALL_VELOCITY_SCALE = 0.05
+# Pitch length and width in observation units (x in [-1, 1], y in
+# [-0.42, 0.42]); offsets are divided by these.
+PITCH_SIZE = np.array([2.0, 0.84], dtype=np.float32)
 
 _ACTION_NAMES = [str(action) for action in
                  football_action_set.action_set_dict['default']]
@@ -47,20 +58,24 @@ CONTEXT_FEATURE_INDEX = {
     'sticky': 0,
     'game_mode': STICKY_ACTIONS,
     'steps_left': STICKY_ACTIONS + GAME_MODES,
+    # x, y from the agent to the centre of the goal it attacks / defends.
+    'attacked_goal': STICKY_ACTIONS + GAME_MODES + 1,
+    'own_goal': STICKY_ACTIONS + GAME_MODES + 3,
+    # y from the agent to the +y and to the -y touchline.
+    'touchlines': STICKY_ACTIONS + GAME_MODES + 5,
 }
-CONTEXT_FEATURES = STICKY_ACTIONS + GAME_MODES + 1
+CONTEXT_FEATURES = STICKY_ACTIONS + GAME_MODES + 7
 
 BALL_FEATURE_NAMES = (
-    'absolute_x', 'absolute_y', 'height',
-    'velocity_x', 'velocity_y', 'velocity_z',
+    'height', 'velocity_x', 'velocity_y', 'velocity_z',
     'offset_x', 'offset_y', 'distance_to_self',
     'owner_none', 'owner_team', 'owner_opponent')
 BALL_FEATURE_INDEX = {name: i for i, name in enumerate(BALL_FEATURE_NAMES)}
 BALL_FEATURES = len(BALL_FEATURE_NAMES)
 
 PLAYER_FEATURE_NAMES = (
-    'absolute_x', 'absolute_y', 'velocity_x', 'velocity_y',
-    'offset_x', 'offset_y', 'ball_offset_x', 'ball_offset_y',
+    'velocity_x', 'velocity_y', 'offset_x', 'offset_y',
+    'ball_offset_x', 'ball_offset_y',
     'distance_to_self', 'distance_to_ball',
     'teammate', 'is_self', 'goalkeeper', 'has_ball', 'offside', 'tired',
     'present')
@@ -157,10 +172,9 @@ def _build_side(views, sticky, out):
 
   index = PLAYER_FEATURE_INDEX
   shared = np.zeros((PLAYERS, PLAYER_FEATURES), dtype=np.float32)
-  shared[:, index['absolute_x']:index['absolute_y'] + 1] = positions
   shared[:, index['velocity_x']:index['velocity_y'] + 1] = (
       velocities / _PLAYER_VELOCITY_SCALE)
-  ball_offset = positions - ball[:2]
+  ball_offset = (positions - ball[:2]) / PITCH_SIZE
   shared[:, index['ball_offset_x']:index['ball_offset_y'] + 1] = ball_offset
   shared[:, index['distance_to_ball']] = np.linalg.norm(ball_offset, axis=1)
   shared[:TEAM, index['teammate']] = 1
@@ -176,7 +190,7 @@ def _build_side(views, sticky, out):
   if not agents.size:
     return
   self_positions = positions[active[agents]]
-  offsets = positions[None] - self_positions[:, None]
+  offsets = (positions[None] - self_positions[:, None]) / PITCH_SIZE
   distances = np.linalg.norm(offsets, axis=-1)
   players = np.repeat(shared[None], agents.size, axis=0)
   players[:, :, index['offset_x']:index['offset_y'] + 1] = offsets
@@ -195,11 +209,11 @@ def _build_side(views, sticky, out):
 
   ball_row = out[agents, CONTEXT_FEATURES:PLAYERS_START]
   ball_index = BALL_FEATURE_INDEX
-  ball_row[:, ball_index['absolute_x']:ball_index['height'] + 1] = ball
+  ball_row[:, ball_index['height']] = ball[2]
   ball_row[:, ball_index['velocity_x']:ball_index['velocity_z'] + 1] = (
       np.asarray(view['ball_direction'], dtype=np.float32) /
       _BALL_VELOCITY_SCALE)
-  ball_offset_from_self = ball[:2] - self_positions
+  ball_offset_from_self = (ball[:2] - self_positions) / PITCH_SIZE
   ball_row[:, ball_index['offset_x']:ball_index['offset_y'] + 1] = (
       ball_offset_from_self)
   ball_row[:, ball_index['distance_to_self']] = np.linalg.norm(
@@ -212,6 +226,15 @@ def _build_side(views, sticky, out):
       sticky[agents])
   out[agents, context['game_mode'] + int(view['game_mode'])] = 1
   out[agents, context['steps_left']] = view['steps_left'] / STEPS_LEFT_SCALE
+  for name, landmark in (('attacked_goal', (1.0, 0.0)),
+                         ('own_goal', (-1.0, 0.0))):
+    out[agents, context[name]:context[name] + 2] = (
+        (np.asarray(landmark, dtype=np.float32) - self_positions) / PITCH_SIZE)
+  half_width = PITCH_SIZE[1] / 2
+  out[agents, context['touchlines']] = (
+      (half_width - self_positions[:, 1]) / PITCH_SIZE[1])
+  out[agents, context['touchlines'] + 1] = (
+      (-half_width - self_positions[:, 1]) / PITCH_SIZE[1])
 
 
 def build(views, sticky, out=None):

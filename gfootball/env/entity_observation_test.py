@@ -81,8 +81,6 @@ class EntityObservationTest(absltest.TestCase):
     feature = entity.PLAYER_FEATURE_INDEX
     self.assertEqual(players[0, feature['is_self']], 1)
     self.assertEqual(players[1:, feature['is_self']].sum(), 0)
-    np.testing.assert_allclose(players[0, feature['absolute_x']],
-                               _world()['left_team'][3, 0], atol=1e-6)
     np.testing.assert_allclose(players[0, feature['offset_x']], 0, atol=1e-6)
     teammates = players[1:11, feature['distance_to_self']]
     opponents = players[11:, feature['distance_to_self']]
@@ -91,6 +89,56 @@ class EntityObservationTest(absltest.TestCase):
     self.assertEqual(players[:11, feature['teammate']].sum(), 11)
     self.assertEqual(players[11:, feature['teammate']].sum(), 0)
     self.assertEqual(players[:, feature['present']].sum(), 22)
+
+  def test_nothing_depends_on_where_on_the_pitch_the_play_is(self):
+    """Shifting the whole scene moves only the landmark offsets.
+
+    Players and ball are described relative to the agent, so the same
+    situation anywhere on the pitch gives the same tokens; only where the
+    goals and touchlines are (the context landmarks) changes.
+    """
+    # Jittered so no two players are exactly as far from an agent: an exact
+    # tie would be ordered by float rounding, which the shift changes.
+    jitter = np.random.default_rng(0).normal(0, 0.01, (2, 11, 2))
+    world = _world()
+    for team, noise in zip(('left_team', 'right_team'), jitter):
+      world[team] = (world[team] + noise).astype(np.float32)
+    shifted = {key: np.copy(value) for key, value in world.items()}
+    shift = np.array([0.1, 0.05], np.float32)
+    for team in ('left_team', 'right_team'):
+      shifted[team] = world[team] + shift
+    shifted['ball'] = world['ball'] + np.append(shift, 0)
+    sticky = np.zeros((22, entity.STICKY_ACTIONS))
+    before = entity.build(_views(world), sticky)
+    after = entity.build(_views(shifted), sticky)
+    tokens = slice(entity.CONTEXT_FEATURES, None)
+    np.testing.assert_allclose(after[:11, tokens], before[:11, tokens],
+                               atol=1e-5)
+    goal = entity.CONTEXT_FEATURE_INDEX['attacked_goal']
+    np.testing.assert_allclose(
+        after[:11, goal] - before[:11, goal],
+        -shift[0] / entity.PITCH_SIZE[0], atol=1e-5)
+
+  def test_goals_and_touchlines_are_given_relative_to_the_agent(self):
+    observations = entity.build(_views(_world()),
+                                np.zeros((22, entity.STICKY_ACTIONS)))
+    index = entity.CONTEXT_FEATURE_INDEX
+    x, y = _world()['left_team'][9]
+    length, width = entity.PITCH_SIZE
+    context = observations[9]
+    np.testing.assert_allclose(
+        context[index['attacked_goal']:index['attacked_goal'] + 2],
+        [(1 - x) / length, -y / width], atol=1e-6)
+    np.testing.assert_allclose(
+        context[index['own_goal']:index['own_goal'] + 2],
+        [(-1 - x) / length, -y / width], atol=1e-6)
+    np.testing.assert_allclose(
+        context[index['touchlines']:index['touchlines'] + 2],
+        [(width / 2 - y) / width, (-width / 2 - y) / width], atol=1e-6)
+    # No feature anywhere is an absolute pitch coordinate.
+    names = (entity.PLAYER_FEATURE_NAMES + entity.BALL_FEATURE_NAMES +
+             tuple(index))
+    self.assertFalse([name for name in names if 'absolute' in name])
 
   def test_flags_mark_keepers_the_ball_carrier_and_offside_attackers(self):
     observations = entity.build(_views(_world()),
@@ -125,10 +173,14 @@ class EntityObservationTest(absltest.TestCase):
     carrier_as_opponent = right_view[
         right_view[:, feature['has_ball']] == 1][0]
     self.assertEqual(carrier_as_opponent[feature['teammate']], 0)
+    # Right-team agent 3 stands at -opponents[3] in its turned view and sees
+    # the carrier at -own[9].
+    world = _world()
     np.testing.assert_allclose(
-        carrier_as_opponent[[feature['absolute_x'], feature['absolute_y']]],
-        -left_carrier[[feature['absolute_x'], feature['absolute_y']]],
-        atol=1e-6)
+        carrier_as_opponent[[feature['offset_x'], feature['offset_y']]],
+        (world['right_team'][3] - world['left_team'][9]) /
+        entity.PITCH_SIZE, atol=1e-6)
+    self.assertEqual(left_carrier[feature['is_self']], 1)
     ball = observations[11 + 3, entity.CONTEXT_FEATURES:]
     np.testing.assert_array_equal(
         ball[entity.BALL_FEATURE_INDEX['owner_none']:
