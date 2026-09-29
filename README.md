@@ -250,8 +250,9 @@ With whole-rollout steps (the update graph captured once per layout
 capacity and replayed), 46 x 1 trains 121k-124k samples/s at 7, 16 or 32
 `UPDATE_EPOCHS` alike: the update overlaps collection completely, so more
 optimizer steps per rollout cost no throughput.  `OBSERVATION=entities` with
-the MLP runs at the same speed; `NETWORK=transformer` is update-bound (see
-below).
+the MLP runs at the same speed.  `NETWORK=transformer` is update-bound: 85k
+samples/s at 7 update epochs, 39k at 16 (one whole-rollout step is ~47 ms
+of attention in bfloat16 against ~260 ms to collect a rollout).
 
 More matches than CPUs gains at most a few percent, because collection
 (~275k steps/s) already outruns the update, and a bigger batch grows the
