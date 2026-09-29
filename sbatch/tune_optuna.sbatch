@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=football-optuna-level0
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=48
+#SBATCH --mem=96G
 #SBATCH --gres=gpu:1
 #SBATCH --time=05:00:00
 # One Optuna trial per array task. Submit from the football repo root with

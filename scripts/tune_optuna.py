@@ -48,10 +48,11 @@ import optuna
 
 STUDY_NAME = 'level0'
 MAX_STEPS = 200_000_000
-# Gate evaluations happen every PROMOTION_EPOCHS * 21120 agent steps at one
-# environment per worker; the interval is divided by the environments per
-# worker so evaluations stay ~2.1M agent steps apart in every trial.
-PROMOTION_EPOCHS = 100
+# Gate evaluations happen every PROMOTION_EPOCHS * 32384 agent steps (46
+# workers x 22 agents x 32 steps) at one environment per worker; the interval
+# is divided by the environments per worker so evaluations stay ~2.1M agent
+# steps apart in every trial, as in the 30-worker September 25 study.
+PROMOTION_EPOCHS = 66
 SMOOTHING = 3
 SEED_BASE = 20261000
 OPPONENT = 'opponents/level4.pt'
