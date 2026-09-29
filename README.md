@@ -368,6 +368,16 @@ VF_COEF=0.918 UPDATE_EPOCHS=7 BALL_POTENTIAL=0.571` with 128-segment
 minibatches (about 55 optimizer steps per rollout), from before whole-rollout
 steps; the next study retunes for them.
 
+The September 29 study (whole-rollout steps, 46 x 1, 48 trials, the model
+searched too) is the launcher's default: trial 22, 0.921 level-0 success
+(September 25 winner re-run: 0.854), `LEARNING_RATE=7.06e-4 ANNEAL_LR=1
+ENT_COEF=1.29e-3 GAMMA=0.999 GAE_LAMBDA=0.960 CLIP_COEF=0.119 VF_COEF=0.774
+UPDATE_EPOCHS=7 BALL_POTENTIAL=0.585` with simple115 and the MLP.  The best
+entity-observation runs were within noise of it (0.906, MLP) and the
+transformer reached 0.836; the model mattered least of all settings on level
+0 (importance 0.02, against 0.33 for the ball potential), so the models are
+compared on the full curriculum.
+
 #### Earlier shaping screen
 
 The bounded screen in `scripts/tune_shaping.py` compares eight configurations

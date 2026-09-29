@@ -52,13 +52,15 @@ fi
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
 WANDB_GROUP=${WANDB_GROUP:-self-play-lstm-ppo}
 ENV_NAME=${ENV_NAME:-11_vs_11_advantage}
-LEARNING_RATE=${LEARNING_RATE:-0.0003}
+# PPO defaults are the September 29 level-0 study's winner (trial 22, 0.921
+# level-0 success against the fixed opponent; README, "Tuning level 0").
+LEARNING_RATE=${LEARNING_RATE:-0.000706}
 # 0.01 kept every run within 10% of a uniform policy after 3000+ epochs.
-ENT_COEF=${ENT_COEF:-0.001}
-VF_COEF=${VF_COEF:-0.5}
-CLIP_COEF=${CLIP_COEF:-0.2}
-GAMMA=${GAMMA:-0.997}
-GAE_LAMBDA=${GAE_LAMBDA:-0.98}
+ENT_COEF=${ENT_COEF:-0.00129}
+VF_COEF=${VF_COEF:-0.774}
+CLIP_COEF=${CLIP_COEF:-0.119}
+GAMMA=${GAMMA:-0.999}
+GAE_LAMBDA=${GAE_LAMBDA:-0.960}
 # Potential-based shaping on ball progress toward the attacked goal
 # (Ng, Harada & Russell 1999): F = gamma*Phi(s') - Phi(s) with
 # Phi = BALL_POTENTIAL * ball x toward the attacked goal (in [-1, 1]); the
@@ -66,7 +68,7 @@ GAE_LAMBDA=${GAE_LAMBDA:-0.98}
 # optimal policy unchanged; 0 disables.  Uses GAMMA above as the discount,
 # which it must: a different discount leaves a real reward proportional
 # to Phi.
-BALL_POTENTIAL=${BALL_POTENTIAL:-0}
+BALL_POTENTIAL=${BALL_POTENTIAL:-0.585}
 # Distance of the nearest teammate to the ball, combined
 # with the ball potential before the same discounted potential difference.
 PLAYER_POTENTIAL=${PLAYER_POTENTIAL:-0}
@@ -76,11 +78,12 @@ SPAWN=${SPAWN:-curriculum}
 # Optimizer steps per rollout.  Each step trains on the whole rollout (one
 # segment per agent, ~0.6 GB on the GPU at 46 matches), so there is no
 # minibatch size to set.
-UPDATE_EPOCHS=${UPDATE_EPOCHS:-4}
+UPDATE_EPOCHS=${UPDATE_EPOCHS:-7}
 BPTT_HORIZON=${BPTT_HORIZON:-32}
 HIDDEN_SIZE=${HIDDEN_SIZE:-256}
-# OBSERVATION=entities adds absolute positions, ball owner, keepers, offside,
-# sticky buttons and steps left (gfootball/env/entity_observation.py);
+# OBSERVATION=entities: egocentric offsets to players, ball, goals and
+# touchlines, ball owner, keepers, offside, sticky buttons and steps left
+# (gfootball/env/entity_observation.py);
 # NETWORK=transformer runs attention over its players and ball (needs it).
 OBSERVATION=${OBSERVATION:-simple115}
 NETWORK=${NETWORK:-mlp}
@@ -164,7 +167,7 @@ if [[ ${GPU_FILLER:-1} == 0 ]]; then
 fi
 GPU_HEARTBEAT=${GPU_HEARTBEAT:-0}
 ANNEAL_LR_ARGS=(--no-anneal-lr)
-if [[ ${ANNEAL_LR:-0} == 1 ]]; then
+if [[ ${ANNEAL_LR:-1} == 1 ]]; then
   ANNEAL_LR_ARGS=(--anneal-lr)
 fi
 # The score gate plays against a frozen snapshot of the policy taken on
