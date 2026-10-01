@@ -72,9 +72,17 @@ BALL_POTENTIAL=${BALL_POTENTIAL:-0.585}
 # Distance of the nearest teammate to the ball, combined
 # with the ball potential before the same discounted potential difference.
 PLAYER_POTENTIAL=${PLAYER_POTENTIAL:-0}
+# Fade the player potential to 0 as the observed ball speed reaches this
+# (ball-direction units: dribble <~0.27, struck ball ~1), so kicking costs no
+# potential; 0 keeps the plain distance potential.
+PLAYER_POTENTIAL_FADE_SPEED=${PLAYER_POTENTIAL_FADE_SPEED:-0}
 # SPAWN=uniform ignores curriculum levels and places the ball and players
 # uniformly over the pitch, all onside (advantage env only).
 SPAWN=${SPAWN:-curriculum}
+# Share of training episodes whose outfield players (not the goal-side
+# blockers) keep their level x but spawn uniformly across the pitch width;
+# the gate never uses it.  0 disables.
+WIDTH_SPAWN_FRACTION=${WIDTH_SPAWN_FRACTION:-0}
 # Optimizer steps per rollout.  Each step trains on the whole rollout (one
 # segment per agent, ~0.6 GB on the GPU at 46 matches), so there is no
 # minibatch size to set.
@@ -288,7 +296,9 @@ cd "$RUN_ROOT"
   --gamma "$GAMMA" \
   --ball-potential "$BALL_POTENTIAL" \
   --player-potential "$PLAYER_POTENTIAL" \
+  --player-potential-fade-speed "$PLAYER_POTENTIAL_FADE_SPEED" \
   --spawn "$SPAWN" \
+  --width-spawn-fraction "$WIDTH_SPAWN_FRACTION" \
   --gae-lambda "$GAE_LAMBDA" \
   --update-epochs "$UPDATE_EPOCHS" \
   --bptt-horizon "$BPTT_HORIZON" \

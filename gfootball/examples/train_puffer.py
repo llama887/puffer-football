@@ -1365,6 +1365,20 @@ def build_parser():
                            'teammate to the ball; added to '
                            'the ball potential with the same gamma and '
                            'zero terminal potential; 0 disables')
+  parser.add_argument('--player-potential-fade-speed', type=float,
+                      default=0.0,
+                      help='fade the player potential out as the ball '
+                           'speeds up, reaching 0 at this observed '
+                           'ball-direction magnitude (dribble <~0.27, struck '
+                           'ball ~1), so kicking costs no potential while a '
+                           'settled loose ball still pulls players to it; '
+                           'still strictly potential-based; 0 disables')
+  parser.add_argument('--width-spawn-fraction', type=float, default=0.0,
+                      help='share of training episodes (never gate '
+                           'episodes) whose outfield players, except the '
+                           'goal-side blockers, keep their level x but spawn '
+                           'uniformly across the pitch width, so they must '
+                           'go and get the ball (advantage env only)')
   parser.add_argument('--update-epochs', type=int, default=4,
                       help='optimizer steps per rollout; each step trains on '
                            'the whole rollout (the minibatch is the rollout)')
@@ -1612,8 +1626,11 @@ def main():
       # the evaluation envs are built without it.
       ball_potential_scale=args.ball_potential,
       player_potential_scale=args.player_potential,
+      player_potential_fade_speed=args.player_potential_fade_speed,
       potential_gamma=args.gamma,
-      spawn=args.spawn)
+      spawn=args.spawn,
+      # A training distribution only: the gate keeps the level's own scenes.
+      width_spawn_fraction=args.width_spawn_fraction)
   if not 0 <= args.start_level < args.curriculum_levels:
     raise ValueError('start-level must be inside the curriculum')
   # The launcher exports OMP_NUM_THREADS=1 so the env workers do not each
@@ -1650,7 +1667,9 @@ def main():
       'promotion_early_abort_margin': args.promotion_early_abort_margin,
       'ball_potential': args.ball_potential,
       'player_potential': args.player_potential,
+      'player_potential_fade_speed': args.player_potential_fade_speed,
       'spawn': args.spawn,
+      'width_spawn_fraction': args.width_spawn_fraction,
       'frozen_defence_gate': args.frozen_defence_gate,
       'greedy_promotion_episodes': args.greedy_promotion_episodes,
       'selfplay_promotion_episodes': args.selfplay_promotion_episodes,

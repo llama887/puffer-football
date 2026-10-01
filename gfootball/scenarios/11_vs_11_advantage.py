@@ -29,6 +29,15 @@ offside is moved back onside.  That is the no-curriculum alternative: some
 spawns land players next to the ball near a goal by chance, so there is
 always something scoreable without maintaining a level schedule.
 
+With 'width_spawn_fraction' set, that fraction of TRAINING episodes (never the
+gate's evaluation episodes) is a width spawn: the level's scene is laid out as
+usual, then every outfield player except the goal-side blockers takes a y
+drawn uniformly across the pitch width while keeping the x the level gives it.
+The ball, the blockers and the keepers stay where the level puts them, so the
+level still sets the distance from goal and the defensive line, but nobody
+starts lined up on the ball: whoever is nearest has to go and get it.  The
+draw has its own generator, so the normal scenes are unchanged by it.
+
 Every episode ends as soon as the ball goes out of play.  With the magnet off
 the engine never designates a set-piece taker, so a goal kick, corner or
 throw-in would otherwise freeze the match until the timeout.
@@ -250,6 +259,7 @@ def build_scenario(builder):
   evaluation = bool(values.get('curriculum_evaluation', False))
 
   cycle = seed + episode
+  values['curriculum_width_spawn'] = False
   if values.get('uniform_spawn', False):
     _build_uniform(builder, values, seed, episode, cycle)
     return
@@ -296,6 +306,11 @@ def build_scenario(builder):
   # Own generator again, so the coin flip moves no other draw.
   blocker_side = (1.0 if random.Random(
       '{}:{}:blocker_side'.format(seed, episode)).random() < 0.5 else -1.0)
+  # Width spawn, training only, with its own generator so no other draw moves.
+  width_rng = random.Random('{}:{}:width'.format(seed, episode))
+  width_spawn = (not evaluation and width_rng.random() <
+                 float(values.get('width_spawn_fraction', 0.0)))
+  values['curriculum_width_spawn'] = width_spawn
   outfield = []
   for team in (Team.e_Left, Team.e_Right):
     attacking = team == attacking_team
@@ -333,6 +348,9 @@ def build_scenario(builder):
       else:
         position = (advantage * contested[0] + (1 - advantage) * standard[0],
                     advantage * contested[1] + (1 - advantage) * standard[1])
+      if width_spawn and (attacking or rank >= goalside):
+        # Keep the level's x, spread across the width; blockers stay put.
+        position = (position[0], width_rng.uniform(-_PITCH_Y, _PITCH_Y))
       outfield.append((team, index, role, position[0], position[1]))
   spaced = _separate([(row[3], row[4]) for row in outfield])
 

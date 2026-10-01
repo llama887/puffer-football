@@ -460,6 +460,73 @@ class PufferEnvTest(absltest.TestCase):
     with self.assertRaisesRegex(ValueError, 'spawn'):
       puffer_env.FootballPufferEnv(spawn='random')
 
+  def test_width_spawn_moves_players_across_the_width_only(self):
+    """Width spawn keeps the level's distances, ball and goal-side blockers.
+
+    In a training episode drawn for it, every outfield player except the
+    goal-side blockers keeps the x its level gives it and takes a uniform y
+    across the pitch, so nobody starts lined up on the ball and the nearest
+    player has to go and get it.  The ball, the blockers and the keepers stay
+    where the level puts them, and gate (evaluation) episodes never use it.
+    """
+    def layout(fraction, seed, advantage, evaluation=False):
+      cfg = _advantage_config(advantage, evaluation=evaluation, seed=seed)
+      cfg['width_spawn_fraction'] = fraction
+      cfg.NewScenario(seed % 7)
+      scenario = cfg.ScenarioConfig()
+      attack_right = scenario.ball_position[0] > 0
+      # AddPlayer flips both axes for the right team; undo it for world space.
+      left = [(p.position[0], p.position[1]) for p in scenario.left_team]
+      right = [(-p.position[0], -p.position[1]) for p in scenario.right_team]
+      attackers, defenders = (left, right) if attack_right else (right, left)
+      ball = (scenario.ball_position[0], scenario.ball_position[1])
+      return (ball, attackers, defenders,
+              cfg['curriculum_goalside_defenders'],
+              cfg['curriculum_width_spawn'])
+
+    carrier_offsets = []
+    for seed in range(40):
+      for advantage in (1.0, 0.5):
+        ball, attackers, defenders, blockers, flag = layout(0.0, seed, advantage)
+        self.assertFalse(flag)
+        wide_ball, wide_attackers, wide_defenders, wide_blockers, wide_flag = (
+            layout(1.0, seed, advantage))
+        self.assertTrue(wide_flag)
+        self.assertEqual(ball, wide_ball)
+        self.assertEqual(blockers, wide_blockers)
+        for (x, _), (wide_x, wide_y) in zip(attackers + defenders,
+                                           wide_attackers + wide_defenders):
+          # Only the overlap relaxation may nudge x, by under a player width.
+          self.assertLess(abs(x - wide_x), 0.03)
+          self.assertLessEqual(abs(wide_y), 0.42)
+        # Keepers and goal-side blockers keep their lateral places.
+        for index in [0] + list(range(1, 1 + blockers)):
+          self.assertLess(abs(defenders[index][1] - wide_defenders[index][1]),
+                          0.03)
+        self.assertLess(abs(attackers[0][1] - wide_attackers[0][1]), 0.03)
+        # The carrier normally stands right behind the ball.
+        self.assertLess(abs(attackers[1][1] - ball[1]), 0.03)
+        carrier_offsets.append(abs(wide_attackers[1][1] - wide_ball[1]))
+        # The gate never sees a width spawn.
+        gate = layout(1.0, seed, advantage, evaluation=True)
+        self.assertEqual(gate[:4], layout(0.0, seed, advantage,
+                                          evaluation=True)[:4])
+        self.assertFalse(gate[4])
+    self.assertGreater(max(carrier_offsets), 0.25)
+    self.assertGreater(np.mean(carrier_offsets), 0.1)
+    drawn = sum(layout(0.5, seed, 0.75)[4] for seed in range(200))
+    self.assertBetween(drawn, 70, 130)
+
+  def test_width_spawn_fraction_reaches_the_scenario(self):
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=3,
+        curriculum_levels=ADVANTAGE_LEVELS, width_spawn_fraction=0.5)
+    try:
+      env.reset()
+      self.assertEqual(env._env.unwrapped._config['width_spawn_fraction'], 0.5)
+    finally:
+      env.close()
+
   def test_inactive_curriculum_players_are_hidden_and_forced_idle(self):
     env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
     try:
@@ -828,6 +895,7 @@ class PufferEnvTest(absltest.TestCase):
     env = object.__new__(puffer_env.FootballPufferEnv)
     env._ball_potential_scale = 0.0
     env._player_potential_scale = 1.0
+    env._player_potential_fade_speed = 0.0
     raw = np.zeros((22, 115), dtype=np.float32)
     raw[0, :22] = raw[0, 44:66] = -1
     raw[0, :2] = (0.4, 0.1)
@@ -840,21 +908,62 @@ class PufferEnvTest(absltest.TestCase):
     raw[0, 88:90] = (0.5, 0.1)
     np.testing.assert_allclose(env._potentials(raw), (-0.4, -0.1), atol=1e-6)
 
+  def test_player_potential_fades_while_the_ball_is_struck(self):
+    """A struck ball carries no player potential; a settled loose ball does.
+
+    The player term is weighted by how settled the ball is, read from the
+    observed ball direction, so it stays a function of the state.  Kicking
+    from the feet then costs nothing (the kicker was at distance zero and the
+    flying ball weighs zero), while a ball left lying far from the team still
+    lowers that team's potential until someone walks to it.  A fade speed of
+    zero switches the weighting off, which is the old potential.
+    """
+    self.assertEqual(puffer_env.settled_ball_weight(0.3, 0.0), 1.0)
+    self.assertEqual(puffer_env.settled_ball_weight(0.0, 0.5), 1.0)
+    self.assertAlmostEqual(puffer_env.settled_ball_weight(0.25, 0.5), 0.5)
+    self.assertEqual(puffer_env.settled_ball_weight(0.8, 0.5), 0.0)
+    env = object.__new__(puffer_env.FootballPufferEnv)
+    env._ball_potential_scale = 0.5
+    env._player_potential_scale = 1.0
+    env._player_potential_fade_speed = 0.5
+    env._attacking_left = True
+    raw = np.zeros((22, 115), dtype=np.float32)
+    raw[0, :22] = raw[0, 44:66] = -1
+    raw[0, :2] = (0.4, 0.1)
+    raw[0, 44:46] = (0.9, 0.1)
+    raw[0, 88:90] = (0.6, 0.1)
+    ball = (0.5 * 0.6, -0.5 * 0.6)
+    np.testing.assert_allclose(
+        env._potentials(raw), (ball[0] - 0.2, ball[1] - 0.3), atol=1e-6)
+    raw[0, 91] = 1.0  # struck along the pitch: the player term vanishes
+    np.testing.assert_allclose(env._potentials(raw), ball, atol=1e-6)
+    raw[0, 91] = 0.25  # half the fade speed: half the player term
+    np.testing.assert_allclose(
+        env._potentials(raw), (ball[0] - 0.1, ball[1] - 0.15), atol=1e-6)
+    raw[0, 91] = 0.0
+    raw[0, 92] = 0.25 * 54.4 / 83.6  # y is measured in x-distance units too
+    np.testing.assert_allclose(
+        env._potentials(raw), (ball[0] - 0.1, ball[1] - 0.15), atol=1e-6)
+
   def test_combined_potentials_telescope_across_real_episode_resets(self):
     """Both teams preserve score returns with combined or player-only shaping.
 
     Replay identical engine actions with shaping on/off through two complete
     episodes. Check the discounted return identity separately for each side,
     including terminal correction and potential initialisation after reset.
-    Stacked observations must use their newest absolute frame.
+    Stacked observations must use their newest absolute frame, and the
+    ball-speed fade of the player term must keep the identity exact.
     """
     gamma = 0.997
-    for ball_scale, player_scale, stack in ((1.0, 0.3, 1), (0.0, 1.0, 4)):
+    for ball_scale, player_scale, stack, fade in ((1.0, 0.3, 1, 0.0),
+                                                  (0.0, 1.0, 4, 0.0),
+                                                  (0.585, 1.0, 1, 0.5)):
       common = dict(env_name=ADVANTAGE_ENV_NAME, frame_stack=stack,
                     seed=7, curriculum_levels=ADVANTAGE_LEVELS)
       env = puffer_env.FootballPufferEnv(
           **common, ball_potential_scale=ball_scale,
-          player_potential_scale=player_scale, potential_gamma=gamma)
+          player_potential_scale=player_scale, potential_gamma=gamma,
+          player_potential_fade_speed=fade)
       plain = puffer_env.FootballPufferEnv(**common)
       try:
         env.reset()
@@ -886,10 +995,17 @@ class PufferEnvTest(absltest.TestCase):
 
   def test_shaping_scales_reject_nonfinite_or_negative_values(self):
     """Invalid potentials must fail before constructing an engine instance."""
-    for name in ('ball_potential_scale', 'player_potential_scale'):
+    for name in ('ball_potential_scale', 'player_potential_scale',
+                 'player_potential_fade_speed'):
       for value in (-1, float('inf'), float('nan')):
         with self.assertRaisesRegex(ValueError, 'finite and non-negative'):
           puffer_env.FootballPufferEnv(**{name: value})
+    for value in (-0.1, 1.5, float('nan')):
+      with self.assertRaisesRegex(ValueError, 'width_spawn_fraction'):
+        puffer_env.FootballPufferEnv(env_name=ADVANTAGE_ENV_NAME,
+                                     width_spawn_fraction=value)
+    with self.assertRaisesRegex(ValueError, 'width_spawn_fraction'):
+      puffer_env.FootballPufferEnv(width_spawn_fraction=0.5)  # not advantage
 
   def test_ball_shaping_rewards_both_sides_and_leaves_success_alone(self):
     scale, gamma = 1.0, 0.99

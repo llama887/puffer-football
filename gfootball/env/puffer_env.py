@@ -151,6 +151,28 @@ def closest_player_potential(positions, ball_position, scale):
   return -float(scale) * float(distance.min())
 
 
+def settled_ball_weight(ball_speed, fade_speed):
+  """How much the player potential counts for a ball moving at `ball_speed`.
+
+  1 for a still or rolling ball, falling linearly to 0 at `fade_speed` and
+  staying 0 above it; a `fade_speed` of 0 disables the fade (always 1).
+  Speeds are simple115v2 ball-direction magnitudes, y in x-distance units:
+  that feature runs about 18 times the ball's per-step movement, a dribbled
+  ball stays under ~0.16-0.27 and a struck one is ~1 (probed 2026-10-01).
+
+  Multiplying the nearest-player potential by this keeps it a function of the
+  observed state, so the shaping stays exactly potential-based, but changes
+  what a kick does to it: the kicker was at distance zero, so the potential
+  was ~0 before the kick and stays ~0 while the ball flies, where the plain
+  distance potential dropped as soon as the ball left the kicker's feet.  Once
+  a loose ball settles far from a team the full distance counts again, so the
+  team gains potential by walking to it.
+  """
+  if not fade_speed:
+    return 1.0
+  return float(np.clip(1.0 - float(ball_speed) / float(fade_speed), 0.0, 1.0))
+
+
 def centralized_score_rewards(score_reward, active_mask, out=None):
   """Share the zero-sum match score with every active player on each team."""
   active_mask = np.asarray(active_mask, dtype=bool)
@@ -175,7 +197,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                frozen_defence_path=None, frozen_defence_horizon=32,
                ball_potential_scale=0.0, potential_gamma=0.99,
                player_potential_scale=0.0, spawn='curriculum',
-               observation='simple115'):
+               observation='simple115', player_potential_fade_speed=0.0,
+               width_spawn_fraction=0.0):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     # 'simple115': simple115v2 made egocentric (and sorted); 'entities': the
@@ -191,13 +214,23 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       raise ValueError("spawn must be 'curriculum' or 'uniform'")
     if spawn == 'uniform' and env_name != ADVANTAGE_ENV_NAME:
       raise ValueError('uniform spawn needs ' + ADVANTAGE_ENV_NAME)
-    # Set before _make_env, which reads it when building the engine.
+    # Width spawn: this fraction of training episodes spreads every outfield
+    # player except the goal-side blockers uniformly across the pitch width at
+    # the x their level gives them (see 11_vs_11_advantage).
+    if not 0 <= width_spawn_fraction <= 1:
+      raise ValueError('width_spawn_fraction must be in [0, 1]')
+    if width_spawn_fraction and env_name != ADVANTAGE_ENV_NAME:
+      raise ValueError('width_spawn_fraction needs ' + ADVANTAGE_ENV_NAME)
+    # Set before _make_env, which reads them when building the engine.
     self._spawn = spawn
+    self._width_spawn_fraction = float(width_spawn_fraction)
     # None: the frozen policy keeps memory for whole episodes.
     if frozen_defence_horizon is not None and frozen_defence_horizon < 1:
       raise ValueError('frozen_defence_horizon must be positive or None')
     for name, scale in (('ball_potential_scale', ball_potential_scale),
-                        ('player_potential_scale', player_potential_scale)):
+                        ('player_potential_scale', player_potential_scale),
+                        ('player_potential_fade_speed',
+                         player_potential_fade_speed)):
       if not np.isfinite(scale) or scale < 0:
         raise ValueError(name + ' must be finite and non-negative')
     if not 0 < potential_gamma <= 1:
@@ -242,6 +275,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._episode_level = 0
     self._episode_attackers = 1
     self._episode_template = 0
+    self._episode_width_spawn = False
     self._attacking_left = True
     self._active_mask = np.ones(self.num_agents, dtype=bool)
     # Scratch buffers reused by step(), so a transition allocates nothing.
@@ -280,6 +314,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     # shaping is added to the rewards the learner sees and nothing else.
     self._ball_potential_scale = float(ball_potential_scale)
     self._player_potential_scale = float(player_potential_scale)
+    self._player_potential_fade_speed = float(player_potential_fade_speed)
     self._potential_gamma = float(potential_gamma)
     self._attack_potential = 0.0
     self._defence_potential = 0.0
@@ -305,14 +340,19 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     ball; the episode's designated attacker only changes the return order.
     Adding fixed state potentials preserves their telescoping
     property; both terms use the same discount and terminal correction.
+    The player terms are weighted by settled_ball_weight of the observed
+    ball speed (91:93), which is also part of the state.
     """
     frame = np.asarray(raw_observations, dtype=np.float32).reshape(
         22, -1)[0, -115:]
     advance = self._ball_advance(raw_observations, self._attacking_left)
-    left = closest_player_potential(frame[:22], frame[88:90],
-                                    self._player_potential_scale)
-    right = closest_player_potential(frame[44:66], frame[88:90],
-                                     self._player_potential_scale)
+    weight = settled_ball_weight(
+        np.hypot(frame[91], frame[92] * (83.6 / 54.4)),
+        self._player_potential_fade_speed)
+    left = weight * closest_player_potential(
+        frame[:22], frame[88:90], self._player_potential_scale)
+    right = weight * closest_player_potential(
+        frame[44:66], frame[88:90], self._player_potential_scale)
     attack, defence = (left, right) if self._attacking_left else (right, left)
     return (ball_potential(advance, self._ball_potential_scale) + attack,
             ball_potential(-advance, self._ball_potential_scale) + defence)
@@ -345,6 +385,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
             'needs_sticky_actions': False,
             'real_time': False,
             'uniform_spawn': self._spawn == 'uniform',
+            'width_spawn_fraction': self._width_spawn_fraction,
         })
 
   def _reset_match(self):
@@ -368,6 +409,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
           raw_config._values['curriculum_episode_attackers'])
       self._episode_template = int(
           raw_config._values['curriculum_episode_template'])
+    self._episode_width_spawn = bool(
+        raw_config._values.get('curriculum_width_spawn', False))
     self._set_active_players()
     if self._frozen_defence_path is not None:
       self._frozen_state = {'lstm_h': None, 'lstm_c': None, 'done': None}
@@ -604,6 +647,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
               self._episode_level >= self._attacker_only_levels),
           'curriculum_distance_progress': distance_progress,
           'curriculum_template': float(self._episode_template),
+          'curriculum_width_spawn': float(self._episode_width_spawn),
           'curriculum_attacking_left': float(self._attacking_left),
           'curriculum_frozen_defence': float(
               self._frozen_defence_path is not None),

@@ -392,6 +392,27 @@ def test_shaping_controls_share_discount_and_stay_out_of_promotion():
   assert 'player_potential_scale' not in make.call_args.kwargs
 
 
+def test_loose_ball_shaping_and_width_spawn_are_opt_in_and_training_only():
+  """Both default off; the gate is built with neither.
+
+  The fade only changes shaping, which promotion never uses, and width spawns
+  are a training distribution: the gate keeps scoring the level's own scenes.
+  """
+  from gfootball.examples.train_puffer import _make_promotion_env
+  defaults = build_parser().parse_args([])
+  assert defaults.player_potential_fade_speed == 0
+  assert defaults.width_spawn_fraction == 0
+  args = build_parser().parse_args([
+      '--player-potential', '0.3', '--player-potential-fade-speed', '0.5',
+      '--width-spawn-fraction', '0.5'])
+  assert args.player_potential_fade_speed == 0.5
+  assert args.width_spawn_fraction == 0.5
+  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
+    _make_promotion_env(args, SimpleNamespace(value=4))
+  assert 'player_potential_fade_speed' not in make.call_args.kwargs
+  assert 'width_spawn_fraction' not in make.call_args.kwargs
+
+
 def test_spawn_mode_defaults_to_curriculum_and_reaches_the_gate():
   """The gate must score on the same spawn distribution the policy trains on."""
   from gfootball.examples.train_puffer import _make_promotion_env
