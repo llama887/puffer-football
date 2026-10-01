@@ -402,6 +402,34 @@ def test_spawn_mode_defaults_to_curriculum_and_reaches_the_gate():
   assert make.call_args.kwargs['spawn'] == 'uniform'
 
 
+def test_gate_replays_memory_the_way_each_policy_was_trained():
+  """The gate evaluates both sides with the memory they were trained with.
+
+  The evaluated policy restarts memory every bptt window unless the run
+  carries memory, and the frozen opponent follows the run by default; an
+  opponent file trained elsewhere (--frozen-defence-init) can be given its
+  own window, 0 meaning whole episodes.
+  """
+  from gfootball.examples.train_puffer import (
+      _make_promotion_env, _run_promotion)
+  cases = (([], 32, 32),
+           (['--bptt-horizon', '128'], 128, 128),
+           (['--carry-lstm-memory'], None, None),
+           (['--carry-lstm-memory', '--frozen-defence-horizon', '32'],
+            None, 32),
+           (['--frozen-defence-horizon', '0'], 32, None))
+  for flags, policy_window, opponent_window in cases:
+    args = build_parser().parse_args(['--device', 'cpu'] + flags)
+    with patch('gfootball.examples.train_puffer.make_vector_env') as make:
+      _make_promotion_env(args, SimpleNamespace(value=0))
+    assert make.call_args.kwargs['frozen_defence_horizon'] == opponent_window
+    # A mocked pool reports itself async, so the async evaluator is chosen.
+    with patch('gfootball.examples.train_puffer.make_vector_env'), patch(
+        'gfootball.examples.train_puffer.evaluate_promotion_async') as evaluate:
+      _run_promotion(args, None, SimpleNamespace(value=0), 0, 'cpu', 4)
+    assert evaluate.call_args.kwargs['recurrent_horizon'] == policy_window
+
+
 def test_learning_rate_follows_training_progress():
   """Cosine decay by agent steps done, reaching zero exactly at the end.
 
@@ -719,45 +747,63 @@ def test_graphed_update_matches_the_eager_update():
     layouts = [(torch.rand(segments, horizon, device=device) < rate).float()
                for rate in (0.1, 0.1, 0.3)]
     schedule = (3e-4, 1.5e-4, 0.0)
-    results = []
-    for graph in (False, True):
-      trainer = FootballPuffeRL.__new__(FootballPuffeRL)
-      trainer.config = config
-      trainer.observations = observations.clone()
-      trainer.actions = actions.clone()
-      trainer.logprobs = logprobs.clone()
-      trainer.uncompiled_policy = trainer.policy = copy.deepcopy(base)
-      rate = torch.tensor(schedule[0], device=device) if graph else schedule[0]
-      trainer.optimizer = torch.optim.Adam(
-          trainer.policy.parameters(), lr=rate, eps=1e-5, capturable=graph)
-      trainer.optimizer_steps = 0
-      trainer.graph_update = graph
-      trainer._update_graph = trainer._update_pool = None
-      trainer._update_capacity = None
-      trainer.update_captures = 0
-      trainer._epoch_values = None
-      totals = []
-      for terminals, learning_rate in zip(layouts, schedule):
-        trainer.terminals = terminals
-        set_learning_rate(trainer.optimizer, learning_rate)
-        trainer._stage_epoch(*epoch, trainable)
-        before = torch.cat([p.detach().flatten().clone()
-                            for p in trainer.policy.parameters()])
-        trainer._update(segment_index)
-        totals.append(trainer._totals.clone())
-      final = torch.cat([p.detach().flatten()
-                         for p in trainer.policy.parameters()])
-      results.append((final, before, torch.stack(totals),
-                      trainer.optimizer_steps))
-      captures = trainer.update_captures
-    (eager, _, eager_totals, eager_steps), (graphed, graphed_before,
-                                           graph_totals, graph_steps) = results
-    assert eager_steps == graph_steps == 9
-    # The second layout fits the first's capacity; the third needs more.
-    assert captures == 2
-    assert torch.allclose(eager, graphed, atol=1e-5)
-    assert torch.allclose(eager_totals, graph_totals, atol=1e-5)
-    assert torch.equal(graphed, graphed_before)
+    # With carried memory every rollout also brings new starting memory,
+    # which the graph must read from the trainer's buffers in place.
+    memories = [torch.randn(2, segments, 16, device=device)
+                for _ in layouts]
+    finals = {}
+    for carry_memory in (False, True):
+      results = []
+      for graph in (False, True):
+        trainer = FootballPuffeRL.__new__(FootballPuffeRL)
+        trainer.config = config
+        trainer.observations = observations.clone()
+        trainer.actions = actions.clone()
+        trainer.logprobs = logprobs.clone()
+        trainer.uncompiled_policy = trainer.policy = copy.deepcopy(base)
+        rate = (torch.tensor(schedule[0], device=device) if graph
+                else schedule[0])
+        trainer.optimizer = torch.optim.Adam(
+            trainer.policy.parameters(), lr=rate, eps=1e-5,
+            capturable=graph)
+        trainer.optimizer_steps = 0
+        trainer.graph_update = graph
+        trainer._update_graph = trainer._update_pool = None
+        trainer._update_capacity = None
+        trainer.update_captures = 0
+        trainer._epoch_values = None
+        trainer.carry_memory = carry_memory
+        trainer.segment_h = torch.zeros(segments, 16, device=device)
+        trainer.segment_c = torch.zeros(segments, 16, device=device)
+        trainer.terminals = torch.zeros(segments, horizon, device=device)
+        totals = []
+        for terminals, memory, learning_rate in zip(layouts, memories,
+                                                    schedule):
+          trainer.terminals.copy_(terminals)
+          trainer.segment_h.copy_(memory[0])
+          trainer.segment_c.copy_(memory[1])
+          set_learning_rate(trainer.optimizer, learning_rate)
+          trainer._stage_epoch(*epoch, trainable)
+          before = torch.cat([p.detach().flatten().clone()
+                              for p in trainer.policy.parameters()])
+          trainer._update(segment_index)
+          totals.append(trainer._totals.clone())
+        final = torch.cat([p.detach().flatten()
+                           for p in trainer.policy.parameters()])
+        results.append((final, before, torch.stack(totals),
+                        trainer.optimizer_steps))
+        captures = trainer.update_captures
+      (eager, _, eager_totals, eager_steps), (
+          graphed, graphed_before, graph_totals, graph_steps) = results
+      assert eager_steps == graph_steps == 9
+      # The second layout fits the first's capacity; the third needs more.
+      assert captures == 2
+      assert torch.allclose(eager, graphed, atol=1e-5), carry_memory
+      assert torch.allclose(eager_totals, graph_totals, atol=1e-5)
+      assert torch.equal(graphed, graphed_before)
+      finals[carry_memory] = graphed
+    # The starting memory really reaches the update.
+    assert not torch.allclose(finals[False], finals[True], atol=1e-5)
   finally:
     torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
     torch.backends.cudnn.allow_tf32 = cudnn_tf32
@@ -876,6 +922,183 @@ def test_lstm_cell_checkpoints_still_load():
     restored.load_state_dict(upgrade_state_dict(checkpoint))
     for key, value in policy.state_dict().items():
       assert torch.equal(restored.state_dict()[key], value), key
+
+
+def test_bptt_forward_continues_each_window_from_its_starting_memory():
+  """A window can start from the memory its segment was collected with.
+
+  With carried memory the collector does not clear the LSTM at segment
+  starts, so training must begin each window's first episode piece from the
+  state the actor had there (state['lstm_h'] / ['lstm_c'], one row per
+  window); pieces that start at an episode end still start from zero.  This
+  pins the window forward to stepping forward_eval from the same memory,
+  for the exact and a padded layout, for outputs and every gradient.
+  """
+  from gfootball.env.puffer_policy import (
+      episode_batch_sizes, episode_pieces)
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16).eval()
+  segments, horizon = 6, 7
+  observations = torch.randn(segments, horizon, 115)
+  done = torch.zeros(segments, horizon)
+  done[0, 3] = 1
+  done[2, 1] = done[2, 5] = 1
+  done[3, 0] = 1
+  done[4, 2] = done[4, 3] = 1
+  done[4, horizon - 1] = 1
+  done[5] = 1
+  hidden = torch.randn(segments, 16)
+  cell = torch.randn(segments, 16)
+
+  def outputs_and_gradients(logits, values):
+    policy.zero_grad()
+    (logits.square().mean() + values.square().mean()).backward()
+    return [logits.detach(), values.detach()] + [
+        parameter.grad.clone() for parameter in policy.parameters()]
+
+  state = {'lstm_h': hidden, 'lstm_c': cell, 'done': None}
+  stepwise_logits, stepwise_values = [], []
+  for step in range(horizon):
+    state['done'] = done[:, step]
+    step_logits, step_values = policy.forward_eval(
+        observations[:, step], state)
+    stepwise_logits.append(step_logits)
+    stepwise_values.append(step_values)
+  expected = outputs_and_gradients(
+      torch.stack(stepwise_logits, dim=1).reshape(segments * horizon, -1),
+      torch.stack(stepwise_values, dim=1))
+
+  for pieces in (episode_pieces(done),
+                 episode_pieces(done, episode_batch_sizes(done) + 3)):
+    actual = outputs_and_gradients(*policy(observations, {
+        'episode_pieces': pieces, 'done': done,
+        'lstm_h': hidden, 'lstm_c': cell}))
+    for wanted, got in zip(expected, actual):
+      assert torch.allclose(wanted, got, atol=1e-5)
+
+
+class _OneMatchPool:
+  """One match of two agent rows whose episodes end where `done` says."""
+
+  def __init__(self, observations, done):
+    self.observations = observations
+    self.done = done
+    self.step = 0
+    self.driver_env = SimpleNamespace(num_agents=2)
+
+  def recv(self):
+    terminal = bool(self.done[self.step])
+    return (self.observations[self.step].numpy(), np.zeros(2, np.float32),
+            np.full(2, terminal), np.zeros(2, dtype=bool), [], np.arange(2),
+            np.ones(2, dtype=bool))
+
+  def send(self, actions):
+    self.step += 1
+
+
+def _collecting_trainer(pool, policy, horizon, carry_memory):
+  """An async-collecting trainer over `pool` with room for three segments."""
+  import contextlib
+  from collections import defaultdict
+  segments = 6
+  trainer = FootballPuffeRL.__new__(FootballPuffeRL)
+  trainer.config = dict(
+      bptt_horizon=horizon, device='cpu', clip_coef=0.2, vf_clip_coef=0.2,
+      vf_coef=0.5, ent_coef=0.0, max_grad_norm=0.5, update_epochs=1)
+  trainer.vecenv = pool
+  trainer.total_agents = 2
+  trainer.segments = segments
+  trainer.uncompiled_policy = trainer.policy = policy
+  trainer.overlap_collection = False
+  trainer.carry_memory = carry_memory
+  trainer._init_async_collection()
+  trainer.graph_actor = False
+  trainer.graphed_actor = None
+  trainer.graph_update = False
+  trainer.amp_context = contextlib.nullcontext()
+  trainer.profile = lambda *args, **kwargs: None
+  trainer.epoch = trainer.global_step = 0
+  trainer.stats = defaultdict(list)
+  trainer.observations = torch.zeros(segments, horizon, 115)
+  trainer.actions = torch.zeros(segments, horizon, dtype=torch.long)
+  for name in ('logprobs', 'rewards', 'terminals', 'values'):
+    setattr(trainer, name, torch.zeros(segments, horizon))
+  trainer.optimizer = torch.optim.Adam(policy.parameters(), lr=0.0)
+  trainer.optimizer_steps = 0
+  trainer._epoch_values = None
+  return trainer
+
+
+def test_collector_memory_is_what_training_replays():
+  """The actor's memory at every step is the memory PPO trains through.
+
+  Without carried memory the collector clears the LSTM at every segment
+  start; with it, memory runs on across segments and clears only at episode
+  ends.  Either way the stored log-probs must follow the actor's memory, and
+  the update must reproduce them exactly (importance ratio 1 before any
+  step), including for a segment that starts mid-episode.
+  """
+  horizon = 4
+  steps = 2 * horizon
+  torch.manual_seed(0)
+  observations = torch.randn(steps + 1, 2, 115)
+  done = torch.zeros(steps + 1)
+  done[5] = 1
+  for carry_memory in (False, True):
+    torch.manual_seed(1)
+    policy = FootballPolicy(_env(), hidden_size=16)
+    trainer = _collecting_trainer(_OneMatchPool(observations, done), policy,
+                                  horizon, carry_memory)
+    for _ in range(steps):
+      trainer._collect_batch()
+
+    state = {'lstm_h': None, 'lstm_c': None, 'done': None}
+    blocks = list(trainer.complete_blocks)
+    assert len(blocks) == 2
+    for step in range(steps):
+      if step % horizon == 0 and not carry_memory:
+        state['lstm_h'] = state['lstm_c'] = None
+      state['done'] = torch.full((2,), float(done[step]))
+      with torch.no_grad():
+        logits, _ = policy.forward_eval(observations[step], state)
+      rows = blocks[step // horizon] * 2 + torch.arange(2)
+      column = step % horizon
+      expected = torch.log_softmax(logits, dim=-1).gather(
+          1, trainer.actions[rows, column].view(-1, 1)).squeeze(1)
+      assert torch.allclose(trainer.logprobs[rows, column], expected,
+                            atol=1e-5), (carry_memory, step)
+
+    # The epoch trains the newest segment, which starts mid-episode.
+    trainer._claim_training_blocks()
+    trainable = trainer.row_training[:, None].expand(-1, horizon).clone()
+    trainer._stage_epoch(trainer.values, torch.randn(6, horizon),
+                         torch.randn(6, horizon), trainable)
+    trainer._update(trainer.training_rows)
+    totals = dict(zip(FootballPuffeRL.LOSS_NAMES, trainer._totals.tolist()))
+    assert totals['approx_kl'] < 1e-10, (carry_memory, totals)
+    assert math.isclose(totals['importance'], 1.0, abs_tol=1e-6)
+
+
+def test_promotion_can_carry_memory_through_whole_episodes():
+  """recurrent_horizon=None clears memory only at episode ends.
+
+  A policy trained with carried memory is evaluated the way it acts, so
+  both evaluators must match a window longer than the whole evaluation.
+  """
+  torch.manual_seed(0)
+  policy = FootballPolicy(_env(), hidden_size=16)
+  pairs = [
+      [evaluate_promotion(policy, _ScriptedEnv(length=9, successes=[1, 0]),
+                          4, 5, 'cpu', window) for window in (None, 1000)],
+      [evaluate_promotion_async(
+          policy, _AsyncScriptedPool([3, 5, 7], successes=[1, 0, 1]),
+          12, 9, 'cpu', window) for window in (None, 1000)],
+  ]
+  for carried, windowed in pairs:
+    assert carried['promotion_recurrent_horizon'] == 0.0
+    for name, value in windowed.items():
+      if name != 'promotion_recurrent_horizon':
+        assert math.isclose(carried[name], value, rel_tol=1e-6), name
 
 
 if __name__ == '__main__':

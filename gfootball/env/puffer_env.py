@@ -193,8 +193,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       raise ValueError('uniform spawn needs ' + ADVANTAGE_ENV_NAME)
     # Set before _make_env, which reads it when building the engine.
     self._spawn = spawn
-    if frozen_defence_horizon < 1:
-      raise ValueError('frozen_defence_horizon must be positive')
+    # None: the frozen policy keeps memory for whole episodes.
+    if frozen_defence_horizon is not None and frozen_defence_horizon < 1:
+      raise ValueError('frozen_defence_horizon must be positive or None')
     for name, scale in (('ball_potential_scale', ball_potential_scale),
                         ('player_potential_scale', player_potential_scale)):
       if not np.isfinite(scale) or scale < 0:
@@ -252,7 +253,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     # It runs inside this worker process on the CPU; the defending rows are
     # hidden from the caller exactly like inactive curriculum players.
     self._frozen_defence_path = frozen_defence_path
-    self._frozen_defence_horizon = int(frozen_defence_horizon)
+    self._frozen_defence_horizon = frozen_defence_horizon
     self._frozen_policy = None
     self._frozen_state = None
     self._frozen_steps = 0
@@ -412,10 +413,13 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     """Actions for the defending rows from the frozen policy."""
     self._load_frozen_policy()
     torch = self._torch
-    # Training resets the recurrent state at the start of every rollout
-    # window regardless of episode boundaries, so a policy trained that way is
-    # replayed the same way here.  Episode ends reset it too (_reset_match).
-    if self._frozen_steps % self._frozen_defence_horizon == 0:
+    # Training without carried memory resets the recurrent state at the start
+    # of every rollout window regardless of episode boundaries, so a policy
+    # trained that way is replayed the same way here (a horizon of None: it
+    # was trained with carried memory).  Episode ends reset it too
+    # (_reset_match).
+    if (self._frozen_defence_horizon is not None and
+        self._frozen_steps % self._frozen_defence_horizon == 0):
       self._frozen_state['lstm_h'] = self._frozen_state['lstm_c'] = None
     self._frozen_steps += 1
     observations = torch.as_tensor(

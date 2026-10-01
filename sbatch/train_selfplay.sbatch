@@ -182,6 +182,18 @@ fi
 if [[ -n ${FROZEN_DEFENCE_INIT:-} ]]; then
   FROZEN_GATE_ARGS+=(--frozen-defence-init "$FROZEN_DEFENCE_INIT")
 fi
+# FROZEN_DEFENCE_HORIZON: the memory window that opponent file was trained
+# with (0: whole episodes); by default the same as this run's.
+if [[ -n ${FROZEN_DEFENCE_HORIZON:-} ]]; then
+  FROZEN_GATE_ARGS+=(--frozen-defence-horizon "$FROZEN_DEFENCE_HORIZON")
+fi
+# CARRY_LSTM_MEMORY=1 keeps recurrent memory across rollout segments (cleared
+# only at episode ends) and trains each segment from the memory it started
+# with, instead of restarting memory every BPTT_HORIZON steps.
+MEMORY_ARGS=(--no-carry-lstm-memory)
+if [[ ${CARRY_LSTM_MEMORY:-0} == 1 ]]; then
+  MEMORY_ARGS=(--carry-lstm-memory)
+fi
 # Gate success needed to advance a level; above 1 keeps training on one level.
 CURRICULUM_SUCCESS_THRESHOLD=${CURRICULUM_SUCCESS_THRESHOLD:-0.6}
 
@@ -280,6 +292,7 @@ cd "$RUN_ROOT"
   --gae-lambda "$GAE_LAMBDA" \
   --update-epochs "$UPDATE_EPOCHS" \
   --bptt-horizon "$BPTT_HORIZON" \
+  "${MEMORY_ARGS[@]}" \
   --seed "$SEED" \
   --start-level "$START_LEVEL" \
   --promotion-interval "$PROMOTION_INTERVAL" \

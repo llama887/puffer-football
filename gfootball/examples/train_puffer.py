@@ -180,6 +180,9 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device,
                        recurrent_horizon, greedy=False, early_abort=None):
   """Evaluate with the same recurrent windows as PufferLib training rollouts.
 
+  Memory restarts every `recurrent_horizon` steps, as the training rollout
+  restarts it at every segment; None keeps it for the whole episode, for a
+  policy trained with carried memory.  Episode ends always clear it.
   `greedy` takes the argmax action instead of sampling, which shows whether
   the network has actually learned a shot underneath a near-uniform
   distribution.  `early_abort` is an optional `(after_episodes, min_rate)`
@@ -187,8 +190,8 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device,
   the evaluation early, since it cannot pass the gate and the remaining
   episodes would only refine a number nobody acts on.
   """
-  if recurrent_horizon < 1:
-    raise ValueError('recurrent_horizon must be positive')
+  if recurrent_horizon is not None and recurrent_horizon < 1:
+    raise ValueError('recurrent_horizon must be positive or None')
   observations, _ = vecenv.reset(seed=seed)
   generator = torch.Generator(device=device).manual_seed(seed)
   state = {'lstm_h': None, 'lstm_c': None, 'done': None}
@@ -215,7 +218,7 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device,
           break
       # PuffeRL.evaluate starts every rollout window from zero memory. Keep
       # this clock independent of episode resets, just like the collector.
-      if steps % recurrent_horizon == 0:
+      if recurrent_horizon is not None and steps % recurrent_horizon == 0:
         state['lstm_h'] = state['lstm_c'] = None
       observation_tensor = torch.as_tensor(observations, device=device)
       active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
@@ -262,7 +265,8 @@ def _promotion_metrics(rows, action_counts, decisions, active_logits_rows,
   action_counts = action_counts.cpu()
   decisions = max(1, int(decisions))
   metrics.update({
-      'promotion_recurrent_horizon': float(recurrent_horizon),
+      # 0: memory ran through whole episodes.
+      'promotion_recurrent_horizon': float(recurrent_horizon or 0),
       'promotion_greedy': float(greedy),
       'promotion_aborted': float(aborted),
       'promotion_episodes': float(len(rows)),
@@ -314,12 +318,13 @@ def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
 
   The result does not depend on timing: each match's engine, frozen
   defence and sampling noise are seeded per match, recurrent memory
-  restarts every `recurrent_horizon` of a match's own steps and at episode
-  ends, and everything reported (episodes, action statistics, the early
-  abort) is taken from a fixed number of each match's first episodes.
+  restarts every `recurrent_horizon` of a match's own steps (never, if
+  None) and at episode ends, and everything reported (episodes, action
+  statistics, the early abort) is taken from a fixed number of each match's
+  first episodes.
   """
-  if recurrent_horizon < 1:
-    raise ValueError('recurrent_horizon must be positive')
+  if recurrent_horizon is not None and recurrent_horizon < 1:
+    raise ValueError('recurrent_horizon must be positive or None')
   if getattr(vecenv, 'envs_per_worker', 1) != 1:
     raise ValueError('async promotion needs one match per worker, so that '
                      'match i is reset with seed + i')
@@ -371,7 +376,8 @@ def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
         episode_logits[match].append(current_logits[match])
         current_actions[match] = 0
         current_logits[match] = []
-      restart = match_ids[match_steps[match_ids] % recurrent_horizon == 0]
+      restart = (match_ids[match_steps[match_ids] % recurrent_horizon == 0]
+                 if recurrent_horizon is not None else ())
       if len(restart):
         fresh = torch.as_tensor(
             (restart[:, None] * per_env + np.arange(per_env)).ravel(),
@@ -488,11 +494,18 @@ class FootballPuffeRL(pufferl.PuffeRL):
   LOSS_NAMES = ('policy_loss', 'value_loss', 'entropy', 'gradient_norm',
                 'old_approx_kl', 'approx_kl', 'clipfrac', 'importance',
                 'minibatch_transitions')
+  # Recurrent memory runs across rollout segments (see
+  # _init_async_collection); off, it restarts at every segment.
+  carry_memory = False
 
   def __init__(self, config, vecenv, policy, logger=None,
                log_interval_seconds=0.25, overlap_collection=False,
-               graph_actor=False, graph_update=False):
+               graph_actor=False, graph_update=False, carry_memory=False):
     super().__init__(config, vecenv, policy, logger=logger)
+    self.carry_memory = bool(carry_memory)
+    if self.carry_memory and not getattr(vecenv, 'is_async', False):
+      raise ValueError('carried memory needs --async-collection; PuffeRL\'s '
+                       'own rollout restarts memory at every segment')
     # PufferLib's epoch-based scheduler is unused: train() sets the rate from
     # training progress (see cosine_learning_rate).
     self.async_collection = bool(getattr(vecenv, 'is_async', False))
@@ -541,9 +554,12 @@ class FootballPuffeRL(pufferl.PuffeRL):
     as it runs, into blocks of a buffer with room for several segments per
     match.  An epoch trains on exactly one segment per match's worth of
     completed blocks; segments in progress, and any completed beyond that,
-    carry over.  Recurrent memory still starts from zero at every segment
-    and every episode end, exactly as in PuffeRL's rollout, so BPTT replays
-    what the policy saw.
+    carry over.  By default recurrent memory starts from zero at every
+    segment and every episode end, exactly as in PuffeRL's rollout.  With
+    carry_memory it clears only at episode ends: each segment continues its
+    match's memory, and the memory it started from is kept per buffer row
+    (segment_h, segment_c) for training.  Either way BPTT replays what the
+    policy saw.
 
     With overlap on, collection continues while the update runs on the GPU:
     a copy of the policy acts on its own CUDA stream and is synced after
@@ -568,6 +584,10 @@ class FootballPuffeRL(pufferl.PuffeRL):
     hidden = self.uncompiled_policy.hidden_size
     self.agent_h = torch.zeros(self.total_agents, hidden, device=device)
     self.agent_c = torch.zeros(self.total_agents, hidden, device=device)
+    if self.carry_memory:
+      # Per buffer row: the actor's memory when that row's segment began.
+      self.segment_h = torch.zeros(self.segments, hidden, device=device)
+      self.segment_c = torch.zeros(self.segments, hidden, device=device)
     self.row_training = torch.zeros(self.segments, dtype=torch.bool,
                                     device=device)
     self.agent_offsets = np.arange(self.agents_per_env)
@@ -634,6 +654,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
         self.match_block[match] = self.free_blocks.pop()
         self.match_step[match] = 0
         fresh_matches.append(match)
+    fresh_matches = np.asarray(fresh_matches, dtype=np.int64)
     recording = self.match_block[matches] >= 0
     self.discarded_steps += int((~recording).sum())
     self.global_step += int(mask.sum())
@@ -642,13 +663,22 @@ class FootballPuffeRL(pufferl.PuffeRL):
               if self.acting_stream is not None else contextlib.nullcontext())
     with stream:
       agent_index = torch.as_tensor(agent_ids, device=device)
-      if fresh_matches:
-        # Every segment starts from zero memory, as PuffeRL's windows do.
+      if len(fresh_matches):
         fresh = torch.as_tensor(
-            (np.asarray(fresh_matches)[:, None] * per_env +
+            (fresh_matches[:, None] * per_env +
              self.agent_offsets).ravel(), device=device)
-        self.agent_h[fresh] = 0
-        self.agent_c[fresh] = 0
+        if self.carry_memory:
+          # The segment continues its match's memory; keep where it started
+          # so training can replay the segment from the same state.
+          block_rows = torch.as_tensor(
+              (self.match_block[fresh_matches][:, None] * per_env +
+               self.agent_offsets).ravel(), device=device)
+          self.segment_h[block_rows] = self.agent_h[fresh]
+          self.segment_c[block_rows] = self.agent_c[fresh]
+        else:
+          # Every segment starts from zero memory, as PuffeRL's windows do.
+          self.agent_h[fresh] = 0
+          self.agent_c[fresh] = 0
 
       profile('eval_copy', epoch)
       o_device = torch.as_tensor(o).to(device)
@@ -776,6 +806,20 @@ class FootballPuffeRL(pufferl.PuffeRL):
     self._epoch_weight.copy_(trainable)
     self._totals.zero_()
 
+  def _starting_memory(self, index):
+    """The window-forward state that starts buffer rows `index` as collected.
+
+    Empty when memory restarts at every segment (the window forward starts
+    from zero by itself).  With carry_memory, the memory each row's segment
+    started from plus the done flags that clear it where the segment opens
+    on a new episode.  Shapes are fixed by `index`, so a captured update can
+    read it.
+    """
+    if not self.carry_memory:
+      return {}
+    return {'done': self.terminals[index], 'lstm_h': self.segment_h[index],
+            'lstm_c': self.segment_c[index]}
+
   def _minibatch_step(self, policy, index, pieces):
     """One PPO gradient step on the segments in `index`.
 
@@ -793,7 +837,8 @@ class FootballPuffeRL(pufferl.PuffeRL):
       return (values * mask).sum() / denominator
 
     logits, new_values = policy(
-        self.observations[index], {'episode_pieces': pieces})
+        self.observations[index],
+        {'episode_pieces': pieces, **self._starting_memory(index)})
     _, new_logprobs, entropy = pufferlib.pytorch.sample_logits(
         logits, action=self.actions[index])
     new_logprobs = new_logprobs.view(mask.shape)
@@ -1035,7 +1080,8 @@ class FootballPuffeRL(pufferl.PuffeRL):
         index = segment_index[:min(64, num_segments)]
         sample_mask = trainable[index]
         post_logits, post_values = self.policy(
-            self.observations[index], {'done': self.terminals[index]})
+            self.observations[index],
+            {'done': self.terminals[index], **self._starting_memory(index)})
         post_logits = post_logits.view(*sample_mask.shape, -1)[sample_mask]
         for name, value in policy_diagnostics(post_logits).items():
           losses[name] = value.item()
@@ -1089,7 +1135,28 @@ def _async_batch_workers(args, num_workers, promotion=False):
   return max(1, num_workers // 3)
 
 
+def memory_window(args):
+  """Steps the training rollout keeps recurrent memory before restarting it.
+
+  The bptt horizon, since every rollout segment starts from zero memory, or
+  None with --carry-lstm-memory, where memory clears only at episode ends.
+  Evaluation replays a policy with the memory it was trained with.
+  """
+  return None if args.carry_lstm_memory else args.bptt_horizon
+
+
 def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
+  """Worker pool for gate evaluations at the given curriculum level.
+
+  The frozen opponent keeps its memory the way this run trains unless
+  --frozen-defence-horizon says otherwise (an opponent file trained by
+  another run, where 0 means whole episodes).
+  """
+  frozen_defence_horizon = args.frozen_defence_horizon
+  if frozen_defence_horizon is None:
+    frozen_defence_horizon = memory_window(args)
+  elif frozen_defence_horizon == 0:
+    frozen_defence_horizon = None
   return make_vector_env(
       num_envs=args.promotion_workers, num_workers=args.promotion_workers,
       batch_size=args.promotion_workers, reserved_cpus=0,
@@ -1106,7 +1173,7 @@ def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
       curriculum_evaluation=True,
       observation=args.observation,
       frozen_defence_path=frozen_defence_path,
-      frozen_defence_horizon=args.bptt_horizon,
+      frozen_defence_horizon=frozen_defence_horizon,
       # The gate scores on the same spawn distribution the policy trains on.
       spawn=args.spawn)
 
@@ -1173,7 +1240,7 @@ def _run_promotion(args, policy, level_value, level, device, episodes,
     return evaluate(
         policy, promotion_env, episodes,
         args.seed + 1000000 + 10000 * level, device,
-        recurrent_horizon=args.bptt_horizon, greedy=greedy,
+        recurrent_horizon=memory_window(args), greedy=greedy,
         early_abort=early_abort)
   finally:
     if not reuse:
@@ -1302,6 +1369,17 @@ def build_parser():
                       help='optimizer steps per rollout; each step trains on '
                            'the whole rollout (the minibatch is the rollout)')
   parser.add_argument('--bptt-horizon', type=int, default=32)
+  parser.add_argument('--carry-lstm-memory',
+                      action=argparse.BooleanOptionalAction, default=False,
+                      help='keep recurrent memory across rollout segments '
+                           '(cleared only at episode ends) and train each '
+                           'segment from the memory it started with, instead '
+                           'of restarting memory every --bptt-horizon steps; '
+                           'needs --async-collection')
+  parser.add_argument('--frozen-defence-horizon', type=int, default=None,
+                      help='steps the frozen gate opponent keeps memory '
+                           'before restarting it (0: whole episodes); by '
+                           'default the same as this run trains with')
   parser.add_argument('--hidden-size', type=int, default=256)
   parser.add_argument('--observation', default='simple115',
                       choices=('simple115', 'entities'),
@@ -1582,6 +1660,8 @@ def main():
       'diagnostic_promotion_every': args.diagnostic_promotion_every,
       'compile': args.compile,
       'reuse_promotion_envs': args.reuse_promotion_envs,
+      'carry_lstm_memory': args.carry_lstm_memory,
+      'frozen_defence_horizon': args.frozen_defence_horizon,
   }, sort_keys=True), flush=True)
 
   policy = FootballPolicy(env, hidden_size=args.hidden_size,
@@ -1598,7 +1678,8 @@ def main():
       log_interval_seconds=args.log_interval_seconds,
       overlap_collection=args.overlap_collection,
       graph_actor=args.graph_actor,
-      graph_update=args.graph_update)
+      graph_update=args.graph_update,
+      carry_memory=args.carry_lstm_memory)
   filler = None
   if args.gpu_filler and args.device == 'cuda':
     from gfootball.examples.gpu_filler import GpuFiller

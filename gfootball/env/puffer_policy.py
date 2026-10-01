@@ -288,14 +288,19 @@ class FootballPolicy(torch.nn.Module):
   def forward(self, observations, state=None):
     """Backprop through time over (segments, horizon) training windows.
 
-    Every window starts from zero memory, as every rollout segment does, and
-    memory clears wherever state['done'] marks an episode start.  The window
-    is cut into episode pieces (episode_pieces) and run as one packed cuDNN
-    LSTM call instead of a Python loop of `horizon` small cell kernels; the
-    result equals stepping forward_eval through the window.  A caller that
-    runs the same windows repeatedly passes state['episode_pieces'] (the
-    episode_pieces of its done flags) instead of 'done' to skip recomputing
-    the layout and its host sync.
+    Every window starts from zero memory unless state['lstm_h'] and
+    ['lstm_c'] give each window's starting memory (one row per window, the
+    actor's memory when its segment began, for rollouts that carry memory
+    across segments).  Memory clears wherever state['done'] marks an episode
+    start, so only the piece that opens a window reads the starting memory,
+    and a window whose first step starts an episode begins from zero.  The
+    window is cut into episode pieces (episode_pieces) and run as one packed
+    cuDNN LSTM call instead of a Python loop of `horizon` small cell
+    kernels; the result equals stepping forward_eval through the window.  A
+    caller that runs the same windows repeatedly passes
+    state['episode_pieces'] (the episode_pieces of its done flags) to skip
+    recomputing the layout and its host sync; with starting memory it still
+    passes 'done' too, which is then only read for each window's first step.
     """
     if observations.dim() == 2:
       return self.forward_eval(observations, dict(state or {}))
@@ -303,17 +308,39 @@ class FootballPolicy(torch.nn.Module):
     segments, horizon = observations.shape[:2]
     encoded = self._encode(
         observations.float().reshape(segments * horizon, -1))
+    done = state.get('done')
     pieces = state.get('episode_pieces')
     if pieces is None:
-      done = state.get('done')
       if done is None:
         done = encoded.new_zeros(segments, horizon)
       pieces = episode_pieces(done)
+    starting_hidden = state.get('lstm_h')
+    starting_cell = state.get('lstm_c')
+    if starting_hidden is not None:
+      if done is None:
+        raise ValueError("starting memory needs state['done'] to clear the "
+                         'windows that open on an episode start')
+      starting_hidden, starting_cell = self._reset_finished(
+          starting_hidden, starting_cell, done[:, 0])
     order, inverse, batch_sizes = pieces
     # One zero row for the spare slots of a padded layout to read.
     padded = torch.cat((encoded, encoded.new_zeros(1, encoded.shape[1])))
+    memory = None
+    if starting_hidden is not None:
+      # The first batch_sizes[0] packed rows are every piece's first step, in
+      # piece order, which is the order nn.LSTM reads initial states in.  A
+      # piece opens its window iff its first step is a window's step 0.
+      first = order[:int(batch_sizes[0])]
+      opens_window = ((first % horizon == 0) &
+                      (first < segments * horizon)).unsqueeze(-1)
+      window = torch.where(opens_window.squeeze(-1),
+                           torch.div(first, horizon, rounding_mode='floor'), 0)
+      memory = tuple(
+          (start.index_select(0, window) * opens_window).to(
+              padded.dtype).unsqueeze(0)
+          for start in (starting_hidden, starting_cell))
     packed, _ = self.rnn(torch.nn.utils.rnn.PackedSequence(
-        padded.index_select(0, order), batch_sizes))
+        padded.index_select(0, order), batch_sizes), memory)
     hidden = packed.data.index_select(0, inverse)
     return self.actor(hidden), self.critic(hidden).view(segments, horizon)
 
