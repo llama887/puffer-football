@@ -38,6 +38,22 @@ level still sets the distance from goal and the defensive line, but nobody
 starts lined up on the ball: whoever is nearest has to go and get it.  The
 draw has its own generator, so the normal scenes are unchanged by it.
 
+With 'mixed_shape' set, every level from 1 up (gate scenes included, since it
+is part of the level) puts min(level, 3) attackers between the ball and the
+goal, onside behind a defensive line that steps up when there is room, and
+clear of the shooting lane.  Otherwise no attacker starts ahead of the ball
+from level 3 on, so running forward is right from every spawn.
+
+With 'loose_ball_fraction' set, that fraction of TRAINING episodes is a
+loose-ball spawn built to look like a real dead ball: some players start on
+the touchlines, the nearest attacker starts a fetch distance from the still
+ball that grows with the level (0.05-0.15 at level 0, up to 0.9 by level
+10), every defender starts farther still on the low levels (the head start
+fades to an even race by level 10), and about half the outfield players are
+given a direction to hold.  'curriculum_held_directions' lists those
+directions per agent; puffer_env presses them on the first step, outside
+training.
+
 Every episode ends as soon as the ball goes out of play.  With the magnet off
 the engine never designates a set-piece taker, so a goal kick, corner or
 throw-in would otherwise freeze the match until the timeout.
@@ -48,7 +64,8 @@ import random
 
 from . import *
 from gfootball.curriculum import (
-    SPAWN_TEMPLATE_COUNT, goalside_blockers, lateral_half_width)
+    ADVANTAGE_LEVELS, SPAWN_TEMPLATE_COUNT, goalside_blockers,
+    lateral_half_width)
 
 
 _FORMATION = (
@@ -202,6 +219,167 @@ def _onside(attackers, defenders, ball_x, sign, rng):
           (sign * rng.uniform(-_PITCH_X, line), y) for x, y in attackers]
 
 
+# Mixed shape: from level 1, up to this many attackers start between the ball
+# and the goal (one more per level), onside behind a defensive line that sits
+# _MIXED_LINE_DEPTH ahead of the ball when the pitch leaves room for it.
+_MIXED_MAX_AHEAD = 3
+_MIXED_LINE_DEPTH = (0.10, 0.25)
+_MIXED_LINE_DEFENDERS = 3
+# Goal mouth half-width; the shooting lane narrows from it to the ball, and
+# an attacker placed ahead keeps this much clear of the lane.
+_POST_Y = 0.044
+_LANE_CLEARANCE = 0.03
+# Loose-ball spawn.  Measured dead balls (9/30 traces) have the nearest
+# attacker 0.4-0.9 from a still ball, every player holding a direction and
+# the defence usually farther away.  The fetch distance and the defenders'
+# head start both follow level progress, reaching the measured range and an
+# even race at _LOOSE_RAMP_LEVELS.
+_LOOSE_RAMP_LEVELS = 10
+_LOOSE_FETCH = (0.05, 0.15, 0.90)  # minimum, maximum at level 0, at the ramp
+_LOOSE_DEFENDER_MARGIN = 0.15      # at level 0, fading to 0
+_LOOSE_TOUCHLINE_SHARE = 0.3
+_LOOSE_TOUCHLINE_Y = (0.28, 0.36)
+_LOOSE_HELD_SHARE = 0.5
+# Default action set: 1-8 are the eight movement directions.
+_DIRECTION_ACTIONS = tuple(range(1, 9))
+
+
+def _lane_gap(x, y, ball_x, ball_y, direction):
+  """How far (x, y) is outside the shooting lane from the ball to the goal.
+
+  Negative inside the lane.  In world coordinates; `direction` is +1 when
+  the goal being attacked is at x = +1.
+  """
+  along = (direction * x - direction * ball_x) / (1.0 - direction * ball_x)
+  centre = ball_y * (1.0 - along)
+  return abs(y - centre) - (_POST_Y * along + _LANE_CLEARANCE)
+
+
+def _lane_free_y(x, ball_x, ball_y, direction, rng):
+  """A y across the width, outside the shooting lane at that x."""
+  for _ in range(100):
+    y = rng.uniform(-_PITCH_Y, _PITCH_Y)
+    if _lane_gap(x, y, ball_x, ball_y, direction) > 0:
+      return y
+  return _PITCH_Y if ball_y < 0 else -_PITCH_Y
+
+
+def _mixed_shape(positions, roles, ball_x, ball_y, direction, level, rng):
+  """Put some attackers between the ball and the goal, onside, lane clear.
+
+  `positions` are world [x, y] lists for the outfield players and `roles`
+  says, per player, 'attacker', 'blocker' or 'defender'.  If the defensive
+  line (the second-last defender, keeper included) sits less than a drawn
+  depth ahead of the ball, the defenders nearest the ball step up to that
+  line; then min(level, _MIXED_MAX_AHEAD) attackers take spots between the
+  ball and the line, outside the shooting lane.  Returns those attackers'
+  indices, which the final pass keeps ahead, onside and lane clear.
+  """
+  forward = lambda x: direction * x - direction * ball_x
+  room = 0.94 - direction * ball_x
+  defenders = [i for i, role in enumerate(roles) if role != 'attacker']
+  depths = sorted([forward(positions[i][0]) for i in defenders] +
+                  [forward(direction * 1.0)])
+  line = depths[-2]
+  target = min(rng.uniform(*_MIXED_LINE_DEPTH), room - 0.01)
+  if line < target:
+    movable = sorted((i for i in defenders if roles[i] == 'defender'),
+                     key=lambda i: math.hypot(positions[i][0] - ball_x,
+                                              positions[i][1] - ball_y))
+    for i in movable[:_MIXED_LINE_DEFENDERS]:
+      positions[i][0] = ball_x + direction * target
+      positions[i][1] = rng.uniform(-_PITCH_Y, _PITCH_Y)
+    line = target
+  attackers = [i for i, role in enumerate(roles) if role == 'attacker']
+  # The two carriers stay behind the ball; ring players move up.
+  ahead = rng.sample(attackers[2:], min(level, _MIXED_MAX_AHEAD))
+  for i in ahead:
+    depth = rng.uniform(0.035, max(0.04, line - 0.012))
+    positions[i][0] = ball_x + direction * depth
+    positions[i][1] = _lane_free_y(positions[i][0], ball_x, ball_y,
+                                   direction, rng)
+  return ahead
+
+
+def _keep_mixed_shape(spaced, roles, ahead, ball_x, ball_y, direction):
+  """Undo what the overlap relaxation did to the mixed shape.
+
+  Every attacker ends up onside and every attacker ahead of the ball clear
+  of the shooting lane; the chosen ones stay at least 0.025 ahead.
+  """
+  forward = lambda x: direction * x - direction * ball_x
+  depths = sorted([forward(spaced[i][0]) for i, role in enumerate(roles)
+                   if role != 'attacker'] + [forward(direction * 1.0)])
+  line = max(0.0, depths[-2])
+  for i, role in enumerate(roles):
+    if role != 'attacker':
+      continue
+    x, y = spaced[i]
+    depth = forward(x)
+    if i in ahead:
+      depth = max(depth, 0.025)
+    depth = min(depth, line - 0.002) if depth > 0 else depth
+    x = ball_x + direction * depth
+    if depth > 0.02 and _lane_gap(x, y, ball_x, ball_y, direction) <= 0:
+      along = depth / (1.0 - direction * ball_x)
+      centre = ball_y * (1.0 - along)
+      side = 1.0 if y >= centre else -1.0
+      y = centre + side * (_POST_Y * along + _LANE_CLEARANCE + 0.001)
+      if abs(y) > _PITCH_Y:
+        y = centre - side * (_POST_Y * along + _LANE_CLEARANCE + 0.001)
+    spaced[i] = (x, y)
+
+
+def _push_out(point, ball_x, ball_y, radius, rng):
+  """Move `point` to `radius` from the ball, along its own bearing if it can.
+
+  Bearings that would leave the pitch are retried at random, so a player
+  pushed off the ball near a goal line or touchline still lands in play.
+  """
+  dx, dy = point[0] - ball_x, point[1] - ball_y
+  angle = math.atan2(dy, dx) if math.hypot(dx, dy) > 1e-6 else (
+      rng.uniform(-math.pi, math.pi))
+  for attempt in range(40):
+    x = ball_x + radius * math.cos(angle)
+    y = ball_y + radius * math.sin(angle)
+    if abs(x) <= _PITCH_X and abs(y) <= _PITCH_Y:
+      return [x, y]
+    angle = rng.uniform(-math.pi, math.pi)
+  return [max(-_PITCH_X, min(_PITCH_X, x)), max(-_PITCH_Y, min(_PITCH_Y, y))]
+
+
+def _loose_ball(positions, roles, ball_x, ball_y, direction, level, rng):
+  """Make the opening a race for a still ball, like a real dead ball.
+
+  Some players are sent to the touchlines, then every attacker is moved out
+  to at least the fetch distance and one of them exactly to it, and every
+  outfield defender to at least the fetch distance plus the level's head
+  start.  The keeper cannot leave the goal, so on the levels where it is near
+  the ball the fetch distance is capped below its distance.
+  """
+  progress = min(1.0, level / float(_LOOSE_RAMP_LEVELS))
+  low, high0, high1 = _LOOSE_FETCH
+  keeper = math.hypot(direction * 1.0 - ball_x, ball_y)
+  high = min(high0 + (high1 - high0) * progress, keeper - 0.02)
+  fetch = rng.uniform(low, max(low, high))
+  margin = _LOOSE_DEFENDER_MARGIN * (1.0 - progress)
+  for i in range(len(positions)):
+    if rng.random() < _LOOSE_TOUCHLINE_SHARE:
+      positions[i][1] = rng.choice((-1.0, 1.0)) * rng.uniform(
+          *_LOOSE_TOUCHLINE_Y)
+  distance = lambda i: math.hypot(positions[i][0] - ball_x,
+                                  positions[i][1] - ball_y)
+  for i, role in enumerate(roles):
+    floor = fetch if role == 'attacker' else fetch + margin
+    if distance(i) < floor:
+      positions[i] = _push_out(positions[i], ball_x, ball_y,
+                               floor + rng.uniform(0.0, 0.05), rng)
+  attackers = [i for i, role in enumerate(roles) if role == 'attacker']
+  nearest = min(attackers, key=distance)
+  positions[nearest] = _push_out(positions[nearest], ball_x, ball_y, fetch, rng)
+  return fetch
+
+
 def _build_uniform(builder, values, seed, episode, cycle):
   """Uniform no-curriculum spawn: ball and players anywhere, all onside.
 
@@ -260,6 +438,8 @@ def build_scenario(builder):
 
   cycle = seed + episode
   values['curriculum_width_spawn'] = False
+  values['curriculum_loose_ball'] = False
+  values['curriculum_held_directions'] = [0] * 22
   if values.get('uniform_spawn', False):
     _build_uniform(builder, values, seed, episode, cycle)
     return
@@ -352,7 +532,34 @@ def build_scenario(builder):
         # Keep the level's x, spread across the width; blockers stay put.
         position = (position[0], width_rng.uniform(-_PITCH_Y, _PITCH_Y))
       outfield.append((team, index, role, position[0], position[1]))
-  spaced = _separate([(row[3], row[4]) for row in outfield])
+
+  positions = [[row[3], row[4]] for row in outfield]
+  roles = ['attacker' if row[0] == attacking_team else
+           'blocker' if row[1] - 1 < goalside else 'defender'
+           for row in outfield]
+  levels = int(values.get('curriculum_levels', ADVANTAGE_LEVELS))
+  level = int(round((1.0 - advantage) * (levels - 1)))
+  # Mixed shape is part of the level, so gate scenes get it too.
+  mixed = bool(values.get('mixed_shape', False)) and level >= 1
+  ahead = (_mixed_shape(positions, roles, ball_x, ball_y, direction, level,
+                        random.Random('{}:{}:mixed'.format(seed, episode)))
+           if mixed else [])
+  # Loose-ball spawn: training only, its own generator.
+  loose_rng = random.Random('{}:{}:loose'.format(seed, episode))
+  loose = (not evaluation and loose_rng.random() <
+           float(values.get('loose_ball_fraction', 0.0)))
+  held = [0] * 22
+  if loose:
+    _loose_ball(positions, roles, ball_x, ball_y, direction, level, loose_rng)
+    for row in outfield:
+      if loose_rng.random() < _LOOSE_HELD_SHARE:
+        agent = (0 if row[0] == Team.e_Left else 11) + row[1]
+        held[agent] = loose_rng.choice(_DIRECTION_ACTIONS)
+  values['curriculum_loose_ball'] = loose
+  values['curriculum_held_directions'] = held
+  spaced = _separate([tuple(p) for p in positions])
+  if mixed:
+    _keep_mixed_shape(spaced, roles, ahead, ball_x, ball_y, direction)
 
   for team in (Team.e_Left, Team.e_Right):
     builder.SetTeam(team)

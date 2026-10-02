@@ -83,6 +83,16 @@ SPAWN=${SPAWN:-curriculum}
 # blockers) keep their level x but spawn uniformly across the pitch width;
 # the gate never uses it.  0 disables.
 WIDTH_SPAWN_FRACTION=${WIDTH_SPAWN_FRACTION:-0}
+# MIXED_SHAPE=1: from level 1 some attackers start ahead of the ball, onside
+# and clear of the shooting lane (part of the level; the gate plays it too).
+MIXED_SHAPE=${MIXED_SHAPE:-0}
+MIXED_SHAPE_ARGS=(--no-mixed-shape)
+if [[ $MIXED_SHAPE == 1 ]]; then
+  MIXED_SHAPE_ARGS=(--mixed-shape)
+fi
+# Share of training episodes that open as a race for a still ball (dead-ball
+# practice); the gate never uses it.  0 disables.
+LOOSE_BALL_FRACTION=${LOOSE_BALL_FRACTION:-0}
 # Optimizer steps per rollout.  Each step trains on the whole rollout (one
 # segment per agent, ~0.6 GB on the GPU at 46 matches), so there is no
 # minibatch size to set.
@@ -299,6 +309,8 @@ cd "$RUN_ROOT"
   --player-potential-fade-speed "$PLAYER_POTENTIAL_FADE_SPEED" \
   --spawn "$SPAWN" \
   --width-spawn-fraction "$WIDTH_SPAWN_FRACTION" \
+  "${MIXED_SHAPE_ARGS[@]}" \
+  --loose-ball-fraction "$LOOSE_BALL_FRACTION" \
   --gae-lambda "$GAE_LAMBDA" \
   --update-epochs "$UPDATE_EPOCHS" \
   --bptt-horizon "$BPTT_HORIZON" \

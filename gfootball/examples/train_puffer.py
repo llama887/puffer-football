@@ -1175,7 +1175,9 @@ def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
       frozen_defence_path=frozen_defence_path,
       frozen_defence_horizon=frozen_defence_horizon,
       # The gate scores on the same spawn distribution the policy trains on.
-      spawn=args.spawn)
+      spawn=args.spawn,
+      # The mixed shape defines the level; loose-ball spawns are training only.
+      mixed_shape=args.mixed_shape)
 
 
 def rearm_for_reset(vecenv):
@@ -1379,6 +1381,19 @@ def build_parser():
                            'goal-side blockers, keep their level x but spawn '
                            'uniformly across the pitch width, so they must '
                            'go and get the ball (advantage env only)')
+  parser.add_argument('--mixed-shape', action=argparse.BooleanOptionalAction,
+                      default=False,
+                      help='from level 1, put min(level, 3) attackers between '
+                           'the ball and the goal, onside and clear of the '
+                           'shooting lane; part of the level, so the gate '
+                           'plays it too (advantage env only)')
+  parser.add_argument('--loose-ball-fraction', type=float, default=0.0,
+                      help='share of training episodes (never gate episodes) '
+                           'that open as a race for a still ball: the '
+                           'nearest attacker a level-dependent fetch distance '
+                           'away, defenders farther on low levels, some '
+                           'players on the touchlines and half holding a '
+                           'direction (advantage env only)')
   parser.add_argument('--update-epochs', type=int, default=4,
                       help='optimizer steps per rollout; each step trains on '
                            'the whole rollout (the minibatch is the rollout)')
@@ -1630,7 +1645,9 @@ def main():
       potential_gamma=args.gamma,
       spawn=args.spawn,
       # A training distribution only: the gate keeps the level's own scenes.
-      width_spawn_fraction=args.width_spawn_fraction)
+      width_spawn_fraction=args.width_spawn_fraction,
+      mixed_shape=args.mixed_shape,
+      loose_ball_fraction=args.loose_ball_fraction)
   if not 0 <= args.start_level < args.curriculum_levels:
     raise ValueError('start-level must be inside the curriculum')
   # The launcher exports OMP_NUM_THREADS=1 so the env workers do not each
@@ -1670,6 +1687,8 @@ def main():
       'player_potential_fade_speed': args.player_potential_fade_speed,
       'spawn': args.spawn,
       'width_spawn_fraction': args.width_spawn_fraction,
+      'mixed_shape': args.mixed_shape,
+      'loose_ball_fraction': args.loose_ball_fraction,
       'frozen_defence_gate': args.frozen_defence_gate,
       'greedy_promotion_episodes': args.greedy_promotion_episodes,
       'selfplay_promotion_episodes': args.selfplay_promotion_episodes,

@@ -517,6 +517,152 @@ class PufferEnvTest(absltest.TestCase):
     drawn = sum(layout(0.5, seed, 0.75)[4] for seed in range(200))
     self.assertBetween(drawn, 70, 130)
 
+  def test_mixed_shape_puts_onside_attackers_ahead_of_the_ball(self):
+    """From level 1, some attackers start between the ball and the goal.
+
+    Without it no attacker ever starts ahead of the ball from level 3 up, so
+    "forward" is the right move from every spawn.  The ones placed ahead are
+    onside (no nearer the goal line than the second-last defender) and out
+    of the shooting lane, so they never block the shot the level is built
+    around.  Level 0, the anchor, is unchanged, and so are the ball, the
+    keepers and the goal-side blockers.  It is part of the level, so gate
+    scenes use it too.
+    """
+    def layout(mixed, seed, level, evaluation):
+      cfg = _advantage_config(
+          advantage_for_level(level, ADVANTAGE_LEVELS),
+          evaluation=evaluation, seed=seed)
+      cfg['mixed_shape'] = mixed
+      cfg.NewScenario(seed % 7)
+      scenario = cfg.ScenarioConfig()
+      attack_right = scenario.ball_position[0] > 0
+      flip = 1.0 if attack_right else -1.0
+      left = [(flip * p.position[0], flip * p.position[1])
+              for p in scenario.left_team]
+      right = [(-flip * p.position[0], -flip * p.position[1])
+               for p in scenario.right_team]
+      attackers, defenders = (left, right) if attack_right else (right, left)
+      ball = (flip * scenario.ball_position[0],
+              flip * scenario.ball_position[1])
+      return ball, attackers, defenders, cfg['curriculum_goalside_defenders']
+
+    for evaluation in (False, True):
+      for seed in range(25):
+        self.assertEqual(layout(True, seed, 0, evaluation),
+                         layout(False, seed, 0, evaluation))
+        for level in (1, 3, 9, 14, 18):
+          ball, attackers, defenders, blockers = layout(
+              True, seed, level, evaluation)
+          plain_ball, _, plain_defenders, _ = layout(
+              False, seed, level, evaluation)
+          self.assertEqual(ball, plain_ball)
+          self.assertEqual(defenders[0], plain_defenders[0])  # keeper
+          for rank in range(1, 1 + blockers):
+            self.assertLess(abs(defenders[rank][0] - plain_defenders[rank][0]) +
+                            abs(defenders[rank][1] - plain_defenders[rank][1]),
+                            0.03)
+          ahead = [(x, y) for x, y in attackers[1:] if x > ball[0] + 0.02]
+          self.assertGreaterEqual(len(ahead), min(3, level), (level, seed))
+          second_last = sorted(x for x, _ in defenders)[-2]
+          line = max(ball[0], second_last)
+          for x, y in attackers:
+            self.assertLessEqual(x, line + 1e-6, (level, seed))
+          for x, y in ahead:
+            # The lane narrows from the posts (|y| = 0.044) to the ball.
+            along = (x - ball[0]) / (1.0 - ball[0])
+            centre = ball[1] * (1.0 - along)
+            self.assertGreater(abs(y - centre), 0.044 * along + 0.015,
+                               (level, seed))
+
+  def test_loose_ball_spawn_matches_the_dead_ball_situation(self):
+    """A loose-ball spawn starts like a real dead ball, made winnable.
+
+    Measured dead balls have the nearest attacker 0.4-0.9 from a still ball,
+    the players holding a direction, and the defenders usually farther away.
+    In a training episode drawn for it, the ball stays where the level puts
+    it, the nearest attacker starts a fetch distance away that grows with the
+    level, every defender (keeper included) starts farther than that on the
+    low levels, and about half the outfield players are given a direction to
+    hold on the first step.  Gate episodes never use it.
+    """
+    def layout(fraction, seed, level, evaluation=False):
+      cfg = _advantage_config(
+          advantage_for_level(level, ADVANTAGE_LEVELS),
+          evaluation=evaluation, seed=seed)
+      cfg['loose_ball_fraction'] = fraction
+      cfg.NewScenario(seed % 7)
+      scenario = cfg.ScenarioConfig()
+      attack_right = scenario.ball_position[0] > 0
+      left = [(p.position[0], p.position[1]) for p in scenario.left_team]
+      right = [(-p.position[0], -p.position[1]) for p in scenario.right_team]
+      attackers, defenders = (left, right) if attack_right else (right, left)
+      ball = np.array((scenario.ball_position[0], scenario.ball_position[1]))
+      nearest = lambda team: min(np.hypot(x - ball[0], y - ball[1])
+                                 for x, y in team)
+      return (tuple(ball), nearest(attackers[1:]), nearest(defenders),
+              cfg['curriculum_loose_ball'],
+              list(cfg['curriculum_held_directions']))
+
+    directions = {1, 2, 3, 4, 5, 6, 7, 8}
+    for level in (0, 2, 5, 10, 14):
+      fetches = []
+      for seed in range(30):
+        ball, attacker, defender, loose, held = layout(1.0, seed, level)
+        plain_ball, plain_attacker, _, plain_loose, plain_held = layout(
+            0.0, seed, level)
+        self.assertTrue(loose)
+        self.assertFalse(plain_loose)
+        self.assertEqual(plain_held, [0] * 22)
+        self.assertEqual(ball, plain_ball)
+        self.assertGreater(attacker, plain_attacker)
+        fetches.append(attacker)
+        if level <= 5:
+          self.assertGreater(defender, attacker + 0.01, (level, seed))
+        else:
+          self.assertGreater(defender, attacker - 0.03, (level, seed))
+        self.assertLen(held, 22)
+        self.assertEqual(held[0], 0)   # keepers never get a held direction
+        self.assertEqual(held[11], 0)
+        self.assertTrue(set(held) <= directions | {0})
+        self.assertGreater(sum(h > 0 for h in held), 0)
+        gate = layout(1.0, seed, level, evaluation=True)
+        self.assertFalse(gate[3])
+        self.assertEqual(gate[4], [0] * 22)
+      if level >= 10:
+        self.assertGreater(max(fetches), 0.5, level)
+      if level == 0:
+        self.assertLess(max(fetches), 0.13)
+    drawn = sum(layout(0.5, seed, 5)[3] for seed in range(200))
+    self.assertBetween(drawn, 70, 130)
+
+  def test_loose_ball_warmup_presses_held_directions_outside_training(self):
+    """The first step of a loose-ball episode presses the held directions.
+
+    Every row is hidden on that step, so the trainer (which skips all-zero
+    rows) never learns from actions the policy did not choose and the step
+    pays nothing; from the next step the policy acts on players that are
+    already running, with those buttons held.
+    """
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=5,
+        curriculum_levels=ADVANTAGE_LEVELS, observation='entities',
+        loose_ball_fraction=1.0)
+    try:
+      observations, _ = env.reset()
+      held = np.asarray(env._env.unwrapped._config['curriculum_held_directions'])
+      self.assertGreater((held > 0).sum(), 0)
+      self.assertFalse(np.any(observations))
+      observations, rewards, _, _, _ = env.step(np.zeros(22, dtype=np.int32))
+      self.assertTrue(np.all(np.any(observations, axis=1)))
+      self.assertFalse(np.any(rewards))
+      sticky_names = entity_observation._STICKY_NAMES
+      action_names = entity_observation._ACTION_NAMES
+      for agent in np.flatnonzero(held):
+        pressed = action_names[held[agent]]
+        self.assertEqual(env._sticky[agent, sticky_names.index(pressed)], 1.0)
+    finally:
+      env.close()
+
   def test_width_spawn_fraction_reaches_the_scenario(self):
     env = puffer_env.FootballPufferEnv(
         env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=3,

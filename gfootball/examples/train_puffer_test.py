@@ -413,6 +413,22 @@ def test_loose_ball_shaping_and_width_spawn_are_opt_in_and_training_only():
   assert 'width_spawn_fraction' not in make.call_args.kwargs
 
 
+def test_mixed_shape_reaches_the_gate_and_loose_balls_stay_in_training():
+  """The mixed shape defines the level, so the gate plays it too; loose-ball
+  spawns are a training distribution only.  Both default off."""
+  from gfootball.examples.train_puffer import _make_promotion_env
+  defaults = build_parser().parse_args([])
+  assert defaults.mixed_shape is False
+  assert defaults.loose_ball_fraction == 0
+  args = build_parser().parse_args(
+      ['--mixed-shape', '--loose-ball-fraction', '0.5'])
+  assert args.mixed_shape is True and args.loose_ball_fraction == 0.5
+  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
+    _make_promotion_env(args, SimpleNamespace(value=2))
+  assert make.call_args.kwargs['mixed_shape'] is True
+  assert 'loose_ball_fraction' not in make.call_args.kwargs
+
+
 def test_spawn_mode_defaults_to_curriculum_and_reaches_the_gate():
   """The gate must score on the same spawn distribution the policy trains on."""
   from gfootball.examples.train_puffer import _make_promotion_env

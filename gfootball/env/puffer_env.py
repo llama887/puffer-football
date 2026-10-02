@@ -198,7 +198,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                ball_potential_scale=0.0, potential_gamma=0.99,
                player_potential_scale=0.0, spawn='curriculum',
                observation='simple115', player_potential_fade_speed=0.0,
-               width_spawn_fraction=0.0):
+               width_spawn_fraction=0.0, mixed_shape=False,
+               loose_ball_fraction=0.0):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     # 'simple115': simple115v2 made egocentric (and sorted); 'entities': the
@@ -221,9 +222,21 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       raise ValueError('width_spawn_fraction must be in [0, 1]')
     if width_spawn_fraction and env_name != ADVANTAGE_ENV_NAME:
       raise ValueError('width_spawn_fraction needs ' + ADVANTAGE_ENV_NAME)
+    # Mixed shape (part of each level from 1 up): some attackers start ahead
+    # of the ball.  Loose-ball spawns (training only): the opening is a race
+    # for a still ball, with held directions pressed on the first step.
+    if not 0 <= loose_ball_fraction <= 1:
+      raise ValueError('loose_ball_fraction must be in [0, 1]')
+    if (loose_ball_fraction or mixed_shape) and env_name != ADVANTAGE_ENV_NAME:
+      raise ValueError('mixed_shape and loose_ball_fraction need ' +
+                       ADVANTAGE_ENV_NAME)
     # Set before _make_env, which reads them when building the engine.
     self._spawn = spawn
     self._width_spawn_fraction = float(width_spawn_fraction)
+    self._mixed_shape = bool(mixed_shape)
+    self._loose_ball_fraction = float(loose_ball_fraction)
+    # Directions to press on the first step of a loose-ball episode.
+    self._warmup_actions = None
     # None: the frozen policy keeps memory for whole episodes.
     if frozen_defence_horizon is not None and frozen_defence_horizon < 1:
       raise ValueError('frozen_defence_horizon must be positive or None')
@@ -276,6 +289,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._episode_attackers = 1
     self._episode_template = 0
     self._episode_width_spawn = False
+    self._episode_loose_ball = False
     self._attacking_left = True
     self._active_mask = np.ones(self.num_agents, dtype=bool)
     # Scratch buffers reused by step(), so a transition allocates nothing.
@@ -386,6 +400,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
             'real_time': False,
             'uniform_spawn': self._spawn == 'uniform',
             'width_spawn_fraction': self._width_spawn_fraction,
+            'mixed_shape': self._mixed_shape,
+            'loose_ball_fraction': self._loose_ball_fraction,
         })
 
   def _reset_match(self):
@@ -411,7 +427,17 @@ class FootballPufferEnv(pufferlib.PufferEnv):
           raw_config._values['curriculum_episode_template'])
     self._episode_width_spawn = bool(
         raw_config._values.get('curriculum_width_spawn', False))
+    self._episode_loose_ball = bool(
+        raw_config._values.get('curriculum_loose_ball', False))
     self._set_active_players()
+    # A loose-ball spawn presses its held directions on the first step.  Every
+    # row is hidden for that step, so the trainer (which skips all-zero rows)
+    # never trains on actions the policy did not choose.
+    held = np.asarray(raw_config._values.get(
+        'curriculum_held_directions', ()), dtype=np.int64)
+    self._warmup_actions = held if held.size and held.any() else None
+    if self._warmup_actions is not None:
+      self._active_mask.fill(False)
     if self._frozen_defence_path is not None:
       self._frozen_state = {'lstm_h': None, 'lstm_c': None, 'done': None}
     if self._ball_potential_scale or self._player_potential_scale:
@@ -578,6 +604,11 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     actions[~episode_active_mask] = 0
     if self._frozen_defence_path is not None:
       actions[self._defending_rows()] = self._frozen_actions()
+    warmup = self._warmup_actions is not None
+    if warmup:
+      pressed = self._warmup_actions > 0
+      actions[pressed] = self._warmup_actions[pressed]
+      self._warmup_actions = None
     if self._observation == 'entities':
       entity_observation.press_buttons(self._sticky, actions)
     observations, _, done, info = self._env.step(actions)
@@ -648,6 +679,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
           'curriculum_distance_progress': distance_progress,
           'curriculum_template': float(self._episode_template),
           'curriculum_width_spawn': float(self._episode_width_spawn),
+          'curriculum_loose_ball': float(self._episode_loose_ball),
           'curriculum_attacking_left': float(self._attacking_left),
           'curriculum_frozen_defence': float(
               self._frozen_defence_path is not None),
@@ -672,6 +704,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._episode_length = 0
       self._possession_steps = 0
       self._advance_sum = 0.0
+    elif warmup:
+      # The held directions are pressed; the policy takes over from here.
+      self._set_active_players()
     self._write_observations(observations)
     return (self.observations, self.rewards, self.terminals,
             self.truncations, infos)
