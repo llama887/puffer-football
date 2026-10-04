@@ -10,6 +10,7 @@ import pufferlib
 import pufferlib.vector
 
 import gfootball.env as football_env
+from gfootball import adr
 from gfootball.env import entity_observation
 from gfootball.env import football_action_set
 from gfootball.env import wrappers
@@ -33,6 +34,9 @@ _BALL_STEP_SCALE = np.array([
     45.0 / 10.0,
 ], dtype=np.float32)
 _GOAL_HEIGHT = 2.5
+# frozen_defence_path value for the base random policy: uniform random
+# actions for the defending side, no snapshot file.
+RANDOM_DEFENCE = 'random'
 
 
 def _soft_scale(values, scale):
@@ -199,7 +203,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                player_potential_scale=0.0, spawn='curriculum',
                observation='simple115', player_potential_fade_speed=0.0,
                width_spawn_fraction=0.0, mixed_shape=False,
-               loose_ball_fraction=0.0):
+               loose_ball_fraction=0.0, adr_shared=None,
+               adr_probe_fraction=0.0):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     # 'simple115': simple115v2 made egocentric (and sorted); 'entities': the
@@ -237,6 +242,18 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._loose_ball_fraction = float(loose_ball_fraction)
     # Directions to press on the first step of a loose-ball episode.
     self._warmup_actions = None
+    # ADR (gfootball/adr.py): every episode samples its settings from ranges
+    # the trainer keeps in shared memory; a probe episode pins one setting's
+    # edge and is played against uniform random defenders.
+    if adr_shared is not None and env_name != ADVANTAGE_ENV_NAME:
+      raise ValueError('adr needs ' + ADVANTAGE_ENV_NAME)
+    if not 0 <= adr_probe_fraction <= 1:
+      raise ValueError('adr_probe_fraction must be in [0, 1]')
+    self._adr = (adr.AutomaticDomainRandomization(shared=adr_shared)
+                 if adr_shared is not None else None)
+    self._adr_probe_fraction = float(adr_probe_fraction)
+    self._adr_values = None
+    self._adr_probe = None
     # None: the frozen policy keeps memory for whole episodes.
     if frozen_defence_horizon is not None and frozen_defence_horizon < 1:
       raise ValueError('frozen_defence_horizon must be positive or None')
@@ -273,6 +290,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._env_name = env_name
     self._render = render
     self._seed = int(seed)
+    # Episode-level draws (ADR settings, probes, random defenders) use their
+    # own generator so they move nothing else.
+    self._episode_rng = np.random.default_rng([self._seed, 0xad5])
     self._frame_stack = frame_stack
     self._sort_players = bool(sort_players)
     self._curriculum_levels = int(curriculum_levels)
@@ -414,6 +434,15 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     if self._advantage_mode:
       self._env.unwrapped._config['advantage'] = advantage_for_level(
           self._curriculum_level, self._curriculum_levels)
+    if self._adr is not None:
+      self._adr_probe = None
+      if self._episode_rng.random() < self._adr_probe_fraction:
+        self._adr_values, index, edge = self._adr.sample_probe(
+            self._episode_rng)
+        self._adr_probe = (index, edge)
+      else:
+        self._adr_values = self._adr.sample(self._episode_rng)
+      self._env.unwrapped._config['adr_values'] = self._adr_values
     observations = self._from_engine(self._env.reset())
     self._sticky.fill(0)
     raw_config = self._env.unwrapped._config
@@ -462,9 +491,28 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         self._active_mask[
             defending_offset + np.asarray(
                 DEFENDER_ORDER[:defenders], dtype=np.intp)] = True
-    if self._frozen_defence_path is not None:
-      # The frozen side is acted by this worker, never by the caller.
+    if self._frozen_defence_path is not None or self._adr_probe is not None:
+      # The frozen (or random, in an ADR probe) side is acted by this worker,
+      # never by the caller, and is never trained.
       self._active_mask[self._defending_rows()] = False
+
+  def _adr_info(self):
+    """Episode-end ADR fields: whether it was a probe, which setting and
+    edge it tested (-1 if none) and every setting it was played with."""
+    if self._adr is None:
+      return {}
+    index, edge = self._adr_probe if self._adr_probe else (-1, -1)
+    info = {'adr_probe': float(self._adr_probe is not None),
+            'adr_parameter': float(index), 'adr_edge': float(edge)}
+    for name, value in self._adr_values.items():
+      info['adr_' + name] = float(value)
+    return info
+
+  def _random_defence(self):
+    """True when uniform random actions play the defending side: the
+    'random' frozen defence (the base random policy) or an ADR probe."""
+    return (self._frozen_defence_path == RANDOM_DEFENCE or
+            self._adr_probe is not None)
 
   def _load_frozen_policy(self):
     """Load the frozen defending policy once per reset (the snapshot changes
@@ -479,7 +527,11 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     return self._frozen_policy
 
   def _frozen_actions(self):
-    """Actions for the defending rows from the frozen policy."""
+    """Actions for the defending rows from the frozen policy, or uniform
+    random actions when the defence is random (_random_defence)."""
+    if self._random_defence():
+      return self._episode_rng.integers(
+          0, self.single_action_space.n, size=11)
     self._load_frozen_policy()
     torch = self._torch
     # Training without carried memory resets the recurrent state at the start
@@ -546,7 +598,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       normalize_egocentric(self.observations)
       if self._sort_players:
         sort_players_by_distance(self.observations)
-    if self._frozen_defence_path is not None:
+    if (self._frozen_defence_path is not None and
+        self._frozen_defence_path != RANDOM_DEFENCE):
       # The frozen side needs its own rows before they are hidden below, in
       # the observation its snapshot was trained on: the fixed gate opponent
       # is a simple115 policy, and every learner must face the same one.
@@ -602,7 +655,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
               casting='unsafe')
     actions = self._step_actions
     actions[~episode_active_mask] = 0
-    if self._frozen_defence_path is not None:
+    if self._frozen_defence_path is not None or self._adr_probe is not None:
       actions[self._defending_rows()] = self._frozen_actions()
     warmup = self._warmup_actions is not None
     if warmup:
@@ -680,6 +733,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
           'curriculum_template': float(self._episode_template),
           'curriculum_width_spawn': float(self._episode_width_spawn),
           'curriculum_loose_ball': float(self._episode_loose_ball),
+          **self._adr_info(),
           'curriculum_attacking_left': float(self._attacking_left),
           'curriculum_frozen_defence': float(
               self._frozen_defence_path is not None),

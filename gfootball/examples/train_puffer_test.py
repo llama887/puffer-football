@@ -429,6 +429,39 @@ def test_mixed_shape_reaches_the_gate_and_loose_balls_stay_in_training():
   assert 'loose_ball_fraction' not in make.call_args.kwargs
 
 
+def test_adr_is_opt_in_and_probe_results_move_the_shared_ranges():
+  """--adr is off by default; probe results in episode infos are recorded at
+  their setting's edge (other episodes are ignored), and the gate pool never
+  samples from the ADR ranges."""
+  from gfootball import adr
+  from gfootball.examples.train_puffer import (
+      _make_promotion_env, record_adr_probes)
+  defaults = build_parser().parse_args([])
+  assert defaults.adr is False
+  assert defaults.adr_probe_fraction == 0.2
+  assert defaults.adr_buffer_size == 64
+  assert (defaults.adr_low_threshold, defaults.adr_high_threshold) == (0.3, 0.6)
+  assert defaults.random_baseline_levels == '5,9,14'
+  randomizer = adr.AutomaticDomainRandomization(buffer_size=2)
+  index = adr.PARAMETER_INDEX['fetch_distance']
+  infos = [
+      {'adr_probe': 1.0, 'adr_parameter': float(index),
+       'adr_edge': float(adr.UPPER), 'curriculum_success': 1.0},
+      {'adr_probe': 0.0, 'adr_parameter': -1.0, 'adr_edge': -1.0,
+       'curriculum_success': 1.0},
+      {'curriculum_success': 0.0},
+      {'adr_probe': 1.0, 'adr_parameter': float(index),
+       'adr_edge': float(adr.UPPER), 'curriculum_success': 1.0},
+  ]
+  assert record_adr_probes(randomizer, infos) == 2
+  low, high = randomizer.ranges()[index]
+  assert high > adr.PARAMETERS[index].start and low == adr.PARAMETERS[index].start
+  args = build_parser().parse_args(['--adr'])
+  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
+    _make_promotion_env(args, SimpleNamespace(value=0))
+  assert 'adr_shared' not in make.call_args.kwargs
+
+
 def test_spawn_mode_defaults_to_curriculum_and_reaches_the_gate():
   """The gate must score on the same spawn distribution the policy trains on."""
   from gfootball.examples.train_puffer import _make_promotion_env

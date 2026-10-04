@@ -301,11 +301,14 @@ def _mixed_shape(positions, roles, ball_x, ball_y, direction, level, rng):
   return ahead
 
 
-def _keep_mixed_shape(spaced, roles, ahead, ball_x, ball_y, direction):
+def _keep_mixed_shape(spaced, roles, ahead, ball_x, ball_y, direction,
+                      lane=True):
   """Undo what the overlap relaxation did to the mixed shape.
 
-  Every attacker ends up onside and every attacker ahead of the ball clear
-  of the shooting lane; the chosen ones stay at least 0.025 ahead.
+  Every attacker ends up onside and, with `lane`, every attacker ahead of the
+  ball clear of the shooting lane; the chosen ones stay at least 0.025
+  ahead.  A race for a still ball passes lane=False: nobody is at the ball to
+  shoot, and sliding an attacker onto the lane edge would put him beside it.
   """
   forward = lambda x: direction * x - direction * ball_x
   depths = sorted([forward(spaced[i][0]) for i, role in enumerate(roles)
@@ -320,7 +323,8 @@ def _keep_mixed_shape(spaced, roles, ahead, ball_x, ball_y, direction):
       depth = max(depth, 0.025)
     depth = min(depth, line - 0.002) if depth > 0 else depth
     x = ball_x + direction * depth
-    if depth > 0.02 and _lane_gap(x, y, ball_x, ball_y, direction) <= 0:
+    if lane and depth > 0.02 and _lane_gap(x, y, ball_x, ball_y,
+                                           direction) <= 0:
       along = depth / (1.0 - direction * ball_x)
       centre = ball_y * (1.0 - along)
       side = 1.0 if y >= centre else -1.0
@@ -378,6 +382,124 @@ def _loose_ball(positions, roles, ball_x, ball_y, direction, level, rng):
   nearest = min(attackers, key=distance)
   positions[nearest] = _push_out(positions[nearest], ball_x, ball_y, fetch, rng)
   return fetch
+
+
+def _chance_count(value, rng):
+  """The whole part of `value`, plus one more with its fractional chance."""
+  whole = int(math.floor(value + 1e-9))
+  return whole + (1 if rng.random() < value - whole else 0)
+
+
+def _race_for_the_ball(positions, roles, ball_x, ball_y, fetch, head_start,
+                       rng):
+  """Nearest attacker exactly `fetch` from the ball, nearest outfield
+  defender exactly `fetch + head_start` (at least 0.03), everyone else of
+  each team at least that far.  The keepers are not moved."""
+  distance = lambda i: math.hypot(positions[i][0] - ball_x,
+                                  positions[i][1] - ball_y)
+  defender_reach = max(0.03, fetch + head_start)
+  for team, reach in (('attacker', fetch), ('defender', defender_reach)):
+    members = [i for i, role in enumerate(roles)
+               if (role == 'attacker') == (team == 'attacker')]
+    for i in members:
+      if distance(i) < reach:
+        positions[i] = _push_out(positions[i], ball_x, ball_y,
+                                 reach + rng.uniform(0.0, 0.05), rng)
+    nearest = min(members, key=distance)
+    positions[nearest] = _push_out(positions[nearest], ball_x, ball_y, reach,
+                                   rng)
+
+
+def _build_adr(builder, values, seed, episode, cycle, settings):
+  """A scene from explicit ADR settings (gfootball/adr.py) instead of a level.
+
+  The ball sits `ball_distance` from the attacked goal line at y
+  `ball_lateral`; the attackers start packed around it and the defence in
+  its formation, blended toward real match formations by `formation`; then
+  `blockers` goal-side blockers, `attackers_ahead` attackers between the ball
+  and the goal, the race for the ball (`fetch_distance`,
+  `defender_head_start`) and `held_share` of the outfield players holding a
+  direction.  Offside is on once the formation is a real match shape, with
+  every attacker placed onside.
+  """
+  rng = random.Random('{}:{}:adr'.format(seed, episode))
+  attack_right = (cycle // SPAWN_TEMPLATE_COUNT) % 2 == 0
+  values['curriculum_episode_attackers'] = 11
+  values['curriculum_episode_template'] = cycle % SPAWN_TEMPLATE_COUNT
+  builder._config['reverse_team_processing'] = not attack_right
+  direction = 1.0 if attack_right else -1.0
+  distance = float(settings['ball_distance'])
+  ball_x = direction * (1.0 - distance)
+  ball_y = float(settings['ball_lateral'])
+  builder.SetBallPosition(ball_x, ball_y)
+  formation = max(0.0, min(1.0, float(settings['formation'])))
+  progress = max(0.0, min(1.0, (distance - 0.1) / 0.9))
+  builder.config().game_duration = int(round(300 + 400 * progress))
+  builder.config().deterministic = False
+  builder.config().use_magnet = False
+  offsides = formation >= 0.9
+  builder.config().offsides = offsides
+  builder.config().end_episode_on_score = True
+  builder.config().end_episode_on_out_of_play = True
+
+  attacking_team = Team.e_Left if attack_right else Team.e_Right
+  goalside = max(0, min(10, _chance_count(float(settings['blockers']), rng)))
+  values['curriculum_goalside_defenders'] = goalside
+  blocker_side = 1.0 if rng.random() < 0.5 else -1.0
+  outfield = []
+  for team in (Team.e_Left, Team.e_Right):
+    attacking = team == attacking_team
+    for index, (standard_x, standard_y, role) in enumerate(_FORMATION):
+      if index == 0:
+        continue
+      rank = index - 1
+      standard = _to_team_coordinates(team, standard_x, standard_y)
+      if attacking and rank < 2:
+        position = _carrier_spawn(rank, ball_x, ball_y, direction, rng)
+      elif rank < goalside and not attacking:
+        position = _blocker_spawn(rank, ball_x, ball_y, direction,
+                                  blocker_side, rng)
+      else:
+        contested = (_ring_spawn(rank - 2, 0.0, ball_x, ball_y, direction, rng)
+                     if attacking else standard)
+        position = ((1 - formation) * contested[0] + formation * standard[0],
+                    (1 - formation) * contested[1] + formation * standard[1])
+      outfield.append((team, index, role, position[0], position[1]))
+
+  positions = [[row[3], row[4]] for row in outfield]
+  roles = ['attacker' if row[0] == attacking_team else
+           'blocker' if row[1] - 1 < goalside else 'defender'
+           for row in outfield]
+  ahead_count = min(_MIXED_MAX_AHEAD,
+                    _chance_count(float(settings['attackers_ahead']), rng))
+  ahead = (_mixed_shape(positions, roles, ball_x, ball_y, direction,
+                        ahead_count, rng) if ahead_count else [])
+  _race_for_the_ball(positions, roles, ball_x, ball_y,
+                     float(settings['fetch_distance']),
+                     float(settings['defender_head_start']), rng)
+  held = [0] * 22
+  held_share = float(settings['held_share'])
+  for row in outfield:
+    if rng.random() < held_share:
+      held[(0 if row[0] == Team.e_Left else 11) + row[1]] = rng.choice(
+          _DIRECTION_ACTIONS)
+  racing = float(settings['fetch_distance']) > 0.035
+  values['curriculum_loose_ball'] = racing
+  values['curriculum_held_directions'] = held
+  spaced = _separate([tuple(p) for p in positions])
+  if offsides or (ahead and not racing):
+    # In a race only offside matters (the race already placed everyone).
+    _keep_mixed_shape(spaced, roles, [] if racing else ahead, ball_x, ball_y,
+                      direction, lane=not racing)
+  for team in (Team.e_Left, Team.e_Right):
+    builder.SetTeam(team)
+    for index, (_, _, role) in enumerate(_FORMATION):
+      if index == 0:
+        builder.AddPlayer(-1.0, 0.0, role)
+        continue
+      position = next(spaced[k] for k, row in enumerate(outfield)
+                      if row[0] == team and row[1] == index)
+      builder.AddPlayer(*_to_team_coordinates(team, *position), role)
 
 
 def _build_uniform(builder, values, seed, episode, cycle):
@@ -442,6 +564,9 @@ def build_scenario(builder):
   values['curriculum_held_directions'] = [0] * 22
   if values.get('uniform_spawn', False):
     _build_uniform(builder, values, seed, episode, cycle)
+    return
+  if values.get('adr_values'):
+    _build_adr(builder, values, seed, episode, cycle, values['adr_values'])
     return
   attack_right = (cycle // SPAWN_TEMPLATE_COUNT) % 2 == 0
   template = cycle % SPAWN_TEMPLATE_COUNT

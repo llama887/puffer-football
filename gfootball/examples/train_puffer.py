@@ -24,7 +24,10 @@ import pufferlib
 from pufferlib import pufferl
 import pufferlib.pytorch
 
-from gfootball.env.puffer_env import make_vector_env
+from multiprocessing import RawValue
+
+from gfootball import adr
+from gfootball.env.puffer_env import RANDOM_DEFENCE, make_vector_env
 from gfootball.env import football_action_set
 # Re-exported: scripts and tests import the policy from this module.
 from gfootball.env.puffer_policy import (  # noqa: F401
@@ -489,6 +492,10 @@ class GraphedActor:
 class FootballPuffeRL(pufferl.PuffeRL):
   """PPO restricted to the agent rows the curriculum actually controls."""
 
+  # The ADR randomizer that records probe results (set by main with --adr).
+  # A class default, so trainers built without __init__ (tests) have it too.
+  adr = None
+
   # Loss statistics accumulated on the GPU inside the minibatch loop and read
   # back once, when the epoch is logged.
   LOSS_NAMES = ('policy_loss', 'value_loss', 'entropy', 'gradient_norm',
@@ -739,6 +746,8 @@ class FootballPuffeRL(pufferl.PuffeRL):
       self.match_block[match] = -1
 
     profile('eval_misc', epoch)
+    if self.adr is not None:
+      record_adr_probes(self.adr, info)
     for i in info:
       for k, v in pufferlib.unroll_nested_dict(i):
         if isinstance(v, np.ndarray):
@@ -1249,6 +1258,49 @@ def _run_promotion(args, policy, level_value, level, device, episodes,
       promotion_env.close()
 
 
+def record_adr_probes(randomizer, infos):
+  """Feed every finished ADR probe episode in `infos` to the randomizer.
+
+  A probe's info names the setting and edge it pinned and whether the
+  attack scored against the random defenders; other episodes are skipped.
+  Returns how many probes were recorded.
+  """
+  recorded = 0
+  for info in infos:
+    if info.get('adr_probe'):
+      randomizer.record(int(info['adr_parameter']), int(info['adr_edge']),
+                        info['curriculum_success'])
+      recorded += 1
+  return recorded
+
+
+def adr_metrics(randomizer):
+  """Both edges of every ADR range and the ADR entropy, for the logs."""
+  metrics = {'adr/entropy': randomizer.entropy()}
+  for parameter, (low, high) in zip(adr.PARAMETERS, randomizer.ranges()):
+    metrics['adr/{}/low'.format(parameter.name)] = float(low)
+    metrics['adr/{}/high'.format(parameter.name)] = float(high)
+  return metrics
+
+
+def random_baseline_metrics(args, policy, level_value):
+  """Score the policy against the base random policy at fixed levels.
+
+  Uniform random actions play the defending side on the gate's evaluation
+  scenes of each level in --random-baseline-levels.  The opponent and the
+  scenes never change, so the numbers compare across runs and over time.
+  """
+  metrics = {}
+  for level in [int(x) for x in args.random_baseline_levels.split(',') if x]:
+    level_value.value = level
+    result = _run_promotion(args, policy, level_value, level, args.device,
+                            args.random_baseline_episodes,
+                            frozen_defence_path=RANDOM_DEFENCE)
+    metrics['vs_random/level_{}/success_rate'.format(level)] = (
+        result['promotion_success_rate'])
+  return metrics
+
+
 def _prefixed(prefix, metrics):
   return {prefix + name: value for name, value in metrics.items()}
 
@@ -1394,6 +1446,27 @@ def build_parser():
                            'away, defenders farther on low levels, some '
                            'players on the touchlines and half holding a '
                            'direction (advantage env only)')
+  parser.add_argument('--adr', action=argparse.BooleanOptionalAction,
+                      default=False,
+                      help='automatic domain randomization (gfootball/adr.py) '
+                           'instead of the level curriculum: every episode '
+                           'samples its settings from ranges that grow and '
+                           'shrink with probe results; the level gate is off')
+  parser.add_argument('--adr-probe-fraction', type=float, default=0.2,
+                      help='share of episodes that probe one setting edge '
+                           'against uniform random defenders')
+  parser.add_argument('--adr-buffer-size', type=int, default=64,
+                      help='probe results per edge before it may move')
+  parser.add_argument('--adr-low-threshold', type=float, default=0.3,
+                      help='probe success at or below this shrinks the edge')
+  parser.add_argument('--adr-high-threshold', type=float, default=0.6,
+                      help='probe success at or above this grows the edge')
+  parser.add_argument('--random-baseline-levels', default='5,9,14',
+                      help='curriculum levels at which every check scores '
+                           'the policy against the base random policy '
+                           '(uniform random defenders); empty disables')
+  parser.add_argument('--random-baseline-episodes', type=int, default=64,
+                      help='episodes per level for the random baseline')
   parser.add_argument('--update-epochs', type=int, default=4,
                       help='optimizer steps per rollout; each step trains on '
                            'the whole rollout (the minibatch is the rollout)')
@@ -1624,6 +1697,13 @@ def main():
   torch.manual_seed(args.seed)
   np.random.seed(args.seed)
 
+  # ADR ranges live in shared memory: env workers sample from them, the
+  # trainer moves them from probe results.
+  adr_shared = None
+  if args.adr:
+    if args.env_name != ADVANTAGE_ENV_NAME:
+      raise ValueError('--adr needs --env-name ' + ADVANTAGE_ENV_NAME)
+    adr_shared = adr.shared_ranges()
   num_envs = args.num_workers * args.envs_per_worker
   env = make_vector_env(
       num_envs=num_envs, num_workers=args.num_workers, batch_size=num_envs,
@@ -1647,7 +1727,9 @@ def main():
       # A training distribution only: the gate keeps the level's own scenes.
       width_spawn_fraction=args.width_spawn_fraction,
       mixed_shape=args.mixed_shape,
-      loose_ball_fraction=args.loose_ball_fraction)
+      loose_ball_fraction=args.loose_ball_fraction,
+      adr_shared=adr_shared,
+      adr_probe_fraction=args.adr_probe_fraction if args.adr else 0.0)
   if not 0 <= args.start_level < args.curriculum_levels:
     raise ValueError('start-level must be inside the curriculum')
   # The launcher exports OMP_NUM_THREADS=1 so the env workers do not each
@@ -1689,6 +1771,11 @@ def main():
       'width_spawn_fraction': args.width_spawn_fraction,
       'mixed_shape': args.mixed_shape,
       'loose_ball_fraction': args.loose_ball_fraction,
+      'adr': args.adr,
+      'adr_probe_fraction': args.adr_probe_fraction,
+      'adr_buffer_size': args.adr_buffer_size,
+      'adr_thresholds': [args.adr_low_threshold, args.adr_high_threshold],
+      'random_baseline_levels': args.random_baseline_levels,
       'frozen_defence_gate': args.frozen_defence_gate,
       'greedy_promotion_episodes': args.greedy_promotion_episodes,
       'selfplay_promotion_episodes': args.selfplay_promotion_episodes,
@@ -1718,6 +1805,17 @@ def main():
       graph_actor=args.graph_actor,
       graph_update=args.graph_update,
       carry_memory=args.carry_lstm_memory)
+  if args.adr:
+    # Probe results arrive in episode infos, which only the asynchronous
+    # collector (the default) hands to the trainer as episodes finish.
+    if not trainer.async_collection:
+      raise ValueError('--adr needs --async-collection')
+    trainer.adr = adr.AutomaticDomainRandomization(
+        shared=adr_shared, buffer_size=args.adr_buffer_size,
+        low_threshold=args.adr_low_threshold,
+        high_threshold=args.adr_high_threshold)
+  # The random baseline's pool reads its level from here.
+  baseline_level = RawValue('i', 0)
   filler = None
   if args.gpu_filler and args.device == 'cuda':
     from gfootball.examples.gpu_filler import GpuFiller
@@ -1754,7 +1852,18 @@ def main():
         args.curriculum_success_threshold - args.promotion_early_abort_margin)
   try:
     while trainer.global_step < config['total_timesteps']:
-      if trainer.epoch % args.promotion_interval == 0:
+      if args.adr and trainer.epoch % args.promotion_interval == 0:
+        # No level gate under ADR: log the ranges and the random baseline.
+        started = time.time()
+        metrics = adr_metrics(trainer.adr)
+        metrics.update(random_baseline_metrics(
+            args, trainer.uncompiled_policy, baseline_level))
+        metrics['promotion_wall_seconds'] = time.time() - started
+        trainer.promotion_metrics = metrics
+        print('ADR {}'.format(json.dumps(
+            {'epoch': trainer.epoch, 'optimizer_steps': trainer.optimizer_steps,
+             **metrics}, sort_keys=True)), flush=True)
+      elif trainer.epoch % args.promotion_interval == 0:
         level = env.curriculum_level_value.value
         started = time.time()
         metrics = _run_promotion(
@@ -1778,6 +1887,9 @@ def main():
           metrics.update(_prefixed('selfplay_', _run_promotion(
               args, trainer.uncompiled_policy, env.curriculum_level_value,
               level, args.device, args.selfplay_promotion_episodes)))
+        if diagnostics:
+          metrics.update(random_baseline_metrics(
+              args, trainer.uncompiled_policy, baseline_level))
         metrics['promotion_wall_seconds'] = time.time() - started
         epochs_here = trainer.epoch - level_entry_epoch
         # The later levels are too hard to gate on mastery, so they advance on

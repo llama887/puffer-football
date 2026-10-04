@@ -663,6 +663,166 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       env.close()
 
+  def test_adr_values_build_the_scene_they_describe(self):
+    """With 'adr_values' the scene comes from explicit settings, not a level.
+
+    Each value is honoured: the ball's distance from the attacked goal line
+    and its y, the number of goal-side blockers (fractions add one by
+    chance), the nearest attacker's distance from the still ball (fetch
+    distance), the nearest outfield defender's extra distance (head start),
+    attackers ahead of the ball (onside, lane clear), the share of players
+    holding a direction, and offside once the formation is a real match
+    shape.  The level-0 starting values give a level-0 scene.
+    """
+    from gfootball import adr
+
+    def scene(values, seed):
+      cfg = _advantage_config(1.0, evaluation=False, seed=seed)
+      cfg['adr_values'] = values
+      cfg.NewScenario(seed % 7)
+      scenario = cfg.ScenarioConfig()
+      attack_right = scenario.ball_position[0] > 0
+      flip = 1.0 if attack_right else -1.0
+      left = [(flip * p.position[0], flip * p.position[1])
+              for p in scenario.left_team]
+      right = [(-flip * p.position[0], -flip * p.position[1])
+               for p in scenario.right_team]
+      attackers, defenders = (left, right) if attack_right else (right, left)
+      # Everything in the attacking team's frame (x toward its goal).
+      ball = (flip * scenario.ball_position[0],
+              flip * scenario.ball_position[1])
+      return cfg, scenario, ball, attackers, defenders
+
+    def nearest(team, ball):
+      return min(math.hypot(x - ball[0], y - ball[1]) for x, y in team)
+
+    start = {p.name: p.start for p in adr.PARAMETERS}
+    for seed in range(20):
+      cfg, scenario, ball, attackers, defenders = scene(start, seed)
+      self.assertAlmostEqual(ball[0], 0.9, places=6)
+      self.assertAlmostEqual(nearest(attackers[1:], ball), 0.03, delta=0.01)
+      self.assertEqual(cfg['curriculum_goalside_defenders'], 1)
+      # The level-0 ring is squeezed up to 0.04 (the room in front of the
+      # ball) ahead against the goal line;
+      # nobody is placed ahead of it.
+      self.assertEqual(sum(x > ball[0] + 0.05 for x, _ in attackers[1:]), 0)
+      self.assertEqual(list(cfg['curriculum_held_directions']), [0] * 22)
+      self.assertFalse(scenario.offsides)
+
+    values = dict(start, ball_distance=0.55, ball_lateral=-0.2, blockers=2.0,
+                  fetch_distance=0.4, defender_head_start=0.1,
+                  attackers_ahead=2.0, formation=0.5, held_share=1.0)
+    for seed in range(20):
+      cfg, scenario, ball, attackers, defenders = scene(values, seed)
+      self.assertAlmostEqual(ball[0], 0.45, places=6)
+      # ball_lateral is a pitch y, the same for both attack directions.
+      self.assertAlmostEqual(scenario.ball_position[1], -0.2, places=6)
+      self.assertEqual(cfg['curriculum_goalside_defenders'], 2)
+      self.assertAlmostEqual(nearest(attackers[1:], ball), 0.4, delta=0.02)
+      self.assertAlmostEqual(nearest(defenders[1:], ball), 0.5, delta=0.03)
+      held = list(cfg['curriculum_held_directions'])
+      self.assertEqual(held[0], 0)
+      self.assertEqual(held[11], 0)
+      self.assertEqual(sum(h > 0 for h in held), 20)
+      self.assertEqual(scenario.game_duration, 500)
+
+    counts = []
+    for seed in range(200):
+      cfg, scenario, ball, attackers, defenders = scene(
+          dict(start, blockers=1.5, attackers_ahead=1.5), seed)
+      counts.append(cfg['curriculum_goalside_defenders'])
+    self.assertBetween(np.mean(counts), 1.35, 1.65)
+
+    for seed in range(20):
+      cfg, scenario, ball, attackers, defenders = scene(
+          dict(start, ball_distance=0.9, formation=1.0, attackers_ahead=2.0),
+          seed)
+      self.assertTrue(scenario.offsides)
+      second_last = sorted(x for x, _ in defenders)[-2]
+      for x, _ in attackers:
+        self.assertLessEqual(x, max(ball[0], second_last) + 1e-6)
+
+  def test_adr_env_draws_each_episode_from_the_live_shared_ranges(self):
+    """An ADR env samples every episode from the shared ranges, so a range
+    the trainer moves takes effect at the next episode in every worker."""
+    from gfootball import adr
+    shared = adr.shared_ranges()
+    randomizer = adr.AutomaticDomainRandomization(shared=shared)
+    randomizer.set_range('ball_distance', 0.3, 0.3)
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=3,
+        curriculum_levels=ADVANTAGE_LEVELS, adr_shared=shared)
+    try:
+      env.reset()
+      ball = env._env.unwrapped._config.ScenarioConfig().ball_position[0]
+      # The engine rewrites the scenario in metres at reset (x * 54.4).
+      self.assertAlmostEqual(abs(ball) / 54.4, 0.7, places=4)
+      randomizer.set_range('ball_distance', 0.5, 0.5)
+      env.reset()
+      ball = env._env.unwrapped._config.ScenarioConfig().ball_position[0]
+      self.assertAlmostEqual(abs(ball) / 54.4, 0.5, places=4)
+    finally:
+      env.close()
+    with self.assertRaisesRegex(ValueError, 'adr'):
+      puffer_env.FootballPufferEnv(adr_shared=shared)  # not the advantage env
+    with self.assertRaisesRegex(ValueError, 'adr_probe_fraction'):
+      puffer_env.FootballPufferEnv(env_name=ADVANTAGE_ENV_NAME,
+                                   adr_shared=shared, adr_probe_fraction=1.5)
+
+  def test_adr_probe_episodes_play_random_defenders_outside_training(self):
+    """A probe episode pins one setting's edge, the defending side plays
+    uniform random actions with its rows hidden (so it is never trained),
+    and the episode end reports the setting, the edge and the result."""
+    from gfootball import adr
+    shared = adr.shared_ranges()
+    for fraction, probe in ((1.0, True), (0.0, False)):
+      env = puffer_env.FootballPufferEnv(
+          env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=11,
+          curriculum_levels=ADVANTAGE_LEVELS, adr_shared=shared,
+          adr_probe_fraction=fraction)
+      try:
+        observations, _ = env.reset()
+        defending = env._defending_rows()
+        attacking = slice(0, 11) if defending.start == 11 else slice(11, 22)
+        self.assertEqual(not np.any(observations[defending]), probe)
+        self.assertTrue(np.all(np.any(observations[attacking], axis=1)))
+        infos = []
+        for _ in range(800):
+          _, _, terminals, _, infos = env.step(np.zeros(22, dtype=np.int32))
+          if infos:
+            break
+        self.assertTrue(infos, 'episode must end')
+        info = infos[0]
+        self.assertEqual(info['adr_probe'], float(probe))
+        if probe:
+          self.assertIn(int(info['adr_parameter']), range(len(adr.PARAMETERS)))
+          self.assertIn(int(info['adr_edge']), (adr.LOWER, adr.UPPER))
+        else:
+          self.assertEqual(info['adr_edge'], -1.0)
+        self.assertIn('curriculum_success', info)
+        self.assertAlmostEqual(info['adr_ball_distance'], 0.10, places=6)
+      finally:
+        env.close()
+
+  def test_random_frozen_defence_needs_no_snapshot(self):
+    """frozen_defence_path='random' plays the defending side with uniform
+    random actions (the base random policy) and loads no file."""
+    env = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=4,
+        curriculum_levels=ADVANTAGE_LEVELS, frozen_defence_path='random',
+        curriculum_evaluation=True)
+    try:
+      observations, _ = env.reset()
+      self.assertFalse(np.any(observations[env._defending_rows()]))
+      drawn = np.concatenate([env._frozen_actions() for _ in range(50)])
+      self.assertEqual(drawn.shape, (550,))
+      self.assertGreater(len(set(drawn.tolist())), 15)
+      self.assertTrue(np.all((drawn >= 0) & (drawn < 19)))
+      for _ in range(20):
+        env.step(np.zeros(22, dtype=np.int32))
+    finally:
+      env.close()
+
   def test_width_spawn_fraction_reaches_the_scenario(self):
     env = puffer_env.FootballPufferEnv(
         env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=3,

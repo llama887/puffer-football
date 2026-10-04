@@ -93,6 +93,20 @@ fi
 # Share of training episodes that open as a race for a still ball (dead-ball
 # practice); the gate never uses it.  0 disables.
 LOOSE_BALL_FRACTION=${LOOSE_BALL_FRACTION:-0}
+# ADR=1: automatic domain randomization instead of the level curriculum
+# (gfootball/adr.py); the level gate is off and ranges grow and shrink with
+# probe episodes against uniform random defenders.
+ADR=${ADR:-0}
+ADR_ARGS=(--no-adr)
+if [[ $ADR == 1 ]]; then
+  ADR_ARGS=(--adr --adr-probe-fraction "${ADR_PROBE_FRACTION:-0.2}"
+            --adr-buffer-size "${ADR_BUFFER_SIZE:-64}"
+            --adr-low-threshold "${ADR_LOW_THRESHOLD:-0.3}"
+            --adr-high-threshold "${ADR_HIGH_THRESHOLD:-0.6}")
+fi
+# Levels at which every check scores the policy against uniform random
+# defenders (the base random policy); empty disables.
+RANDOM_BASELINE_LEVELS=${RANDOM_BASELINE_LEVELS-5,9,14}
 # Optimizer steps per rollout.  Each step trains on the whole rollout (one
 # segment per agent, ~0.6 GB on the GPU at 46 matches), so there is no
 # minibatch size to set.
@@ -311,6 +325,8 @@ cd "$RUN_ROOT"
   --width-spawn-fraction "$WIDTH_SPAWN_FRACTION" \
   "${MIXED_SHAPE_ARGS[@]}" \
   --loose-ball-fraction "$LOOSE_BALL_FRACTION" \
+  "${ADR_ARGS[@]}" \
+  --random-baseline-levels "$RANDOM_BASELINE_LEVELS" \
   --gae-lambda "$GAE_LAMBDA" \
   --update-epochs "$UPDATE_EPOCHS" \
   --bptt-horizon "$BPTT_HORIZON" \
