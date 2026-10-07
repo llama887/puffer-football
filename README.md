@@ -339,6 +339,148 @@ to the ball (including the goalkeeper, ignoring absent players), in pitch
 half-length units with the engine's x/y scales accounted for.  Unlike the
 ball term it is not zero-sum.  Both scales default to zero.  See
 [Ng, Harada and Russell (1999)](https://ai.stanford.edu/~ang/papers/shaping-icml99.pdf).
+`PLAYER_POTENTIAL_FADE_SPEED=v` fades the player term to zero as the ball's
+speed reaches `v` (ball-direction units: a dribbled ball stays under about
+0.27, a struck one is about 1), so a kick costs no potential.
+
+Dead-ball practice (all off by default; on three transformer seeds none
+clearly beat the plain run below, whose seed spread was as large as any gap):
+`WIDTH_SPAWN_FRACTION` spreads that share of training episodes' outfield
+players across the pitch width; `MIXED_SHAPE=1` puts some attackers ahead of
+the ball, onside, from level 1 (the gate plays it too); and
+`LOOSE_BALL_FRACTION` opens that share of training episodes as a race for a
+still ball, with some players already holding a direction.
+
+#### Replicating the best run so far
+
+The strongest run before ADR is the entity-observation transformer on the
+level curriculum with ball shaping only: the October 2 control arm, seed 2
+(`/scratch/fyy2003/experiments/football-selfplay-19011722-2`, 5B agent steps,
+about 24 h on one GPU and 48 CPUs).  It entered level 16 of 0-20 and, against
+the fixed defender (see [Scoring runs](#scoring-runs-against-a-fixed-defence)),
+scored 0.87 / 0.33 / 0.56 at levels 5 / 9 / 14, the mean of checkpoints 140k,
+147k and final.  Its final checkpoint is
+`checkpoints/x3bep4me.pt` in that run directory.  The settings are the
+September 29 study's best transformer (trial 3) without annealing:
+
+```shell
+cd /scratch/$USER/repos/football
+sbatch --array=2 --account=<account> --job-name=football-tf-control \
+  --export=ALL,TOTAL_TIMESTEPS=5000000000,SEED_BASE=20261002,OBSERVATION=entities,NETWORK=transformer,LEARNING_RATE=0.000543,ENT_COEF=0.00159,GAMMA=0.995,GAE_LAMBDA=0.927,CLIP_COEF=0.132,VF_COEF=0.428,UPDATE_EPOCHS=3,BALL_POTENTIAL=0.5,ANNEAL_LR=0 \
+  sbatch/train_selfplay.sbatch
+```
+
+Array task 2 with `SEED_BASE=20261002` is seed 20261004.  The run used commit
+24eea79; everything added since is off by default, so the current code trains
+the same way (it only adds the random-defender evaluation to the logs).  It cannot be replayed bit for bit (asynchronous collection
+takes whichever workers are ready first), and the seed matters as much as
+any setting: the same command scored 0.72 / 0.26 / 0.13 on task 0 and
+0.52 / 0.21 / 0.08 on task 1.  Run `--array=0-2` and compare the means
+(0.70 / 0.27 / 0.26 for this arm) rather than chasing one seed.  When
+launching from a study snapshot without its own `.venv`, add
+`ENV_PREFIX=/scratch/$USER/repos/football/.venv` to the exports.
+
+#### Automatic domain randomization (ADR)
+
+`ADR=1` replaces the level curriculum with automatic domain randomization
+(OpenAI, "Solving Rubik's Cube with a Robot Hand", 2019, Section 5;
+`gfootball/adr.py`).  Eight scene settings each get a range that starts at
+the level-0 value: ball distance from the goal line, ball lateral position,
+goal-side blockers, fetch distance to a still ball, the defence's head start
+in the race for it, attackers ahead of the ball, how far the formations are
+from the packed level-0 shape (0) toward real match formations (1), and the
+share of players already holding a direction.  Every training episode draws
+each setting uniformly from its range, so easy scenes stay in the mix.
+
+`ADR_PROBE_FRACTION` (0.2) of episodes are probes: one setting is pinned at
+one edge of its range, and the attack plays against the probe defence, whose
+rows are hidden from training.  After `ADR_BUFFER_SIZE` (64) probes at an
+edge, a success rate of at least `ADR_HIGH_THRESHOLD` (0.6) moves that edge
+outward one step and at most `ADR_LOW_THRESHOLD` (0.3) moves it inward.  The
+level gate is off.
+
+The probe defence matters.  With the default `ADR_PROBE_DEFENCE=random`
+(uniform random defenders, which score the same as defenders standing
+still), the October 4 runs pushed every defensive setting to its limit by
+epoch ~12k of 154k: against random defenders, five blockers cost the attack
+nothing (0.61 with 0 or 5) and real formations even look easier.  Against a
+trained defence the same edges separate (formation 0.55 vs 0.34, head start
+0.56 vs 0.25).  So `ADR_PROBE_DEFENCE` can be a policy file instead.  It is
+copied to `<run>/checkpoints/adr_probe_defence.pt` and, every
+`ADR_PROBE_REFRESH_INTERVAL` epochs (1000, a multiple of the 100-epoch log
+interval), the learner attacks it and its own defence on the
+`RANDOM_BASELINE_LEVELS` scenes.  Once the learner scores at least
+`ADR_PROBE_REFRESH_MARGIN` (0.1) more against the probe defence, the learner's
+current weights replace it (copies are kept as
+`adr_probe_defence_epoch<N>.pt`); the env workers reload it at their next
+probe.
+
+To run ADR with a snapshot probe defence, seeded like the run above, starting
+the probe defence from the October 4 ADR seed-0 final:
+
+```shell
+sbatch --array=0-2 --account=<account> --job-name=football-tf-adr-probe \
+  --export=ALL,TOTAL_TIMESTEPS=5000000000,SEED_BASE=20261002,OBSERVATION=entities,NETWORK=transformer,LEARNING_RATE=0.000543,ENT_COEF=0.00159,GAMMA=0.995,GAE_LAMBDA=0.927,CLIP_COEF=0.132,VF_COEF=0.428,UPDATE_EPOCHS=3,BALL_POTENTIAL=0.5,ANNEAL_LR=0,ADR=1,ADR_PROBE_DEFENCE=/scratch/fyy2003/experiments/football-adr-probe-snapshot-20261007/probe_defence_init.pt \
+  sbatch/train_selfplay.sbatch
+```
+
+Leave out `ADR_PROBE_DEFENCE` for the random-probe version.  Every 100
+epochs the log prints an `ADR {json}` line: both edges of every range
+(`adr/<setting>/low`, `.../high`), the ADR entropy (mean log range width),
+`vs_random/level_<L>/success_rate` against uniform random defenders at
+`RANDOM_BASELINE_LEVELS` (5, 9, 14; every run logs these, ADR or not), and on
+refresh epochs `adr_probe/vs_probe`, `adr_probe/vs_self` and
+`adr_probe/replaced`.  The snapshot probe defence costs about 5% of
+throughput (the transformer runs on the env workers' CPUs during probes).
+
+Results so far, against the fixed defender at levels 5 / 9 / 14 (three seeds,
+mean of checkpoints 140k, 147k and final):
+
+| Run | L5 | L9 | L14 | L14 by seed |
+|---|---|---|---|---|
+| Level curriculum (control) | 0.70 | 0.27 | 0.26 | 0.13 / 0.08 / 0.56 |
+| ADR, random probes (October 4) | 0.59 | 0.32 | 0.19 | 0.21 / 0.18 / 0.19 |
+
+Random-probe ADR is steadier across seeds and the only change so far that
+cut dead-ball episodes (by 35-40%), but it is weaker at level 5: once the
+ranges saturate, scenes near the goal are rare.  The snapshot-probe runs
+(October 7) are in
+`/scratch/fyy2003/experiments/football-adr-probe-snapshot-20261007`.
+
+#### Scoring runs against a fixed defence
+
+Gate numbers are against each run's own snapshots, so they do not compare
+across runs.  `scripts/attack_vs_defence.py` plays a checkpoint's attack
+against a chosen defence on the same scenes every time, and
+`sbatch/attack_vs_defence.sbatch` runs one row of a config file per array
+task.  Runs above are scored at levels 5, 9 and 14, 128 episodes, seed
+4242, against the fixed defender
+`/scratch/fyy2003/experiments/football-selfplay-18794847-1/checkpoints/yxu10gg8/model_153674.pt`
+(the September 29 simple115 MLP, seed 1, final), for checkpoints 140000,
+147000 and the final one.  For example, the best run's final checkpoint:
+
+```shell
+FIXED=/scratch/fyy2003/experiments/football-selfplay-18794847-1/checkpoints/yxu10gg8/model_153674.pt
+RUN=/scratch/fyy2003/experiments/football-selfplay-19011722-2/checkpoints/x3bep4me
+for L in 5 9 14; do
+  echo "best_L$L $RUN/model_153670.pt $FIXED level:$L"
+done > /scratch/$USER/configs.txt
+sbatch --array=0-2 --account=<account> \
+  --export=ALL,CONFIGS=/scratch/$USER/configs.txt,OUT=/scratch/$USER/scores \
+  sbatch/attack_vs_defence.sbatch
+```
+
+With seed 4242 this reproduces the recorded scores exactly (0.930 at level 5
+for that checkpoint).  Each task writes `OUT/<label>.json` and prints a
+`SUMMARY {json}` line with
+the goal rate (`scored`) and how the defence played: `regained` (it won the
+ball), `goal_side` (outfield defenders between the ball and their goal while
+the attack has it) and `pressure` (nearest defender's distance to the ball).
+The defence can also be `self`, `random` or `idle`, and the scene
+`adr:start`, `adr:full` or `adr:pin:<setting>:<0|1>` (an ADR probe);
+`ADR_LOG=<training log>` takes the ADR ranges from that run's last `ADR`
+line.  `VIDEO=1` renders every episode to webm, which needs a GPU node for
+EGL: add `--gres=gpu:1 --partition=h100_tandon,a100_tandon`.
 
 #### Tuning level 0 with Optuna
 
