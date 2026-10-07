@@ -6,6 +6,7 @@ during promotion evaluation.  Keeping it here avoids importing the whole PPO
 loop (and PufferLib's trainer) inside every environment process.
 """
 
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -377,9 +378,16 @@ def network_from_state_dict(state_dict):
 
 
 def save_policy_snapshot(policy, path):
-  """Write a CPU copy of the weights that any process can load."""
+  """Write a CPU copy of the weights that any process can load.
+
+  The file is written beside `path` and renamed over it, so env workers
+  that reload a snapshot while the trainer replaces it (the level gate's
+  frozen defence, the ADR probe defence) never read a half-written file.
+  """
+  partial = '{}.tmp{}'.format(path, os.getpid())
   torch.save({key: value.detach().cpu()
-              for key, value in policy.state_dict().items()}, path)
+              for key, value in policy.state_dict().items()}, partial)
+  os.replace(partial, path)
 
 
 def load_frozen_policy(path, env):

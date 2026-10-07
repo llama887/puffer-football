@@ -1262,7 +1262,7 @@ def record_adr_probes(randomizer, infos):
   """Feed every finished ADR probe episode in `infos` to the randomizer.
 
   A probe's info names the setting and edge it pinned and whether the
-  attack scored against the random defenders; other episodes are skipped.
+  attack scored against the probe defence; other episodes are skipped.
   Returns how many probes were recorded.
   """
   recorded = 0
@@ -1281,6 +1281,41 @@ def adr_metrics(randomizer):
     metrics['adr/{}/low'.format(parameter.name)] = float(low)
     metrics['adr/{}/high'.format(parameter.name)] = float(high)
   return metrics
+
+
+def refresh_adr_probe_defence(args, policy, level_value, probe_path):
+  """Replace the ADR probe defence with the learner once it outgrows it.
+
+  ADR probes judge each range edge by how often the attack scores against
+  the probe defence.  Random defenders cannot sense defensive settings
+  (blockers, formation), and a fixed snapshot stops sensing them once the
+  learner's own defence is stronger, so the ranges saturate.  This plays the
+  learner's attack against the probe defence and against its own
+  (self-play) defence on the same scenes, the gate's evaluation scenes of
+  each --random-baseline-levels level; when the probe defence concedes at
+  least --adr-probe-refresh-margin more, the learner's current weights
+  overwrite `probe_path` (atomically: env workers reload it at their next
+  probe episode).
+
+  Returns metrics: both success rates, averaged over the levels, and
+  whether the defence was replaced.
+  """
+  levels = [int(x) for x in args.random_baseline_levels.split(',') if x]
+  rates = {'vs_probe': [], 'vs_self': []}
+  for level in levels:
+    level_value.value = level
+    for name, defence in (('vs_probe', probe_path), ('vs_self', None)):
+      result = _run_promotion(args, policy, level_value, level, args.device,
+                              args.random_baseline_episodes,
+                              frozen_defence_path=defence)
+      rates[name].append(result['promotion_success_rate'])
+  vs_probe, vs_self = float(np.mean(rates['vs_probe'])), float(
+      np.mean(rates['vs_self']))
+  replaced = vs_probe - vs_self >= args.adr_probe_refresh_margin
+  if replaced:
+    save_policy_snapshot(policy, probe_path)
+  return {'adr_probe/vs_probe': vs_probe, 'adr_probe/vs_self': vs_self,
+          'adr_probe/replaced': float(replaced)}
 
 
 def random_baseline_metrics(args, policy, level_value):
@@ -1454,7 +1489,20 @@ def build_parser():
                            'shrink with probe results; the level gate is off')
   parser.add_argument('--adr-probe-fraction', type=float, default=0.2,
                       help='share of episodes that probe one setting edge '
-                           'against uniform random defenders')
+                           'against the probe defence')
+  parser.add_argument('--adr-probe-defence', default=RANDOM_DEFENCE,
+                      help="who defends ADR probes: 'random' (uniform "
+                           'random defenders) or a policy snapshot, copied '
+                           'to <data-dir>/adr_probe_defence.pt and replaced '
+                           'by the learner when it outgrows it '
+                           '(refresh_adr_probe_defence)')
+  parser.add_argument('--adr-probe-refresh-interval', type=int, default=1000,
+                      help='epochs between checks that may replace a '
+                           'snapshot probe defence; 0 never replaces it')
+  parser.add_argument('--adr-probe-refresh-margin', type=float, default=0.1,
+                      help='replace the probe defence once the learner '
+                           'scores at least this much more against it than '
+                           'against its own defence')
   parser.add_argument('--adr-buffer-size', type=int, default=64,
                       help='probe results per edge before it may move')
   parser.add_argument('--adr-low-threshold', type=float, default=0.3,
@@ -1700,10 +1748,19 @@ def main():
   # ADR ranges live in shared memory: env workers sample from them, the
   # trainer moves them from probe results.
   adr_shared = None
+  adr_probe_defence = RANDOM_DEFENCE
   if args.adr:
     if args.env_name != ADVANTAGE_ENV_NAME:
       raise ValueError('--adr needs --env-name ' + ADVANTAGE_ENV_NAME)
     adr_shared = adr.shared_ranges()
+    if args.adr_probe_defence != RANDOM_DEFENCE:
+      # Refreshes are checked on the ADR log epochs only.
+      if args.adr_probe_refresh_interval % args.promotion_interval:
+        raise ValueError('--adr-probe-refresh-interval must be a multiple '
+                         'of --promotion-interval')
+      # A copy, so a refresh replaces it without touching the original.
+      adr_probe_defence = os.path.join(args.data_dir, 'adr_probe_defence.pt')
+      shutil.copyfile(args.adr_probe_defence, adr_probe_defence)
   num_envs = args.num_workers * args.envs_per_worker
   env = make_vector_env(
       num_envs=num_envs, num_workers=args.num_workers, batch_size=num_envs,
@@ -1729,7 +1786,10 @@ def main():
       mixed_shape=args.mixed_shape,
       loose_ball_fraction=args.loose_ball_fraction,
       adr_shared=adr_shared,
-      adr_probe_fraction=args.adr_probe_fraction if args.adr else 0.0)
+      adr_probe_fraction=args.adr_probe_fraction if args.adr else 0.0,
+      adr_probe_defence=adr_probe_defence,
+      # A snapshot probe defence replays the memory this run trains with.
+      frozen_defence_horizon=memory_window(args))
   if not 0 <= args.start_level < args.curriculum_levels:
     raise ValueError('start-level must be inside the curriculum')
   # The launcher exports OMP_NUM_THREADS=1 so the env workers do not each
@@ -1775,6 +1835,9 @@ def main():
       'adr_probe_fraction': args.adr_probe_fraction,
       'adr_buffer_size': args.adr_buffer_size,
       'adr_thresholds': [args.adr_low_threshold, args.adr_high_threshold],
+      'adr_probe_defence': args.adr_probe_defence,
+      'adr_probe_refresh_interval': args.adr_probe_refresh_interval,
+      'adr_probe_refresh_margin': args.adr_probe_refresh_margin,
       'random_baseline_levels': args.random_baseline_levels,
       'frozen_defence_gate': args.frozen_defence_gate,
       'greedy_promotion_episodes': args.greedy_promotion_episodes,
@@ -1858,6 +1921,17 @@ def main():
         metrics = adr_metrics(trainer.adr)
         metrics.update(random_baseline_metrics(
             args, trainer.uncompiled_policy, baseline_level))
+        if (adr_probe_defence != RANDOM_DEFENCE and trainer.epoch > 0 and
+            args.adr_probe_refresh_interval > 0 and
+            trainer.epoch % args.adr_probe_refresh_interval == 0):
+          metrics.update(refresh_adr_probe_defence(
+              args, trainer.uncompiled_policy, baseline_level,
+              adr_probe_defence))
+          if metrics['adr_probe/replaced']:
+            # Keep every probe defence the run has used.
+            shutil.copyfile(adr_probe_defence, os.path.join(
+                args.data_dir,
+                'adr_probe_defence_epoch{}.pt'.format(trainer.epoch)))
         metrics['promotion_wall_seconds'] = time.time() - started
         trainer.promotion_metrics = metrics
         print('ADR {}'.format(json.dumps(

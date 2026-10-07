@@ -95,14 +95,20 @@ fi
 LOOSE_BALL_FRACTION=${LOOSE_BALL_FRACTION:-0}
 # ADR=1: automatic domain randomization instead of the level curriculum
 # (gfootball/adr.py); the level gate is off and ranges grow and shrink with
-# probe episodes against uniform random defenders.
+# probe episodes.  ADR_PROBE_DEFENCE defends the probes: 'random' (uniform
+# random defenders) or a policy file, which the learner replaces once it
+# scores ADR_PROBE_REFRESH_MARGIN more against it than against its own
+# defence (checked every ADR_PROBE_REFRESH_INTERVAL epochs).
 ADR=${ADR:-0}
 ADR_ARGS=(--no-adr)
 if [[ $ADR == 1 ]]; then
   ADR_ARGS=(--adr --adr-probe-fraction "${ADR_PROBE_FRACTION:-0.2}"
             --adr-buffer-size "${ADR_BUFFER_SIZE:-64}"
             --adr-low-threshold "${ADR_LOW_THRESHOLD:-0.3}"
-            --adr-high-threshold "${ADR_HIGH_THRESHOLD:-0.6}")
+            --adr-high-threshold "${ADR_HIGH_THRESHOLD:-0.6}"
+            --adr-probe-defence "${ADR_PROBE_DEFENCE:-random}"
+            --adr-probe-refresh-interval "${ADR_PROBE_REFRESH_INTERVAL:-1000}"
+            --adr-probe-refresh-margin "${ADR_PROBE_REFRESH_MARGIN:-0.1}")
 fi
 # Levels at which every check scores the policy against uniform random
 # defenders (the base random policy); empty disables.

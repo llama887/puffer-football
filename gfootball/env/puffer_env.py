@@ -2,6 +2,7 @@
 
 from collections import deque
 from functools import partial
+import os
 
 import gymnasium
 import numpy as np
@@ -204,7 +205,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                observation='simple115', player_potential_fade_speed=0.0,
                width_spawn_fraction=0.0, mixed_shape=False,
                loose_ball_fraction=0.0, adr_shared=None,
-               adr_probe_fraction=0.0):
+               adr_probe_fraction=0.0, adr_probe_defence=RANDOM_DEFENCE):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     # 'simple115': simple115v2 made egocentric (and sorted); 'entities': the
@@ -244,7 +245,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._warmup_actions = None
     # ADR (gfootball/adr.py): every episode samples its settings from ranges
     # the trainer keeps in shared memory; a probe episode pins one setting's
-    # edge and is played against uniform random defenders.
+    # edge and is played against `adr_probe_defence`: uniform random
+    # defenders ('random') or a snapshot file, reloaded whenever the trainer
+    # replaces it.
     if adr_shared is not None and env_name != ADVANTAGE_ENV_NAME:
       raise ValueError('adr needs ' + ADVANTAGE_ENV_NAME)
     if not 0 <= adr_probe_fraction <= 1:
@@ -252,6 +255,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._adr = (adr.AutomaticDomainRandomization(shared=adr_shared)
                  if adr_shared is not None else None)
     self._adr_probe_fraction = float(adr_probe_fraction)
+    self._adr_probe_defence = adr_probe_defence
     self._adr_values = None
     self._adr_probe = None
     # None: the frozen policy keeps memory for whole episodes.
@@ -322,7 +326,13 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     # hidden from the caller exactly like inactive curriculum players.
     self._frozen_defence_path = frozen_defence_path
     self._frozen_defence_horizon = frozen_defence_horizon
+    # Who defends the current episode, set at each reset: None (the caller,
+    # self-play), RANDOM_DEFENCE, or a snapshot path (the frozen defence for
+    # every episode, or the ADR probe defence for probe episodes only).
+    self._episode_defence = frozen_defence_path
     self._frozen_policy = None
+    # (path, inode, mtime) of the file _frozen_policy was loaded from.
+    self._frozen_policy_source = None
     self._frozen_state = None
     self._frozen_steps = 0
     self._full_observations = None
@@ -443,6 +453,20 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       else:
         self._adr_values = self._adr.sample(self._episode_rng)
       self._env.unwrapped._config['adr_values'] = self._adr_values
+    self._episode_defence = (self._adr_probe_defence
+                             if self._adr_probe is not None
+                             else self._frozen_defence_path)
+    if self._episode_defence not in (None, RANDOM_DEFENCE):
+      # Reload a snapshot replaced on disk since it was loaded: the level gate
+      # rewrites its snapshot when a level is cleared and the trainer
+      # refreshes the ADR probe defence.  Writers replace the file atomically
+      # (save_policy_snapshot), so new weights always come with a new inode.
+      # Checked once per episode, not per step, to spare the file system.
+      stat = os.stat(self._episode_defence)
+      source = (self._episode_defence, stat.st_ino, stat.st_mtime_ns)
+      if source != self._frozen_policy_source:
+        self._frozen_policy = None
+        self._frozen_policy_source = source
     observations = self._from_engine(self._env.reset())
     self._sticky.fill(0)
     raw_config = self._env.unwrapped._config
@@ -467,7 +491,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._warmup_actions = held if held.size and held.any() else None
     if self._warmup_actions is not None:
       self._active_mask.fill(False)
-    if self._frozen_defence_path is not None:
+    if self._episode_defence is not None:
       self._frozen_state = {'lstm_h': None, 'lstm_c': None, 'done': None}
     if self._ball_potential_scale or self._player_potential_scale:
       self._set_potentials(observations)
@@ -491,8 +515,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         self._active_mask[
             defending_offset + np.asarray(
                 DEFENDER_ORDER[:defenders], dtype=np.intp)] = True
-    if self._frozen_defence_path is not None or self._adr_probe is not None:
-      # The frozen (or random, in an ADR probe) side is acted by this worker,
+    if self._episode_defence is not None:
+      # The frozen, random or ADR probe defence is acted by this worker,
       # never by the caller, and is never trained.
       self._active_mask[self._defending_rows()] = False
 
@@ -509,26 +533,31 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     return info
 
   def _random_defence(self):
-    """True when uniform random actions play the defending side: the
-    'random' frozen defence (the base random policy) or an ADR probe."""
-    return (self._frozen_defence_path == RANDOM_DEFENCE or
-            self._adr_probe is not None)
+    """True when uniform random actions play the defending side this
+    episode: the 'random' frozen defence (the base random policy) or an ADR
+    probe against the default random probe defence."""
+    return self._episode_defence == RANDOM_DEFENCE
 
   def _load_frozen_policy(self):
-    """Load the frozen defending policy once per reset (the snapshot changes
-    on disk when a level is cleared), single threaded on the CPU."""
+    """The episode's defending snapshot, single threaded on the CPU.
+
+    Loaded on first use and kept until _reset_match finds the file replaced
+    on disk (or a reseeding reset() clears it); the per-step callers only
+    read the cached policy.
+    """
     if self._frozen_policy is None:
       import torch
       from gfootball.env.puffer_policy import load_frozen_policy
       torch.set_num_threads(1)
       self._torch = torch
-      self._frozen_policy = load_frozen_policy(self._frozen_defence_path, self)
+      self._frozen_policy = load_frozen_policy(self._episode_defence, self)
       self._frozen_generator = torch.Generator().manual_seed(self._seed)
     return self._frozen_policy
 
   def _frozen_actions(self):
-    """Actions for the defending rows from the frozen policy, or uniform
-    random actions when the defence is random (_random_defence)."""
+    """Actions for the defending rows from the episode's snapshot defence,
+    or uniform random actions when the defence is random
+    (_random_defence)."""
     if self._random_defence():
       return self._episode_rng.integers(
           0, self.single_action_space.n, size=11)
@@ -598,8 +627,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       normalize_egocentric(self.observations)
       if self._sort_players:
         sort_players_by_distance(self.observations)
-    if (self._frozen_defence_path is not None and
-        self._frozen_defence_path != RANDOM_DEFENCE):
+    if self._episode_defence not in (None, RANDOM_DEFENCE):
       # The frozen side needs its own rows before they are hidden below, in
       # the observation its snapshot was trained on: the fixed gate opponent
       # is a simple115 policy, and every learner must face the same one.
@@ -630,8 +658,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       config['episode_number'] = self._initial_episode_number
       self._curriculum_results.clear()
     if self._frozen_defence_path is not None:
-      # A persistent promotion pool outlives promotions; the snapshot on disk
-      # changes when a level is cleared, so reload it on every reset.
+      # A persistent promotion pool replays the same episodes on every
+      # reset: reload the snapshot so its sampling generator restarts from
+      # the seed too.
       self._frozen_policy = None
       self._frozen_steps = 0
     self._write_observations(self._reset_match())
@@ -655,7 +684,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
               casting='unsafe')
     actions = self._step_actions
     actions[~episode_active_mask] = 0
-    if self._frozen_defence_path is not None or self._adr_probe is not None:
+    if self._episode_defence is not None:
       actions[self._defending_rows()] = self._frozen_actions()
     warmup = self._warmup_actions is not None
     if warmup:

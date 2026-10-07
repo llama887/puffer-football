@@ -804,6 +804,55 @@ class PufferEnvTest(absltest.TestCase):
       finally:
         env.close()
 
+  def test_adr_probe_defence_snapshot_plays_probes_and_reloads_when_replaced(
+      self):
+    """With adr_probe_defence set to a snapshot, probe episodes are defended
+    by that snapshot instead of random actions (its rows hidden, so it is
+    never trained), training episodes stay self-play, and a snapshot replaced
+    on disk takes over at the next episode: that is how the trainer
+    refreshes the probe opponent."""
+    from gfootball import adr
+    spaces = SimpleNamespace(
+        single_observation_space=gymnasium.spaces.Box(
+            low=-1, high=1, shape=(115,), dtype=np.float32),
+        single_action_space=gymnasium.spaces.Discrete(19))
+
+    def save_always(action, path):
+      policy = FootballPolicy(spaces, hidden_size=16)
+      with torch.no_grad():
+        policy.actor.weight.zero_()
+        policy.actor.bias.fill_(-50.0)
+        policy.actor.bias[action] = 50.0
+      save_policy_snapshot(policy, path)
+
+    snapshot = self.create_tempfile('probe_defence.pt').full_path
+    save_always(5, snapshot)
+    shared = adr.shared_ranges()
+    probing = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=11,
+        curriculum_levels=ADVANTAGE_LEVELS, adr_shared=shared,
+        adr_probe_fraction=1.0, adr_probe_defence=snapshot)
+    try:
+      observations, _ = probing.reset()
+      self.assertFalse(np.any(observations[probing._defending_rows()]))
+      np.testing.assert_array_equal(probing._frozen_actions(), np.full(11, 5))
+      save_always(9, snapshot)
+      probing.reset()
+      np.testing.assert_array_equal(probing._frozen_actions(), np.full(11, 9))
+      for _ in range(5):
+        probing.step(np.zeros(22, dtype=np.int32))
+    finally:
+      probing.close()
+    training = puffer_env.FootballPufferEnv(
+        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=11,
+        curriculum_levels=ADVANTAGE_LEVELS, adr_shared=shared,
+        adr_probe_fraction=0.0, adr_probe_defence=snapshot)
+    try:
+      observations, _ = training.reset()
+      self.assertTrue(np.all(np.any(observations, axis=1)))
+    finally:
+      training.close()
+
   def test_random_frozen_defence_needs_no_snapshot(self):
     """frozen_defence_path='random' plays the defending side with uniform
     random actions (the base random policy) and loads no file."""

@@ -462,6 +462,46 @@ def test_adr_is_opt_in_and_probe_results_move_the_shared_ranges():
   assert 'adr_shared' not in make.call_args.kwargs
 
 
+def test_adr_probe_defence_is_replaced_only_when_clearly_weaker_than_self_play():
+  """The learner attacks the probe defence and its own defence on the same
+  scenes; only when the probe defence concedes at least
+  --adr-probe-refresh-margin more does the learner's current policy replace
+  it on disk."""
+  import tempfile
+  from gfootball.env.puffer_policy import load_frozen_policy
+  from gfootball.examples import train_puffer
+  defaults = build_parser().parse_args([])
+  assert defaults.adr_probe_defence == 'random'
+  assert defaults.adr_probe_refresh_interval == 1000
+  assert defaults.adr_probe_refresh_margin == 0.1
+  torch.manual_seed(0)
+  old = FootballPolicy(_env(), hidden_size=16).eval()
+  learner = FootballPolicy(_env(), hidden_size=16).eval()
+  args = build_parser().parse_args(['--adr', '--random-baseline-levels', '5,9'])
+  observations = torch.randn(4, 115)
+  for vs_probe, vs_self, replaced in ((0.50, 0.45, False), (0.60, 0.45, True)):
+    with tempfile.TemporaryDirectory() as directory:
+      path = directory + '/adr_probe_defence.pt'
+      save_policy_snapshot(old, path)
+
+      def fake_run(args, policy, level_value, level, device, episodes,
+                   frozen_defence_path=None, **_):
+        return {'promotion_success_rate':
+                vs_probe if frozen_defence_path == path else vs_self}
+
+      with patch.object(train_puffer, '_run_promotion', fake_run):
+        metrics = train_puffer.refresh_adr_probe_defence(
+            args, learner, SimpleNamespace(value=0), path)
+      expected = learner if replaced else old
+      restored = load_frozen_policy(path, _env())
+      with torch.no_grad():
+        assert torch.allclose(restored.forward_eval(observations, {})[0],
+                              expected.forward_eval(observations, {})[0])
+      assert metrics['adr_probe/replaced'] == float(replaced)
+      assert math.isclose(metrics['adr_probe/vs_probe'], vs_probe)
+      assert math.isclose(metrics['adr_probe/vs_self'], vs_self)
+
+
 def test_spawn_mode_defaults_to_curriculum_and_reaches_the_gate():
   """The gate must score on the same spawn distribution the policy trains on."""
   from gfootball.examples.train_puffer import _make_promotion_env
