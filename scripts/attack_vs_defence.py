@@ -10,6 +10,8 @@ The attack is --checkpoint.  The defence (--defence) is:
   idle      no action at all
   PATH      any policy snapshot, simple115 or entity observation (the
             fixed defender used to score runs is a simple115 MLP)
+The defence is gfootball/env/defence.py, exactly what the training env and
+its evaluation pools play.
 Scenes (--scene):
   adr:difficulty:D   every ADR setting uniform over its range at test
                      difficulty D (adr set_difficulty; what the trainer's
@@ -39,6 +41,7 @@ import torch
 
 import gfootball.env as football_env
 from gfootball import adr
+from gfootball.env import defence
 from gfootball.env import entity_observation
 from gfootball.env import wrappers
 from gfootball.env.puffer_env import (
@@ -109,14 +112,14 @@ def main():
   space = SimpleNamespace(
       single_action_space=SimpleNamespace(n=len(ACTION_NAMES)))
   policy = load_frozen_policy(args.checkpoint, space)
-  defence = (policy if args.defence == 'self' else None
-             if args.defence in ('random', 'idle')
-             else load_frozen_policy(args.defence, space))
+  # The same defending side the training env plays; 'self' is the attacking
+  # checkpoint used as a snapshot.
+  defending_side = defence.Defence(
+      args.checkpoint if args.defence == 'self' else args.defence,
+      len(ACTION_NAMES), args.seed, memory_window=HORIZON)
   # Scenes have their own generator so every defence sees the same scenes.
   scene_rng = np.random.default_rng([args.seed, 0xad5])
-  rng = np.random.default_rng([args.seed, 0xde4])
-  generators = [torch.Generator().manual_seed(args.seed + 1),
-                torch.Generator().manual_seed(args.seed + 2)]
+  generator = torch.Generator().manual_seed(args.seed + 1)
   sticky = np.zeros((22, entity_observation.STICKY_ACTIONS), np.float32)
 
   def rows_for(model, raw):
@@ -144,6 +147,7 @@ def main():
       config = env.unwrapped._config
       held = np.asarray(config._values.get('held_directions', [0] * 22),
                         np.int64)
+      defending_side.start_episode()
       attacking_left = config.ScenarioConfig().ball_position[0] > 0
       attack = slice(0, 11) if attacking_left else slice(11, 22)
       defend = slice(11, 22) if attacking_left else slice(0, 11)
@@ -152,19 +156,14 @@ def main():
       regained, goal_side, pressure = False, [], []
       while not done:
         if steps % HORIZON == 0:
-          states = [{'lstm_h': None, 'lstm_c': None, 'done': None}
-                    for _ in range(2)]
+          state = {'lstm_h': None, 'lstm_c': None, 'done': None}
         actions = np.zeros(22, np.int64)
-        # Drawn for all 22 rows, then the attack's kept: this consumes the
-        # generator exactly as the scorer behind the recorded results did
-        # (an earlier trace script), so the same seed reproduces them.
-        actions[attack] = act(policy, rows_for(policy, raw),
-                              states[0], generators[0])[attack]
-        if defence is not None:
-          actions[defend] = act(defence, rows_for(defence, raw)[defend],
-                                states[1], generators[1])
-        elif args.defence == 'random':
-          actions[defend] = rng.integers(0, len(ACTION_NAMES), 11)
+        actions[attack] = act(policy, rows_for(policy, raw), state,
+                              generator)[attack]
+        actions[defend] = defending_side.act(
+            entity_observation.build(raw, sticky)[defend],
+            wrappers.Simple115StateWrapper.convert_observation(
+                raw, True)[defend])
         # A loose-ball ADR scene opens with held directions pressed, as in
         # training.
         if steps == 0 and held.any():

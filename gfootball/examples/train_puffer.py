@@ -26,7 +26,8 @@ from pufferlib import pufferl
 import pufferlib.pytorch
 
 from gfootball import adr
-from gfootball.env.puffer_env import RANDOM_DEFENCE, make_vector_env
+from gfootball.env.defence import RANDOM as RANDOM_DEFENCE
+from gfootball.env.puffer_env import make_vector_env
 from gfootball.env import football_action_set
 # Re-exported: scripts and tests import the policy from this module.
 from gfootball.env.puffer_policy import (  # noqa: F401

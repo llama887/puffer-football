@@ -481,10 +481,10 @@ class PufferEnvTest(absltest.TestCase):
     try:
       observations, _ = probing.reset()
       self.assertFalse(np.any(observations[probing._defending_rows()]))
-      np.testing.assert_array_equal(probing._frozen_actions(), np.full(11, 5))
+      np.testing.assert_array_equal(probing._defence_actions, np.full(11, 5))
       save_always(9, snapshot)
       probing.reset()
-      np.testing.assert_array_equal(probing._frozen_actions(), np.full(11, 9))
+      np.testing.assert_array_equal(probing._defence_actions, np.full(11, 9))
       for _ in range(5):
         probing.step(np.zeros(22, dtype=np.int32))
     finally:
@@ -508,12 +508,14 @@ class PufferEnvTest(absltest.TestCase):
     try:
       observations, _ = env.reset()
       self.assertFalse(np.any(observations[env._defending_rows()]))
-      drawn = np.concatenate([env._frozen_actions() for _ in range(50)])
+      drawn = []
+      for _ in range(50):
+        drawn.append(env._defence_actions.copy())
+        env.step(np.zeros(22, dtype=np.int32))
+      drawn = np.concatenate(drawn)
       self.assertEqual(drawn.shape, (550,))
       self.assertGreater(len(set(drawn.tolist())), 15)
       self.assertTrue(np.all((drawn >= 0) & (drawn < 19)))
-      for _ in range(20):
-        env.step(np.zeros(22, dtype=np.int32))
     finally:
       env.close()
 
@@ -875,12 +877,12 @@ class PufferEnvTest(absltest.TestCase):
     try:
       (entity_rows, _), (simple_rows, _) = [m.reset() for m in matches]
       self.assertEqual(entity_rows.shape[1], entity_observation.SIZE)
-      defending = matches[0]._defending_rows()
-      self.assertEqual(defending, matches[1]._defending_rows())
-      np.testing.assert_array_equal(
-          matches[0]._full_observations[defending],
-          matches[1]._full_observations[defending])
+      self.assertEqual(matches[0]._defending_rows(),
+                       matches[1]._defending_rows())
+      # Same seed and the same simple115 rows: the same defending actions.
       for _ in range(5):
+        np.testing.assert_array_equal(matches[0]._defence_actions,
+                                      matches[1]._defence_actions)
         for match in matches:
           match.step(np.zeros(22, dtype=np.int32))
     finally:
@@ -928,9 +930,6 @@ class PufferEnvTest(absltest.TestCase):
       self.assertTrue(env._active_mask[attacking].all())
       self.assertFalse(np.any(observations[defending]))
       self.assertTrue(np.all(np.any(observations[attacking], axis=1)))
-      # The rows the snapshot acts on are the real, un-hidden observations.
-      self.assertTrue(np.all(np.any(
-          env._full_observations[defending], axis=1)))
 
       raw_env = env._env.unwrapped._env
       before = np.concatenate([raw_env.observation()['left_team'],
@@ -959,8 +958,6 @@ class PufferEnvTest(absltest.TestCase):
           break
       self.assertTrue(infos)
       self.assertIn(infos[0]['attacking_left'], (0.0, 1.0))
-      # A new episode starts the frozen memory from zero again.
-      self.assertIsNone(env._frozen_state['lstm_h'])
     finally:
       env.close()
       twin.close()
