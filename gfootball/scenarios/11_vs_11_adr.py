@@ -1,7 +1,7 @@
 # coding=utf-8
 """11v11 self-play scenes built from ADR settings (gfootball/adr.py).
 
-Every episode reads its settings from the config value 'adr_values' (one
+Every episode reads its settings from the config value adr.VALUES (one
 value per ADR setting; the start values when it is absent): the ball sits
 `ball_distance` from the attacked goal line at y `ball_lateral`; the two
 carriers stand squarely behind it; the other attackers ring the ball and the
@@ -306,7 +306,7 @@ def build_scenario(builder):
   episode = builder.EpisodeNumber()
   values = builder._config._values
   seed = int(values.get('game_engine_random_seed', 0))
-  settings = values.get('adr_values') or {
+  settings = values.get(adr.VALUES) or {
       parameter.name: parameter.start for parameter in adr.PARAMETERS}
   rng = random.Random('{}:{}:adr'.format(seed, episode))
   attack_right = ((seed + episode) // _DIRECTION_PERIOD) % 2 == 0

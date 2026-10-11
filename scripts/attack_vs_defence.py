@@ -116,13 +116,13 @@ def main():
   episodes = []
   try:
     for _ in range(args.episodes):
-      values = ranges.sample(scene_rng)
       if pinned:
         # Exactly like an ADR probe: one setting at one edge of its range.
-        name, edge = pinned[0], int(pinned[1])
-        values[name] = float(
-            ranges.ranges()[adr.PARAMETER_INDEX[name]][edge])
-      env.unwrapped._config['adr_values'] = values
+        values = ranges.sample_pinned(
+            scene_rng, adr.PARAMETER_INDEX[pinned[0]], int(pinned[1]))
+      else:
+        values = ranges.sample(scene_rng)
+      env.unwrapped._config[adr.VALUES] = values
       raw = env.reset()
       sticky.fill(0)
       scene = adr.read_scene(env.unwrapped._config)

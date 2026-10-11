@@ -300,9 +300,8 @@ class SegmentCollector:
   With overlap, collection continues while the update runs on the GPU
   (collect_during_update): a copy of the policy acts on its own CUDA stream
   and is synced after every update, so an action is at most one update
-  stale.  Its
-  log-prob is stored with the transition, so PPO's importance ratio stays
-  exact.  With graph_actor the acting forward replays as one CUDA graph.
+  stale.  Its log-prob is stored with the transition, so PPO's importance
+  ratio stays exact.  With graph_actor the acting forward replays as one CUDA graph.
 
   `rollout` holds the buffers (observations, actions, logprobs, rewards,
   terminals, values; one row per agent segment); `on_batch(infos, steps)`
@@ -349,7 +348,6 @@ class SegmentCollector:
     # Per buffer row: whether it belongs to the epoch being trained.
     self.row_training = torch.zeros(segments, dtype=torch.bool,
                                     device=device)
-    self.training_rows = None
     self.agent_offsets = np.arange(self.agents_per_env)
     self.discarded_steps = 0
     self.dropped_segments = 0
@@ -389,8 +387,9 @@ class SegmentCollector:
   def claim_training_rows(self):
     """Hand exactly one epoch of the newest completed segments to PPO.
 
-    Returns their buffer rows (a fixed count) and a per-row mask of them.
-    Call it before reading the buffers: it waits for the actor's stream.
+    Returns their buffer rows (a fixed count) and a per-row mask of them;
+    the mask is reused, so it holds only until the next claim.  Call it
+    before reading the buffers: it waits for the actor's stream.
     With overlap the environments can outrun the learner: older surplus
     segments are dropped rather than queued, so trained data is never more
     than about one update stale.
@@ -403,13 +402,13 @@ class SegmentCollector:
     self.complete_blocks = []
     rows = (np.asarray(self.training_blocks)[:, None] * per_env +
             self.agent_offsets).ravel()
-    self.training_rows = torch.as_tensor(rows, device=self.row_training.device)
+    rows = torch.as_tensor(rows, device=self.row_training.device)
     self.row_training.zero_()
-    self.row_training[self.training_rows] = True
+    self.row_training[rows] = True
     if self.acting_stream is not None:
       # Everything the actor wrote must land before PPO reads it.
       torch.cuda.current_stream().wait_stream(self.acting_stream)
-    return self.training_rows, self.row_training
+    return rows, self.row_training
 
   def _sync_acting_policy(self):
     """Copy the trained weights (and normalizer statistics) to the actor."""

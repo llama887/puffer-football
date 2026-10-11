@@ -725,7 +725,8 @@ def test_graphed_update_matches_the_eager_update():
             terminals=torch.zeros(segments, horizon, device=device))
         policy = copy.deepcopy(base)
         # The real collector's starting memory: one agent per match, so its
-        # blocks are the rollout's rows.
+        # blocks are the rollout's rows (a third of them in play keeps the
+        # buffer at least the two epochs it needs).
         collector = SegmentCollector(
             SimpleNamespace(num_agents=segments // 3,
                             driver_env=SimpleNamespace(num_agents=1)),

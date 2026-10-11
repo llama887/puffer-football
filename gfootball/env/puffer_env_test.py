@@ -24,7 +24,7 @@ def _scene_config(seed=0, values=None):
   start values)."""
   return config.Config({
       'level': adr.SCENARIO,
-      'adr_values': dict(values or START),
+      adr.VALUES: dict(values or START),
       'game_engine_random_seed': seed,
       'players': ['agent:left_players=11,right_players=11'],
   })
@@ -279,7 +279,7 @@ class PufferEnvTest(absltest.TestCase):
         frame_stack=1, seed=5, observation='entities', adr_shared=shared)
     try:
       observations, _ = env.reset()
-      held = np.asarray(env._env.unwrapped._config['held_directions'])
+      held = np.asarray(env._env.unwrapped._config[adr.HELD_DIRECTIONS])
       self.assertGreater((held > 0).sum(), 0)
       self.assertFalse(np.any(observations))
       observations, rewards, _, _, _ = env.step(np.zeros(22, dtype=np.int32))
@@ -294,7 +294,7 @@ class PufferEnvTest(absltest.TestCase):
       env.close()
 
   def test_adr_values_build_the_scene_they_describe(self):
-    """With 'adr_values' the scene comes from explicit settings.
+    """With adr.VALUES the scene comes from explicit settings.
 
     Each value is honoured: the ball's distance from the attacked goal line
     and its y, the number of goal-side blockers (fractions add one by
@@ -334,7 +334,7 @@ class PufferEnvTest(absltest.TestCase):
       # ball) ahead against the goal line;
       # nobody is placed ahead of it.
       self.assertEqual(sum(x > ball[0] + 0.05 for x, _ in attackers[1:]), 0)
-      self.assertEqual(list(cfg['held_directions']), [0] * 22)
+      self.assertEqual(list(cfg[adr.HELD_DIRECTIONS]), [0] * 22)
       self.assertFalse(scenario.offsides)
 
     values = dict(start, ball_distance=0.55, ball_lateral=-0.2, blockers=2.0,
@@ -348,7 +348,7 @@ class PufferEnvTest(absltest.TestCase):
       self.assertEqual(cfg['goalside_blockers'], 2)
       self.assertAlmostEqual(nearest(attackers[1:], ball), 0.4, delta=0.02)
       self.assertAlmostEqual(nearest(defenders[1:], ball), 0.5, delta=0.03)
-      held = list(cfg['held_directions'])
+      held = list(cfg[adr.HELD_DIRECTIONS])
       self.assertEqual(held[0], 0)
       self.assertEqual(held[11], 0)
       self.assertEqual(sum(h > 0 for h in held), 20)

@@ -365,7 +365,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._adr_probe = (index, edge)
     else:
       self._adr_values = self._adr.sample(self._episode_rng)
-    self._env.unwrapped._config['adr_values'] = self._adr_values
+    self._env.unwrapped._config[adr.VALUES] = self._adr_values
     self._episode_defence = (self._probe_defence if self._adr_probe is not None
                              else self._frozen_defence)
     if self._episode_defence is not None:

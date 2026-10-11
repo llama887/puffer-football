@@ -27,9 +27,10 @@ import numpy as np
 
 LOWER, UPPER = 0, 1
 # The gfootball scenario that builds a scene from a set of ADR values.  It
-# reads them from the config value 'adr_values' and writes what it built
-# for the episode into HELD_DIRECTIONS and LOOSE_BALL (see read_scene).
+# reads them from the config value VALUES and writes what it built for the
+# episode into HELD_DIRECTIONS and LOOSE_BALL (see read_scene).
 SCENARIO = '11_vs_11_adr'
+VALUES = 'adr_values'
 HELD_DIRECTIONS = 'held_directions'
 LOOSE_BALL = 'loose_ball'
 
@@ -142,11 +143,18 @@ class AutomaticDomainRandomization:
     One setting, chosen uniformly, is pinned to its lower or upper edge
     (also chosen uniformly); the rest are sampled as for training.
     """
-    values = self.sample(rng)
     index = int(rng.integers(len(PARAMETERS)))
     edge = int(rng.integers(2))
+    return self.sample_pinned(rng, index, edge), index, edge
+
+  def sample_pinned(self, rng, index, edge):
+    """Values with setting `index` at `edge` (LOWER or UPPER) of its range
+    and the rest sampled as for training: a probe's scene, with the
+    setting and edge picked at random by sample_probe or by hand
+    (scripts/attack_vs_defence.py --scene adr:pin:...)."""
+    values = self.sample(rng)
     values[PARAMETERS[index].name] = float(self._ranges[index][edge])
-    return values, index, edge
+    return values
 
   def record(self, index, edge, success):
     """Add one probe result at a setting's edge; move the edge when due.
