@@ -26,6 +26,7 @@ from pufferlib import pufferl
 import pufferlib.pytorch
 
 from gfootball import adr
+from gfootball.env.defence import IDLE as IDLE_DEFENCE
 from gfootball.env.defence import RANDOM as RANDOM_DEFENCE
 from gfootball.env.puffer_env import make_vector_env
 from gfootball.env import football_action_set
@@ -991,6 +992,18 @@ def memory_window(args):
   return None if args.carry_lstm_memory else args.bptt_horizon
 
 
+def defence_memory_window(args):
+  """Steps a snapshot defence keeps memory before restarting it, wherever it
+  plays (training probes and evaluation pools alike).
+
+  --frozen-defence-horizon, for a snapshot trained with another window (0:
+  whole episodes); by default memory_window, the way this run trains.
+  """
+  if args.frozen_defence_horizon is None:
+    return memory_window(args)
+  return args.frozen_defence_horizon or None
+
+
 class Evaluator:
   """Scores a policy on fixed ADR test scenes against a chosen defence.
 
@@ -1004,9 +1017,9 @@ class Evaluator:
   pool draws its scenes from its own shared ADR ranges, set to the requested
   difficulty before every evaluation, and every evaluation reseeds the pool
   in place, which replays exactly the episodes a fresh pool would.  Pools
-  play without shaping and without probes.  A frozen defence keeps memory
-  the way this run trains unless --frozen-defence-horizon says otherwise (a
-  snapshot trained by another run; 0 means whole episodes).
+  play without shaping and without probes.  A snapshot defence keeps
+  memory for defence_memory_window steps.  Its arguments are checked when it
+  is built, so main builds it before any env worker starts.
   """
 
   def __init__(self, args, make_pool=make_vector_env):
@@ -1019,12 +1032,10 @@ class Evaluator:
     self._args = args
     self._make_pool = make_pool
     self._pools = {}
+    if any(not 0 <= difficulty <= 1 for difficulty in self.difficulties):
+      raise ValueError('--evaluation-difficulties must lie in [0, 1]')
     self._memory_window = memory_window(args)
-    self._defence_window = args.frozen_defence_horizon
-    if self._defence_window is None:
-      self._defence_window = self._memory_window
-    elif self._defence_window == 0:
-      self._defence_window = None
+    self._defence_window = defence_memory_window(args)
 
   def score(self, policy, difficulty, defence=None):
     """_evaluation_metrics of at least --evaluation-episodes episodes at
@@ -1175,9 +1186,10 @@ def build_parser():
                            'against the probe defence')
   parser.add_argument('--adr-probe-defence', default=RANDOM_DEFENCE,
                       help="who defends ADR probes: 'random' (uniform "
-                           'random defenders) or a policy snapshot, copied '
-                           'to <data-dir>/adr_probe_defence.pt and replaced '
-                           'by the learner when it outgrows it '
+                           "random defenders), 'idle' (no action) or a "
+                           'policy snapshot, copied to '
+                           '<data-dir>/adr_probe_defence.pt and replaced by '
+                           'the learner when it outgrows it '
                            '(refresh_adr_probe_defence)')
   parser.add_argument('--adr-probe-refresh-interval', type=int, default=1000,
                       help='epochs between checks that may replace a '
@@ -1387,15 +1399,23 @@ def main():
   torch.manual_seed(args.seed)
   np.random.seed(args.seed)
 
+  # Built first: it checks its arguments before any env worker starts.
+  evaluator = Evaluator(args)
   # ADR ranges live in shared memory: env workers sample from them, the
   # trainer moves them from probe results.
   adr_shared = adr.shared_ranges()
-  adr_probe_defence = RANDOM_DEFENCE
-  if args.adr_probe_defence != RANDOM_DEFENCE:
-    # Refreshes are checked on the evaluation epochs only.
+  adr_probe_defence = args.adr_probe_defence
+  snapshot_probe = adr_probe_defence not in (RANDOM_DEFENCE, IDLE_DEFENCE)
+  if snapshot_probe:
+    # Refreshes are checked on the evaluation epochs only, on the evaluation
+    # difficulties.
     if args.adr_probe_refresh_interval % args.evaluation_interval:
       raise ValueError('--adr-probe-refresh-interval must be a multiple '
                        'of --evaluation-interval')
+    if args.adr_probe_refresh_interval > 0 and not evaluator.difficulties:
+      raise ValueError('refreshing a snapshot probe defence needs '
+                       '--evaluation-difficulties (or '
+                       '--adr-probe-refresh-interval 0)')
     # A copy, so a refresh replaces it without touching the original.
     adr_probe_defence = os.path.join(args.data_dir, 'adr_probe_defence.pt')
     shutil.copyfile(args.adr_probe_defence, adr_probe_defence)
@@ -1414,8 +1434,7 @@ def main():
       adr_shared=adr_shared,
       adr_probe_fraction=args.adr_probe_fraction,
       adr_probe_defence=adr_probe_defence,
-      # A snapshot probe defence replays the memory this run trains with.
-      frozen_defence_horizon=memory_window(args))
+      frozen_defence_horizon=defence_memory_window(args))
   # The launcher exports OMP_NUM_THREADS=1 so the env workers do not each
   # spawn a thread per core and thrash.  PyTorch reads that at import, which
   # also pins the update and the evaluation forward to a single core, and
@@ -1473,7 +1492,6 @@ def main():
       shared=adr_shared, buffer_size=args.adr_buffer_size,
       low_threshold=args.adr_low_threshold,
       high_threshold=args.adr_high_threshold)
-  evaluator = Evaluator(args)
   filler = None
   if args.gpu_filler and args.device == 'cuda':
     from gfootball.examples.gpu_filler import GpuFiller
@@ -1496,7 +1514,7 @@ def main():
         started = time.time()
         metrics = trainer.adr.metrics()
         metrics.update(evaluator.baseline(trainer.uncompiled_policy))
-        if (adr_probe_defence != RANDOM_DEFENCE and trainer.epoch > 0 and
+        if (snapshot_probe and trainer.epoch > 0 and
             args.adr_probe_refresh_interval > 0 and
             trainer.epoch % args.adr_probe_refresh_interval == 0):
           metrics.update(refresh_adr_probe_defence(

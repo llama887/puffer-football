@@ -13,7 +13,8 @@ from gfootball.env.puffer_policy import (
 from gfootball.examples.train_puffer import (
     ACTION_NAMES, SHOT_ACTION, FootballPolicy, GraphedActor, PpoUpdate,
     SegmentCollector,
-    Evaluator, build_config, build_parser, evaluate_episodes,
+    Evaluator, build_config, build_parser, defence_memory_window,
+    evaluate_episodes,
     explained_variance, generalized_advantages, normalize_advantages,
     policy_diagnostics)
 
@@ -411,6 +412,30 @@ def test_evaluation_needs_two_workers():
     pass
   else:
     raise AssertionError('one evaluation worker must be refused')
+
+
+def test_evaluation_difficulties_are_checked_up_front():
+  """A difficulty outside [0, 1] is refused when the Evaluator is built,
+  before training starts, not at the first evaluation."""
+  args = build_parser().parse_args(['--evaluation-difficulties', '0.5,1.5'])
+  try:
+    Evaluator(args, make_pool=_RecordingPools())
+  except ValueError:
+    pass
+  else:
+    raise AssertionError('difficulty 1.5 must be refused')
+
+
+def test_snapshot_defences_replay_one_memory_window():
+  """Training probes and evaluation pools replay a snapshot defence with
+  the same window: --frozen-defence-horizon, else this run's own."""
+  def window(flags):
+    return defence_memory_window(build_parser().parse_args(flags))
+
+  assert window([]) == 32
+  assert window(['--carry-lstm-memory']) is None
+  assert window(['--frozen-defence-horizon', '64']) == 64
+  assert window(['--frozen-defence-horizon', '0']) is None
 
 
 def test_evaluation_replays_memory_the_way_each_policy_was_trained():

@@ -24,5 +24,8 @@ export PYTHONPATH="$REPO:$REPO/third_party"
 echo "=== train_puffer_test"; python -m gfootball.examples.train_puffer_test || status=1
 echo "=== puffer_env_test";  python -m gfootball.env.puffer_env_test 2>&1 | grep -E "^\[|OK|FAIL|Error|Ran " || status=1
 echo "=== adr_test"; python -m gfootball.adr_test || status=1
+echo "=== defence_test"; python -m gfootball.env.defence_test || status=1
+echo "=== entity_observation_test"; python -m gfootball.env.entity_observation_test || status=1
+echo "=== observation_equivalence_test"; python -m gfootball.env.observation_equivalence_test || status=1
 echo "EXIT $status"
 exit $status

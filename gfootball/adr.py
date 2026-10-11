@@ -67,6 +67,13 @@ PARAMETER_INDEX = {parameter.name: i for i, parameter in enumerate(PARAMETERS)}
 _ENTROPY_FLOOR = 1e-3
 
 
+def _uniform_values(ranges, rng):
+  """Each setting uniform in its row of `ranges` (a point gives itself)."""
+  return {parameter.name: float(rng.uniform(low, high)) if high > low
+          else float(low)
+          for parameter, (low, high) in zip(PARAMETERS, ranges)}
+
+
 def shared_ranges():
   """A shared-memory array holding every range, initialised to the starts."""
   array = multiprocessing.RawArray('d', 2 * len(PARAMETERS))
@@ -132,10 +139,7 @@ class AutomaticDomainRandomization:
 
   def sample(self, rng):
     """Values for a training episode: each setting uniform in its range."""
-    ranges = self.ranges()
-    return {parameter.name: float(rng.uniform(low, high)) if high > low
-            else float(low)
-            for parameter, (low, high) in zip(PARAMETERS, ranges)}
+    return _uniform_values(self.ranges(), rng)
 
   def sample_probe(self, rng):
     """Values for a probe episode, and which setting and edge it tests.
@@ -151,9 +155,14 @@ class AutomaticDomainRandomization:
     """Values with setting `index` at `edge` (LOWER or UPPER) of its range
     and the rest sampled as for training: a probe's scene, with the
     setting and edge picked at random by sample_probe or by hand
-    (scripts/attack_vs_defence.py --scene adr:pin:...)."""
-    values = self.sample(rng)
-    values[PARAMETERS[index].name] = float(self._ranges[index][edge])
+    (scripts/attack_vs_defence.py --scene adr:pin:...).
+
+    Every value comes from one copy of the ranges: the trainer may move an
+    edge while a worker samples, and the probe must test the edge it pins.
+    """
+    ranges = self.ranges()
+    values = _uniform_values(ranges, rng)
+    values[PARAMETERS[index].name] = float(ranges[index][edge])
     return values
 
   def record(self, index, edge, success):

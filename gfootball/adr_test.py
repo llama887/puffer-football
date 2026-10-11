@@ -170,6 +170,31 @@ def test_logged_metrics_restore_the_ranges():
   np.testing.assert_array_equal(reader.ranges(), trainer.ranges())
 
 
+def test_a_pinned_probe_reads_one_snapshot_of_the_ranges():
+  """The trainer moves edges while env workers sample: a probe's pinned
+  edge and its other values must come from the same ranges."""
+  randomizer = _fresh()
+  randomizer.set_range('blockers', 1.0, 2.0)
+  live = adr.AutomaticDomainRandomization(shared=randomizer.shared)
+
+  class MovingRng:
+    """Draws like numpy, but the trainer moves an edge mid-sample."""
+
+    def __init__(self):
+      self._rng = np.random.default_rng(0)
+
+    def uniform(self, low, high):
+      randomizer.set_range('blockers', 1.0, 4.0)
+      return self._rng.uniform(low, high)
+
+    def integers(self, high):
+      return self._rng.integers(high)
+
+  values = live.sample_pinned(MovingRng(), adr.PARAMETER_INDEX['blockers'],
+                              adr.UPPER)
+  assert values['blockers'] == 2.0, values['blockers']
+
+
 def _middle_half(name):
   parameter = adr.PARAMETERS[adr.PARAMETER_INDEX[name]]
   span = parameter.maximum - parameter.minimum

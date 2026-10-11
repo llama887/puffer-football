@@ -57,10 +57,15 @@ def scene_ranges(scene, log_path):
 
   A test difficulty's ranges, the start values (points), or for full and
   pin scenes every setting's valid limits, or with --adr-log the ranges of
-  that training log's last `ADR {json}` line.
+  that training log's last `ADR {json}` line.  Any other scene is refused,
+  so a misspelt or retired one (level:L) never quietly plays full ranges.
   """
   randomizer = adr.AutomaticDomainRandomization()
   kind = scene.split(':')
+  parts = {'difficulty': 3, 'start': 2, 'full': 2, 'pin': 4}
+  if kind[0] != 'adr' or len(kind) < 2 or parts.get(kind[1]) != len(kind):
+    raise ValueError('unknown --scene {!r} (see the module docstring)'.format(
+        scene))
   if kind[1] == 'difficulty':
     randomizer.set_difficulty(float(kind[2]))
   elif kind[1] != 'start':
