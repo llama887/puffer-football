@@ -407,3 +407,82 @@ def load_frozen_policy(path, env):
   for parameter in policy.parameters():
     parameter.requires_grad_(False)
   return policy
+
+
+class PolicyPlayer:
+  """Plays a recurrent policy for `matches` matches of `rows` agent rows,
+  with the memory and sampling it is replayed with everywhere outside the
+  training collector.
+
+  Memory: every row keeps its LSTM state; a match's rows restart from zero
+  every `memory_window` of that match's own steps, the way training restarts
+  memory at every rollout segment regardless of episode ends (None: never,
+  for a policy trained with carried memory), on rows the caller marks done
+  (the env reset them), and when the caller clears a match (an episode
+  start).  Sampling: argmax(logits + Gumbel noise) with the noise keyed on
+  (seed, match, that match's step), so a match gets the same actions
+  whichever other matches share its batch and in whatever order they report.
+  """
+
+  def __init__(self, policy, matches, rows, memory_window, seed,
+               device='cpu'):
+    if memory_window is not None and memory_window < 1:
+      raise ValueError('memory_window must be positive or None')
+    self.policy = policy
+    self._rows = int(rows)
+    self._memory_window = memory_window
+    self._device = device
+    self._hidden = torch.zeros(int(matches) * self._rows, policy.hidden_size,
+                               device=device)
+    self._cell = torch.zeros_like(self._hidden)
+    self._steps = np.zeros(int(matches), dtype=np.int64)
+    self.reset(seed)
+
+  def reset(self, seed):
+    """Restart the sampling stream from `seed`, every clock and all memory."""
+    self._seed = int(seed)
+    self._steps[:] = 0
+    self._hidden.zero_()
+    self._cell.zero_()
+
+  def clear(self, match):
+    """Start one match's rows from zero memory (its episode starts)."""
+    rows = slice(match * self._rows, (match + 1) * self._rows)
+    self._hidden[rows] = 0
+    self._cell[rows] = 0
+
+  def act(self, observations, match_ids, done=None):
+    """Actions and logits for the rows of `match_ids`, in that order.
+
+    `observations` holds `rows` rows per listed match; `done` (optional,
+    one flag per row) marks rows whose episode has just been reset.
+    """
+    match_ids = np.asarray(match_ids, dtype=np.int64)
+    if self._memory_window is not None:
+      for match in match_ids[self._steps[match_ids] %
+                             self._memory_window == 0]:
+        self.clear(int(match))
+    index = torch.as_tensor(
+        (match_ids[:, None] * self._rows + np.arange(self._rows)).ravel(),
+        device=self._device)
+    state = {'lstm_h': self._hidden[index], 'lstm_c': self._cell[index],
+             'done': (None if done is None else
+                      torch.as_tensor(np.asarray(done), device=self._device))}
+    with torch.no_grad():
+      logits, _ = self.policy.forward_eval(
+          torch.as_tensor(observations, device=self._device), state)
+      self._hidden[index] = state['lstm_h']
+      self._cell[index] = state['lstm_c']
+      noise = np.empty((len(match_ids), self._rows, logits.shape[-1]),
+                       dtype=np.float32)
+      for position, match in enumerate(match_ids):
+        uniform = np.random.default_rng(
+            (self._seed, int(match), int(self._steps[match]))).random(
+                noise.shape[1:])
+        noise[position] = -np.log(-np.log(
+            np.clip(uniform, 1e-12, 1 - 1e-12)))
+      actions = (logits.float() + torch.as_tensor(
+          noise.reshape(-1, logits.shape[-1]), device=self._device)).argmax(
+              dim=-1)
+    self._steps[match_ids] += 1
+    return actions, logits

@@ -34,26 +34,21 @@ import argparse
 import json
 import os
 import tempfile
-from types import SimpleNamespace
 
 import numpy as np
-import torch
 
 import gfootball.env as football_env
 from gfootball import adr
 from gfootball.env import defence
 from gfootball.env import entity_observation
 from gfootball.env import wrappers
-from gfootball.env.puffer_env import (
-    normalize_egocentric, sort_players_by_distance)
-from gfootball.env.puffer_policy import load_frozen_policy
 from gfootball.examples.train_puffer import ACTION_NAMES
 
 # Training resets the recurrent state every rollout window (32 steps), so
-# the attack restarts its memory every 32 steps of each episode and the
-# defence (gfootball/env/defence.py) every 32 of its own steps and at every
-# episode start.  Scores from before the defence module (2026-10-11) used
-# other defence seeds and windows, so they do not reproduce exactly.
+# both sides restart their memory every 32 of their own steps and at every
+# episode start (gfootball/env/defence.py).  Scores from before the defence
+# module (2026-10-11) used other seeds and windows, so they do not reproduce
+# exactly.
 HORIZON = 32
 
 
@@ -112,33 +107,17 @@ def main():
       number_of_left_players_agent_controls=11,
       number_of_right_players_agent_controls=11,
       other_config_options=options)
-  space = SimpleNamespace(
-      single_action_space=SimpleNamespace(n=len(ACTION_NAMES)))
-  policy = load_frozen_policy(args.checkpoint, space)
-  # The same defending side the training env plays; 'self' is the attacking
-  # checkpoint used as a snapshot.
+  # Both sides are fixed policies played like the training env's defence
+  # ('self' defends with the attacking checkpoint); separate seeds keep
+  # their sampling noise independent.
+  attacking_side = defence.Defence(args.checkpoint, len(ACTION_NAMES),
+                                   args.seed, memory_window=HORIZON)
   defending_side = defence.Defence(
       args.checkpoint if args.defence == 'self' else args.defence,
-      len(ACTION_NAMES), args.seed, memory_window=HORIZON)
+      len(ACTION_NAMES), args.seed + 1, memory_window=HORIZON)
   # Scenes have their own generator so every defence sees the same scenes.
   scene_rng = np.random.default_rng([args.seed, 0xad5])
-  generator = torch.Generator().manual_seed(args.seed + 1)
   sticky = np.zeros((22, entity_observation.STICKY_ACTIONS), np.float32)
-
-  def rows_for(model, raw):
-    """The observation `model` was trained on, for all 22 agents."""
-    if model.normalizer.mean.numel() == entity_observation.SIZE:
-      return entity_observation.build(raw, sticky)
-    frames = wrappers.Simple115StateWrapper.convert_observation(raw, True)
-    normalize_egocentric(frames)
-    sort_players_by_distance(frames)
-    return frames
-
-  def act(model, rows, state, generator):
-    with torch.no_grad():
-      logits, _ = model.forward_eval(torch.from_numpy(rows), state)
-      return torch.multinomial(torch.softmax(logits.float(), -1), 1,
-                               generator=generator).squeeze(-1).numpy()
 
   episodes = []
   try:
@@ -150,6 +129,7 @@ def main():
       config = env.unwrapped._config
       held = np.asarray(config._values.get('held_directions', [0] * 22),
                         np.int64)
+      attacking_side.start_episode()
       defending_side.start_episode()
       attacking_left = config.ScenarioConfig().ball_position[0] > 0
       attack = slice(0, 11) if attacking_left else slice(11, 22)
@@ -158,15 +138,11 @@ def main():
       done, steps, reward = False, 0, 0.0
       regained, goal_side, pressure = False, [], []
       while not done:
-        if steps % HORIZON == 0:
-          state = {'lstm_h': None, 'lstm_c': None, 'done': None}
+        rows = entity_observation.build(raw, sticky)
+        frames = wrappers.Simple115StateWrapper.convert_observation(raw, True)
         actions = np.zeros(22, np.int64)
-        actions[attack] = act(policy, rows_for(policy, raw), state,
-                              generator)[attack]
-        actions[defend] = defending_side.act(
-            entity_observation.build(raw, sticky)[defend],
-            wrappers.Simple115StateWrapper.convert_observation(
-                raw, True)[defend])
+        actions[attack] = attacking_side.act(rows[attack], frames[attack])
+        actions[defend] = defending_side.act(rows[defend], frames[defend])
         # A loose-ball ADR scene opens with held directions pressed, as in
         # training.
         if steps == 0 and held.any():

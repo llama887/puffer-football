@@ -30,7 +30,8 @@ from gfootball.env.puffer_env import make_vector_env
 from gfootball.env import football_action_set
 # Re-exported: scripts and tests import the policy from this module.
 from gfootball.env.puffer_policy import (  # noqa: F401
-    FootballPolicy, episode_batch_sizes, episode_pieces, save_policy_snapshot)
+    FootballPolicy, PolicyPlayer, episode_batch_sizes, episode_pieces,
+    save_policy_snapshot)
 
 
 ACTION_NAMES = tuple(
@@ -142,21 +143,6 @@ def _evaluation_metrics(rows, action_counts, decisions, active_logits_rows,
   }
 
 
-def _match_gumbel_noise(seed, match_ids, match_steps, rows, actions):
-  """Gumbel noise that depends only on (seed, match, that match's step).
-
-  Sampling with argmax(logits + noise) then gives every match the same
-  actions no matter which other matches share its batch or in what order
-  the matches report back.
-  """
-  noise = np.empty((len(match_ids), rows, actions), dtype=np.float32)
-  for position, (match, step) in enumerate(zip(match_ids, match_steps)):
-    uniform = np.random.default_rng(
-        (int(seed), int(match), int(step))).random((rows, actions))
-    noise[position] = -np.log(-np.log(np.clip(uniform, 1e-12, 1 - 1e-12)))
-  return noise.reshape(len(match_ids) * rows, actions)
-
-
 def evaluate_episodes(policy, vecenv, episodes, seed, device,
                       recurrent_horizon):
   """Play `episodes` held-out episodes on a pool whose matches run at their
@@ -166,27 +152,22 @@ def evaluate_episodes(policy, vecenv, episodes, seed, device,
   nothing else.  Taking the first `episodes` to finish overall would favour
   short episodes, and a short episode is usually a goal.
 
-  The result does not depend on timing: each match's engine, defence, scene
-  draws and sampling noise are seeded per match (reset(seed) gives match i
-  the seed seed + i, which its episode infos report as env_seed), recurrent
-  memory restarts every `recurrent_horizon` of a match's own steps, as the
-  training rollout restarts it at every segment (never, if None: a policy
-  trained with carried memory), and at episode ends, and everything reported
-  is taken from a fixed number of each match's first episodes.
+  The result does not depend on timing: each match's engine, defence and
+  scene draws are seeded per match (reset(seed) gives match i the seed
+  seed + i, which its episode infos report as env_seed), the policy plays
+  through a PolicyPlayer (memory window `recurrent_horizon` per match,
+  sampling noise per match and step), and everything reported is taken from
+  a fixed number of each match's first episodes.
   """
-  if recurrent_horizon is not None and recurrent_horizon < 1:
-    raise ValueError('recurrent_horizon must be positive or None')
   if getattr(vecenv, 'envs_per_worker', 1) != 1:
     raise ValueError('async evaluation needs one match per worker, so that '
                      'match i is reset with seed + i')
   per_env = vecenv.driver_env.num_agents
   matches = vecenv.num_agents // per_env
   quota = -(-episodes // matches)
+  player = PolicyPlayer(policy, matches, per_env, recurrent_horizon, seed,
+                        device=device)
   vecenv.async_reset(seed)
-  hidden = policy.hidden_size
-  agent_h = torch.zeros(vecenv.num_agents, hidden, device=device)
-  agent_c = torch.zeros_like(agent_h)
-  match_steps = np.zeros(matches, dtype=np.int64)
   # Per match: finished episodes, and the action counts and active logits
   # of each finished episode and of the one in progress.
   taken = [[] for _ in range(matches)]
@@ -213,29 +194,10 @@ def evaluate_episodes(policy, vecenv, episodes, seed, device,
         episode_logits[match].append(current_logits[match])
         current_actions[match] = 0
         current_logits[match] = []
-      restart = (match_ids[match_steps[match_ids] % recurrent_horizon == 0]
-                 if recurrent_horizon is not None else ())
-      if len(restart):
-        fresh = torch.as_tensor(
-            (restart[:, None] * per_env + np.arange(per_env)).ravel(),
-            device=device)
-        agent_h[fresh] = 0
-        agent_c[fresh] = 0
-      index = torch.as_tensor(agent_ids, device=device)
-      observation_tensor = torch.as_tensor(observations, device=device)
-      active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
-      state = {'lstm_h': agent_h[index], 'lstm_c': agent_c[index],
-               'done': torch.as_tensor(np.asarray(terminals), device=device)}
-      with torch.no_grad():
-        logits, _ = policy.forward_eval(observation_tensor, state)
-        agent_h[index] = state['lstm_h']
-        agent_c[index] = state['lstm_c']
-        noise = torch.as_tensor(_match_gumbel_noise(
-            seed, match_ids, match_steps[match_ids], per_env,
-            logits.shape[-1]), device=device)
-        actions = (logits.float() + noise).argmax(dim=-1)
-      match_steps[match_ids] += 1
-      active_rows = active.view(len(match_ids), per_env).cpu().numpy()
+      active = np.abs(np.asarray(observations)).reshape(
+          len(agent_ids), -1).sum(axis=-1) > 0
+      actions, logits = player.act(observations, match_ids, terminals)
+      active_rows = active.reshape(len(match_ids), per_env)
       match_actions = actions.view(len(match_ids), per_env).cpu().numpy()
       match_logits = logits.view(len(match_ids), per_env, -1).float().cpu()
       for position, match in enumerate(match_ids):

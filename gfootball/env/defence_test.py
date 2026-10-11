@@ -139,13 +139,14 @@ def test_memory_restarts_every_window_and_at_every_episode_start():
     _save(path)
     side = defence.Defence(path, ACTIONS, seed=0, memory_window=3)
     side.start_episode()
-    rows, frames = np.zeros((11, 115), np.float32), _frames()
+    # All-zero rows are absent players, whose memory stays zero.
+    rows, frames = np.full((11, 115), 0.1, np.float32), _frames()
     fresh = []
-    policy = side._load()
+    policy = side._load().policy
     forward = policy.forward_eval
 
     def recording_forward(observations, state):
-      fresh.append(state['lstm_h'] is None)
+      fresh.append(not bool(state['lstm_h'].abs().any()))
       return forward(observations, state)
 
     policy.forward_eval = recording_forward
@@ -159,7 +160,7 @@ def test_memory_restarts_every_window_and_at_every_episode_start():
     carried = defence.Defence(path, ACTIONS, seed=0, memory_window=None)
     carried.start_episode()
     fresh.clear()
-    carried._load().forward_eval = recording_forward
+    carried._load().policy.forward_eval = recording_forward
     for _ in range(5):
       carried.act(rows, frames)
     assert fresh == [True, False, False, False, False], fresh
