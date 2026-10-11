@@ -723,33 +723,30 @@ def test_graphed_update_matches_the_eager_update():
             observations=observations.clone(), actions=actions.clone(),
             logprobs=logprobs.clone(),
             terminals=torch.zeros(segments, horizon, device=device))
-        segment_h = torch.zeros(segments, 16, device=device)
-        segment_c = torch.zeros(segments, 16, device=device)
-
-        def starting_memory(index):
-          # What SegmentCollector.starting_memory gives with carried memory.
-          if not carry_memory:
-            return {}
-          return {'done': rollout.terminals[index],
-                  'lstm_h': segment_h[index], 'lstm_c': segment_c[index]}
-
         policy = copy.deepcopy(base)
+        # The real collector's starting memory: one agent per match, so its
+        # blocks are the rollout's rows.
+        collector = SegmentCollector(
+            SimpleNamespace(num_agents=segments // 3,
+                            driver_env=SimpleNamespace(num_agents=1)),
+            policy, rollout, horizon, device, carry_memory=carry_memory)
         rate = (torch.tensor(schedule[0], device=device) if graph
                 else schedule[0])
         optimizer = torch.optim.Adam(policy.parameters(), lr=rate, eps=1e-5,
                                      capturable=graph)
         ppo = PpoUpdate(policy, optimizer, rollout, config, graph=graph,
-                        starting_memory=starting_memory)
+                        starting_memory=collector.starting_memory)
         totals = []
         for terminals, memory, learning_rate in zip(layouts, memories,
                                                     schedule):
           rollout.terminals.copy_(terminals)
-          segment_h.copy_(memory[0])
-          segment_c.copy_(memory[1])
+          if carry_memory:
+            collector.segment_h.copy_(memory[0])
+            collector.segment_c.copy_(memory[1])
           set_learning_rate(optimizer, learning_rate)
           before = torch.cat([p.detach().flatten().clone()
                               for p in policy.parameters()])
-          totals.append(ppo.update(segment_index, *epoch, trainable).clone())
+          totals.append(ppo.update(segment_index, *epoch, trainable))
         final = torch.cat([p.detach().flatten()
                            for p in policy.parameters()])
         results.append((final, before, torch.stack(totals),
@@ -1016,8 +1013,8 @@ def test_collector_memory_is_what_training_replays():
                             atol=1e-5), (carry_memory, step)
 
     # The epoch trains the newest segment, which starts mid-episode.
-    rows = collector.claim_training_rows()
-    trainable = collector.row_training[:, None].expand(-1, horizon).clone()
+    rows, training_rows = collector.claim_training_rows()
+    trainable = training_rows[:, None].expand(-1, horizon).clone()
     totals = ppo.update(rows, rollout.values, torch.randn(6, horizon),
                         torch.randn(6, horizon), trainable)
     totals = dict(zip(PpoUpdate.LOSS_NAMES, totals.tolist()))

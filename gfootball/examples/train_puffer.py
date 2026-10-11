@@ -16,6 +16,7 @@ import math
 import os
 import shutil
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -296,9 +297,10 @@ class SegmentCollector:
   and the memory it started from is kept per buffer row for training
   (starting_memory).  Either way BPTT replays what the policy saw.
 
-  With overlap, collection continues while the update runs on the GPU: a
-  copy of the policy acts on its own CUDA stream and is synced after every
-  update (sync_acting_policy), so an action is at most one update stale.  Its
+  With overlap, collection continues while the update runs on the GPU
+  (collect_during_update): a copy of the policy acts on its own CUDA stream
+  and is synced after every update, so an action is at most one update
+  stale.  Its
   log-prob is stored with the transition, so PPO's importance ratio stays
   exact.  With graph_actor the acting forward replays as one CUDA graph.
 
@@ -371,19 +373,27 @@ class SegmentCollector:
     while len(self.complete_blocks) < self.blocks_per_epoch:
       self._collect_batch()
 
-  def collect_while(self, done):
-    """Serve ready workers until `done()`; the update runs on the GPU."""
-    while not done():
+  def collect_during_update(self):
+    """With overlap: keep the environments busy until the update queued on
+    the GPU has finished, then give the actor the new weights.  Without
+    overlap there is nothing to do."""
+    if not self.overlap:
+      return
+    finished = torch.cuda.Event()
+    finished.record()
+    while not finished.query():
       if self._workers_ready():
         self._collect_batch()
+    self._sync_acting_policy()
 
   def claim_training_rows(self):
     """Hand exactly one epoch of the newest completed segments to PPO.
 
-    Returns their buffer rows (a fixed count) and marks them in
-    row_training.  With overlap the environments can outrun the learner:
-    older surplus segments are dropped rather than queued, so trained data
-    is never more than about one update stale.
+    Returns their buffer rows (a fixed count) and a per-row mask of them.
+    Call it before reading the buffers: it waits for the actor's stream.
+    With overlap the environments can outrun the learner: older surplus
+    segments are dropped rather than queued, so trained data is never more
+    than about one update stale.
     """
     per_env = self.agents_per_env
     self.training_blocks = self.complete_blocks[-self.blocks_per_epoch:]
@@ -399,9 +409,9 @@ class SegmentCollector:
     if self.acting_stream is not None:
       # Everything the actor wrote must land before PPO reads it.
       torch.cuda.current_stream().wait_stream(self.acting_stream)
-    return self.training_rows
+    return self.training_rows, self.row_training
 
-  def sync_acting_policy(self):
+  def _sync_acting_policy(self):
     """Copy the trained weights (and normalizer statistics) to the actor."""
     if self.acting_policy is self.policy:
       return
@@ -606,7 +616,8 @@ class PpoUpdate:
     self._update_capacity = None
 
   def update(self, rows, values, advantages, returns, trainable):
-    """Train on buffer rows `rows`; returns the loss totals (LOSS_NAMES)."""
+    """Train on buffer rows `rows`; returns the loss totals (LOSS_NAMES),
+    summed over the update epochs."""
     self._stage(values, advantages, returns, trainable)
     done = self.rollout.terminals[rows]
     epochs = self.config['update_epochs']
@@ -614,7 +625,7 @@ class PpoUpdate:
       pieces = episode_pieces(done)
       for _ in range(epochs):
         self._step(self.policy, rows, pieces)
-      return self.totals
+      return self.totals.clone()
     needed = episode_batch_sizes(done)
     capacity = self._update_capacity
     if (self._update_graph is None or
@@ -633,7 +644,7 @@ class PpoUpdate:
     for _ in range(first, epochs):
       self._update_graph.replay()
       self.optimizer_steps += 1
-    return self.totals
+    return self.totals.clone()
 
   def _stage(self, values, advantages, returns, trainable):
     """Copy the epoch into fixed buffers, which a captured step reads."""
@@ -781,15 +792,20 @@ class FootballPuffeRL(pufferl.PuffeRL):
           eps=config['adam_eps'], capturable=True)
     # The ADR randomizer that records probe results (set by main).
     self.adr = None
+    # PuffeRL's rollout buffers, all the collector and the update share.
+    rollout = SimpleNamespace(
+        observations=self.observations, actions=self.actions,
+        logprobs=self.logprobs, rewards=self.rewards,
+        terminals=self.terminals, values=self.values)
     self.collector = SegmentCollector(
-        vecenv, self.uncompiled_policy, self, config['bptt_horizon'],
+        vecenv, self.uncompiled_policy, rollout, config['bptt_horizon'],
         config['device'], carry_memory=carry_memory,
         overlap=overlap_collection and cuda,
         graph_actor=graph_actor and cuda, amp_context=lambda: self.amp_context,
         on_batch=self._record_batch,
         profile=lambda name: self.profile(name, self.epoch))
     self.ppo = PpoUpdate(
-        self.policy, self.optimizer, self, config, graph=graph_update,
+        self.policy, self.optimizer, rollout, config, graph=graph_update,
         starting_memory=self.collector.starting_memory,
         capture_policy=self.uncompiled_policy)
     self.active_steps = torch.zeros((), dtype=torch.long,
@@ -836,7 +852,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
                  time.time() > self.last_log_time + self.log_interval_seconds)
     losses = {}
     # Before any buffer read: waits for the actor's stream.
-    rows = collector.claim_training_rows()
+    rows, training_rows = collector.claim_training_rows()
 
     rollout_values = self.values.clone()
     advantages, returns, valid = generalized_advantages(
@@ -844,7 +860,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
         config['gamma'], config['gae_lambda'])
     active = self.observations.flatten(2).abs().sum(dim=-1) > 0
     # Only this epoch's completed segments; the rest carry over.
-    trainable = active & valid & collector.row_training[:, None]
+    trainable = active & valid & training_rows[:, None]
     segment_index = trainable.any(dim=1).nonzero().flatten()
     num_segments = int(segment_index.numel())
     if num_segments == 0:
@@ -871,12 +887,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
     totals = self.ppo.update(rows, rollout_values, advantages, returns,
                              trainable)
 
-    if collector.overlap:
-      # The update is queued on the GPU; keep the envs busy until it is done.
-      finished = torch.cuda.Event()
-      finished.record()
-      collector.collect_while(finished.query)
-      collector.sync_acting_policy()
+    collector.collect_during_update()
 
     profile('train_misc', epoch)
     self.active_steps += trainable.sum()
@@ -1274,7 +1285,9 @@ def _buffer_segments_per_agent(args):
 
 
 def build_config(args, num_agents):
-  """One rollout segment per agent per epoch keeps BPTT aligned with rollout.
+  """Rollout buffers of whole segments per agent keep BPTT aligned with the
+  rollout: an epoch trains one segment per agent, and the buffer holds two
+  or three per agent (_buffer_segments_per_agent).
 
   `num_agents` must count every agent in every match the vecenv holds, not
   just the ones a single receive delivers.  PufferLib allocates the rollout
