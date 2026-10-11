@@ -476,28 +476,20 @@ def test_learning_rate_follows_training_progress():
   assert cosine_learning_rate(1e-3, 3 * total, total) == 0.0
 
 
-def test_gpu_filler_accepts_the_trainer_call_and_only_spins():
-  """main() builds GpuFiller(matrix_size=..., kind=args.gpu_filler_kind).
+def test_gpu_filler_is_the_spin_kernel_only():
+  """main() builds GpuFiller() with no options.
 
   Only the spin-kernel filler is offered: a filler that replays a CUDA graph
   advances the global CUDA generator and crashed alongside captured graphs.
   """
   from gfootball.examples.gpu_filler import GpuFiller
-  args = build_parser().parse_args([])
-  assert args.gpu_filler_kind == 'sleep'
-  GpuFiller(matrix_size=args.gpu_filler_matrix_size, kind=args.gpu_filler_kind)
-  try:
-    GpuFiller(kind='matmul')
-  except ValueError:
-    pass
-  else:
-    raise AssertionError('a graph-replaying filler must be rejected')
+  GpuFiller()
   try:
     build_parser().parse_args(['--gpu-filler-kind', 'matmul'])
   except SystemExit:
     pass
   else:
-    raise AssertionError('--gpu-filler-kind matmul must not be accepted')
+    raise AssertionError('--gpu-filler-kind must not be accepted')
 
 
 def test_padded_episode_layout_gives_the_same_window_forward():

@@ -157,15 +157,12 @@ fi
 # kernel is running.  The trainer keeps it up itself (GPU_FILLER=1) with
 # single-thread spin kernels on a side stream, which occupy one SM: 91% mean
 # utilization at a 3% cost.  Filler matmuls spread over the device and slowed
-# the latency-bound update (1024^2: 60k instead of 143k).  The old external
-# heartbeat (GPU_HEARTBEAT=1) is a separate process, which time-slices the
-# GPU; it cut SPS to less than half.
-GPU_FILLER_ARGS=(--gpu-filler --gpu-filler-kind "${GPU_FILLER_KIND:-sleep}"
-                 --gpu-filler-matrix-size "${GPU_FILLER_MATRIX_SIZE:-1024}")
+# the latency-bound update (1024^2: 60k instead of 143k), and an external
+# heartbeat process time-sliced the GPU and cut SPS to less than half.
+GPU_FILLER_ARGS=(--gpu-filler)
 if [[ ${GPU_FILLER:-1} == 0 ]]; then
   GPU_FILLER_ARGS=(--no-gpu-filler)
 fi
-GPU_HEARTBEAT=${GPU_HEARTBEAT:-0}
 ANNEAL_LR_ARGS=(--no-anneal-lr)
 if [[ ${ANNEAL_LR:-0} == 1 ]]; then
   ANNEAL_LR_ARGS=(--anneal-lr)
@@ -223,29 +220,14 @@ if [[ ! -e "$REPO/resources" ]]; then
     "$REPO/resources"
 fi
 
-export GPU_HEARTBEAT_TARGET_UTILIZATION="${GPU_HEARTBEAT_TARGET_UTILIZATION:-85}"
-export GPU_HEARTBEAT_CHECK_INTERVAL=0.2
-export GPU_HEARTBEAT_MATRIX_SIZE=6144
-export GPU_HEARTBEAT_DTYPE=bfloat16
-
 cleanup() {
   if [[ -n ${LOCAL_DATA:-} ]]; then
     rm -rf "$LOCAL_DATA"
-  fi
-  if [ -n "${HEARTBEAT_PID:-}" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
-    kill "$HEARTBEAT_PID"
-    wait "$HEARTBEAT_PID" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
 
 nvidia-smi
-if [[ $GPU_HEARTBEAT == 1 ]]; then
-  nice -n 19 "$PUFFER_SOCCER/.venv/bin/python" -u \
-    "$PUFFER_SOCCER/sbatch/gpu_heartbeat.py" &
-  HEARTBEAT_PID=$!
-  echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
-fi
 
 cd "$RUN_ROOT"
 "$ENV_PREFIX/bin/python" -u -m gfootball.examples.train_puffer \

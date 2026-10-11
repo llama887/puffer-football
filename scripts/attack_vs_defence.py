@@ -157,7 +157,7 @@ def main():
         actions = np.zeros(22, np.int64)
         # Drawn for all 22 rows, then the attack's kept: this consumes the
         # generator exactly as the scorer behind the recorded results did
-        # (trace_chase.py), so the same seed reproduces those numbers.
+        # (an earlier trace script), so the same seed reproduces them.
         actions[attack] = act(policy, rows_for(policy, raw),
                               states[0], generators[0])[attack]
         if defence is not None:

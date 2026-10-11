@@ -196,7 +196,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
   the ranges are private points at the start values: the start scene.
   """
 
-  def __init__(self, env_name=adr.SCENARIO, render=False, buf=None, seed=0,
+  def __init__(self, env_name=adr.SCENARIO, buf=None, seed=0,
                frame_stack=4, sort_players=True, frozen_defence_path=None,
                frozen_defence_horizon=32, ball_potential_scale=0.0,
                potential_gamma=0.99, player_potential_scale=0.0,
@@ -250,7 +250,6 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     super().__init__(buf)
 
     self._env_name = env_name
-    self._render = render
     self._seed = int(seed)
     # Episode-level draws (ADR settings, probes, random defenders) use their
     # own generator so they move nothing else.
@@ -351,7 +350,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         representation=('raw' if self._observation == 'entities'
                         else 'simple115v2'),
         rewards='scoring',
-        render=self._render,
+        render=False,
         write_goal_dumps=False,
         write_full_episode_dumps=False,
         write_video=False,
@@ -361,7 +360,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         extra_players=None,
         other_config_options={
             'action_set': 'default',
-            'fast_mode': not self._render,
+            'fast_mode': True,
             'game_engine_random_seed': self._seed,
             # simple115v2 does not encode sticky actions, and producing them
             # costs ten engine queries per controlled player per step.

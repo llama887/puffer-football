@@ -30,20 +30,12 @@ from gfootball.env.puffer_env import RANDOM_DEFENCE, make_vector_env
 from gfootball.env import football_action_set
 # Re-exported: scripts and tests import the policy from this module.
 from gfootball.env.puffer_policy import (  # noqa: F401
-    FootballPolicy, RunningNormalizer, episode_batch_sizes, episode_pieces,
-    save_policy_snapshot)
+    FootballPolicy, episode_batch_sizes, episode_pieces, save_policy_snapshot)
 
 
 ACTION_NAMES = tuple(
     str(action) for action in football_action_set.action_set_dict['default'])
 SHOT_ACTION = ACTION_NAMES.index('shot')
-
-# Order must match how train() stacks them; see the minibatch loop.
-MINIBATCH_STAT_NAMES = (
-    'old_approx_kl', 'approx_kl', 'clipfrac', 'importance',
-    'policy_loss', 'value_loss', 'entropy', 'gradient_norm',
-    'minibatch_transitions')
-
 
 def generalized_advantages(values, rewards, terminals, gamma, gae_lambda):
   """Standard GAE for Puffer's next-step reward storage convention."""
@@ -1354,15 +1346,6 @@ def build_parser():
                            'side-stream matmuls inside the trainer (Torch '
                            'warns below 75%%); replaces the external '
                            'heartbeat, which time-sliced the GPU')
-  parser.add_argument('--gpu-filler-kind', default='sleep',
-                      choices=('sleep',),
-                      help='sleep: a single-block spin kernel on one SM.  '
-                           'Graph-replaying fillers are not offered: they '
-                           'advance the CUDA generator and crash alongside '
-                           'the captured update and actor graphs')
-  parser.add_argument('--gpu-filler-matrix-size', type=int, default=1024,
-                      help='accepted for older launchers; the spin filler '
-                           'has no matrices')
   parser.add_argument('--overlap-collection',
                       action=argparse.BooleanOptionalAction, default=True,
                       help='keep collecting while the PPO update runs on the '
@@ -1603,8 +1586,7 @@ def main():
   filler = None
   if args.gpu_filler and args.device == 'cuda':
     from gfootball.examples.gpu_filler import GpuFiller
-    filler = GpuFiller(matrix_size=args.gpu_filler_matrix_size,
-                       kind=args.gpu_filler_kind).start()
+    filler = GpuFiller().start()
   if args.benchmark_epochs:
     try:
       print('BENCHMARK ' + json.dumps(

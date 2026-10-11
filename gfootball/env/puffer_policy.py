@@ -381,8 +381,8 @@ def save_policy_snapshot(policy, path):
   """Write a CPU copy of the weights that any process can load.
 
   The file is written beside `path` and renamed over it, so env workers
-  that reload a snapshot while the trainer replaces it (the level gate's
-  frozen defence, the ADR probe defence) never read a half-written file.
+  that reload a snapshot while the trainer replaces it (the ADR probe
+  defence) never read a half-written file.
   """
   partial = '{}.tmp{}'.format(path, os.getpid())
   torch.save({key: value.detach().cpu()
