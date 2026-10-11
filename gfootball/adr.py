@@ -1,4 +1,4 @@
-"""Automatic domain randomization (ADR) for the advantage scenario.
+"""Automatic domain randomization (ADR): what every training scene is.
 
 OpenAI, "Solving Rubik's Cube with a Robot Hand" (2019), Section 5: every
 randomized setting has its own range [low, high].  Training episodes draw
@@ -10,13 +10,14 @@ edge outward one step and one at or below `low_threshold` moves it inward.
 Ranges therefore grow where the policy copes and shrink where it does not,
 each setting on its own.
 
-Here the ranges replace the single curriculum level.  They all start as the
-single level-0 value and are clamped to each setting's valid limits.  The
-ranges live in a shared-memory array (`shared_ranges`): the trainer's
-randomizer records probe results and moves edges, and every env worker's
-randomizer, built on the same array, samples from the current ranges with no
-message passing.  The scenario (11_vs_11_advantage) turns a sampled set of
-values into a scene.
+The ranges all start as single points, the start scene (a carrier at the
+ball 0.1 from the goal line, one blocker), and are clamped to each setting's
+valid limits.  They live in a shared-memory array (`shared_ranges`): the
+trainer's randomizer records probe results and moves edges, and every env
+worker's randomizer, built on the same array, samples from the current
+ranges with no message passing.  The scenario (SCENARIO) turns a sampled set
+of values into a scene.  Evaluation scenes use fixed ranges instead
+(`set_difficulty`), the same for every run.
 """
 
 import collections
@@ -25,20 +26,31 @@ import multiprocessing
 import numpy as np
 
 LOWER, UPPER = 0, 1
+# The gfootball scenario that builds a scene from a set of ADR values.  It
+# reads them from the config value VALUES and writes what it built for the
+# episode into HELD_DIRECTIONS and LOOSE_BALL (see read_scene).
+SCENARIO = '11_vs_11_adr'
+VALUES = 'adr_values'
+HELD_DIRECTIONS = 'held_directions'
+LOOSE_BALL = 'loose_ball'
+
+# What the scenario built for an episode (read_scene).
+Scene = collections.namedtuple(
+    'Scene', ('attacking_left', 'held_directions', 'loose_ball'))
 
 ADRParameter = collections.namedtuple(
     'ADRParameter', ('name', 'minimum', 'maximum', 'start', 'step'))
 
-# Valid limits, the level-0 starting value and the step per edge move.
+# Valid limits, the starting value and the step per edge move.
 PARAMETERS = (
-    # Distance from the attacked goal line to the ball (level 0: 0.10).
+    # Distance from the attacked goal line to the ball.
     ADRParameter('ball_distance', 0.05, 1.0, 0.10, 0.045),
     # Ball y across the pitch.
     ADRParameter('ball_lateral', -0.36, 0.36, 0.0, 0.02),
     # Goal-side blockers; fractional values add one more by chance.
     ADRParameter('blockers', 0.0, 5.0, 1.0, 0.2),
     # Distance from the still ball to the nearest attacker (0.03: the
-    # carrier at the ball, as at level 0).
+    # carrier at the ball).
     ADRParameter('fetch_distance', 0.03, 0.9, 0.03, 0.05),
     # Nearest defender's distance minus the nearest attacker's.
     ADRParameter('defender_head_start', -0.5, 0.5, 0.05, 0.05),
@@ -53,6 +65,13 @@ PARAMETERS = (
 PARAMETER_INDEX = {parameter.name: i for i, parameter in enumerate(PARAMETERS)}
 # Widths below this count as this for the entropy, so a point is finite.
 _ENTROPY_FLOOR = 1e-3
+
+
+def _uniform_values(ranges, rng):
+  """Each setting uniform in its row of `ranges` (a point gives itself)."""
+  return {parameter.name: float(rng.uniform(low, high)) if high > low
+          else float(low)
+          for parameter, (low, high) in zip(PARAMETERS, ranges)}
 
 
 def shared_ranges():
@@ -103,12 +122,24 @@ class AutomaticDomainRandomization:
       raise ValueError('low must not exceed high')
     self._ranges[PARAMETER_INDEX[name]] = (low, high)
 
+  def set_difficulty(self, difficulty):
+    """Fix every range at a test difficulty, for evaluation scenes.
+
+    Difficulty d spans each setting from its start value out to d of the way
+    to each valid limit: 0 is the start scene, 1 every limit.  Unlike the
+    ranges training reaches, these depend on d alone, so a score at a given
+    d compares across runs and over time.
+    """
+    if not 0 <= difficulty <= 1:
+      raise ValueError('difficulty must be in [0, 1]')
+    for i, parameter in enumerate(PARAMETERS):
+      self._ranges[i] = (
+          parameter.start - difficulty * (parameter.start - parameter.minimum),
+          parameter.start + difficulty * (parameter.maximum - parameter.start))
+
   def sample(self, rng):
     """Values for a training episode: each setting uniform in its range."""
-    ranges = self.ranges()
-    return {parameter.name: float(rng.uniform(low, high)) if high > low
-            else float(low)
-            for parameter, (low, high) in zip(PARAMETERS, ranges)}
+    return _uniform_values(self.ranges(), rng)
 
   def sample_probe(self, rng):
     """Values for a probe episode, and which setting and edge it tests.
@@ -116,14 +147,23 @@ class AutomaticDomainRandomization:
     One setting, chosen uniformly, is pinned to its lower or upper edge
     (also chosen uniformly); the rest are sampled as for training.
     """
-    ranges = self.ranges()
-    values = {parameter.name: float(rng.uniform(low, high)) if high > low
-              else float(low)
-              for parameter, (low, high) in zip(PARAMETERS, ranges)}
     index = int(rng.integers(len(PARAMETERS)))
     edge = int(rng.integers(2))
+    return self.sample_pinned(rng, index, edge), index, edge
+
+  def sample_pinned(self, rng, index, edge):
+    """Values with setting `index` at `edge` (LOWER or UPPER) of its range
+    and the rest sampled as for training: a probe's scene, with the
+    setting and edge picked at random by sample_probe or by hand
+    (scripts/attack_vs_defence.py --scene adr:pin:...).
+
+    Every value comes from one copy of the ranges: the trainer may move an
+    edge while a worker samples, and the probe must test the edge it pins.
+    """
+    ranges = self.ranges()
+    values = _uniform_values(ranges, rng)
     values[PARAMETERS[index].name] = float(ranges[index][edge])
-    return values, index, edge
+    return values
 
   def record(self, index, edge, success):
     """Add one probe result at a setting's edge; move the edge when due.
@@ -159,3 +199,31 @@ class AutomaticDomainRandomization:
     widths = np.maximum(self._ranges[:, 1] - self._ranges[:, 0],
                         _ENTROPY_FLOOR)
     return float(np.mean(np.log(widths)))
+
+  def metrics(self):
+    """Both edges of every range and the entropy, as the trainer logs them
+    (`adr/<setting>/low`, `adr/<setting>/high`, `adr/entropy`)."""
+    metrics = {'adr/entropy': self.entropy()}
+    for parameter, (low, high) in zip(PARAMETERS, self._ranges):
+      metrics['adr/{}/low'.format(parameter.name)] = float(low)
+      metrics['adr/{}/high'.format(parameter.name)] = float(high)
+    return metrics
+
+  def load_metrics(self, metrics):
+    """Set every range from logged metrics (a training log's ADR line)."""
+    for parameter in PARAMETERS:
+      self.set_range(parameter.name,
+                     metrics['adr/{}/low'.format(parameter.name)],
+                     metrics['adr/{}/high'.format(parameter.name)])
+
+
+def read_scene(config):
+  """What the scenario built for the episode just reset into `config`: which
+  side attacks, the direction each agent holds on the first step (0: none)
+  and whether the opening is a race for a still ball."""
+  values = config._values
+  return Scene(
+      attacking_left=config.ScenarioConfig().ball_position[0] > 0,
+      held_directions=np.asarray(values.get(HELD_DIRECTIONS, [0] * 22),
+                                 dtype=np.int64),
+      loose_ball=bool(values.get(LOOSE_BALL, False)))

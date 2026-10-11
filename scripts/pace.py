@@ -31,7 +31,7 @@ if steps:
     total=float(v)*{'M':1e6,'K':1e3,'':1}[u]
     # steps divided by uptime is the number that decides when a run
     # finishes; the dashboard's own SPS is a recent window and reads
-    # high because it excludes the promotion checks.
+    # high because it excludes the evaluation checks.
     print(f'STEPS/SEC     : {total/max(1,up_s):7.0f} true average   ({total/1e6:.1f}M steps)')
 print(f'epoch {ep_n}   uptime {up_s/3600:.2f}h   overall {up_s/max(1,ep_n):.2f} s/epoch')
 if fast: print(f'normal epochs : {sum(fast)/len(fast):5.2f} s/epoch   (n={len(fast)})   [old run: 4.84]')

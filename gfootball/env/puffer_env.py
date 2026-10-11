@@ -1,8 +1,6 @@
 """PufferLib-native interface for headless 22-player self-play."""
 
-from collections import deque
 from functools import partial
-import os
 
 import gymnasium
 import numpy as np
@@ -12,12 +10,10 @@ import pufferlib.vector
 
 import gfootball.env as football_env
 from gfootball import adr
+from gfootball.env import defence
 from gfootball.env import entity_observation
 from gfootball.env import football_action_set
 from gfootball.env import wrappers
-from gfootball.curriculum import (
-    ADVANTAGE_ENV_NAME, ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS,
-    advantage_for_level, curriculum_state)
 
 
 # Engine units converted to simple115v2's per-step coordinate system.
@@ -35,9 +31,6 @@ _BALL_STEP_SCALE = np.array([
     45.0 / 10.0,
 ], dtype=np.float32)
 _GOAL_HEIGHT = 2.5
-# frozen_defence_path value for the base random policy: uniform random
-# actions for the defending side, no snapshot file.
-RANDOM_DEFENCE = 'random'
 
 
 def _soft_scale(values, scale):
@@ -192,20 +185,21 @@ def centralized_score_rewards(score_reward, active_mask, out=None):
 
 
 class FootballPufferEnv(pufferlib.PufferEnv):
-  """One GRF match exposed as 22 PufferLib agents."""
+  """One GRF match exposed as 22 PufferLib agents.
 
-  def __init__(self, env_name='11_vs_11_curriculum', render=False, buf=None,
-               seed=0, frame_stack=4, curriculum_levels=TOTAL_LEVELS,
-               curriculum_window=20, curriculum_success_threshold=0.6,
-               attacker_only_levels=0, curriculum_level_value=None,
-               curriculum_evaluation=False, sort_players=True,
-               frozen_defence_path=None, frozen_defence_horizon=32,
-               ball_potential_scale=0.0, potential_gamma=0.99,
-               player_potential_scale=0.0, spawn='curriculum',
+  Every episode is an ADR scene (gfootball/adr.py): its settings are drawn
+  from the ranges in `adr_shared`, the shared-memory array the trainer moves
+  (or a fixed test difficulty, for evaluation pools).  Without `adr_shared`
+  the ranges are private points at the start values: the start scene.
+  """
+
+  def __init__(self, env_name=adr.SCENARIO, buf=None, seed=0,
+               frame_stack=4, sort_players=True, frozen_defence_path=None,
+               frozen_defence_horizon=32, ball_potential_scale=0.0,
+               potential_gamma=0.99, player_potential_scale=0.0,
                observation='simple115', player_potential_fade_speed=0.0,
-               width_spawn_fraction=0.0, mixed_shape=False,
-               loose_ball_fraction=0.0, adr_shared=None,
-               adr_probe_fraction=0.0, adr_probe_defence=RANDOM_DEFENCE):
+               adr_shared=None, adr_probe_fraction=0.0,
+               adr_probe_defence=defence.RANDOM):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     # 'simple115': simple115v2 made egocentric (and sorted); 'entities': the
@@ -215,52 +209,14 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     if observation == 'entities' and frame_stack != 1:
       raise ValueError('entity observations need frame_stack=1')
     self._observation = observation
-    # 'curriculum' spawns each level's scene; 'uniform' ignores levels and
-    # places the ball and players uniformly (see 11_vs_11_advantage).
-    if spawn not in ('curriculum', 'uniform'):
-      raise ValueError("spawn must be 'curriculum' or 'uniform'")
-    if spawn == 'uniform' and env_name != ADVANTAGE_ENV_NAME:
-      raise ValueError('uniform spawn needs ' + ADVANTAGE_ENV_NAME)
-    # Width spawn: this fraction of training episodes spreads every outfield
-    # player except the goal-side blockers uniformly across the pitch width at
-    # the x their level gives them (see 11_vs_11_advantage).
-    if not 0 <= width_spawn_fraction <= 1:
-      raise ValueError('width_spawn_fraction must be in [0, 1]')
-    if width_spawn_fraction and env_name != ADVANTAGE_ENV_NAME:
-      raise ValueError('width_spawn_fraction needs ' + ADVANTAGE_ENV_NAME)
-    # Mixed shape (part of each level from 1 up): some attackers start ahead
-    # of the ball.  Loose-ball spawns (training only): the opening is a race
-    # for a still ball, with held directions pressed on the first step.
-    if not 0 <= loose_ball_fraction <= 1:
-      raise ValueError('loose_ball_fraction must be in [0, 1]')
-    if (loose_ball_fraction or mixed_shape) and env_name != ADVANTAGE_ENV_NAME:
-      raise ValueError('mixed_shape and loose_ball_fraction need ' +
-                       ADVANTAGE_ENV_NAME)
-    # Set before _make_env, which reads them when building the engine.
-    self._spawn = spawn
-    self._width_spawn_fraction = float(width_spawn_fraction)
-    self._mixed_shape = bool(mixed_shape)
-    self._loose_ball_fraction = float(loose_ball_fraction)
-    # Directions to press on the first step of a loose-ball episode.
+    # Directions to press on the first step of an episode with held players.
     self._warmup_actions = None
-    # ADR (gfootball/adr.py): every episode samples its settings from ranges
-    # the trainer keeps in shared memory; a probe episode pins one setting's
-    # edge and is played against `adr_probe_defence`: uniform random
-    # defenders ('random') or a snapshot file, reloaded whenever the trainer
-    # replaces it.
-    if adr_shared is not None and env_name != ADVANTAGE_ENV_NAME:
-      raise ValueError('adr needs ' + ADVANTAGE_ENV_NAME)
     if not 0 <= adr_probe_fraction <= 1:
       raise ValueError('adr_probe_fraction must be in [0, 1]')
-    self._adr = (adr.AutomaticDomainRandomization(shared=adr_shared)
-                 if adr_shared is not None else None)
+    self._adr = adr.AutomaticDomainRandomization(shared=adr_shared)
     self._adr_probe_fraction = float(adr_probe_fraction)
-    self._adr_probe_defence = adr_probe_defence
     self._adr_values = None
     self._adr_probe = None
-    # None: the frozen policy keeps memory for whole episodes.
-    if frozen_defence_horizon is not None and frozen_defence_horizon < 1:
-      raise ValueError('frozen_defence_horizon must be positive or None')
     for name, scale in (('ball_potential_scale', ball_potential_scale),
                         ('player_potential_scale', player_potential_scale),
                         ('player_potential_fade_speed',
@@ -269,14 +225,6 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         raise ValueError(name + ' must be finite and non-negative')
     if not 0 < potential_gamma <= 1:
       raise ValueError('potential_gamma must be in (0, 1]')
-    if curriculum_levels < 2:
-      raise ValueError('curriculum_levels must be at least 2')
-    if curriculum_window < 1:
-      raise ValueError('curriculum_window must be positive')
-    if not 0 < curriculum_success_threshold <= 1:
-      raise ValueError('curriculum_success_threshold must be in (0, 1]')
-    if not 0 <= attacker_only_levels <= curriculum_levels:
-      raise ValueError('attacker_only_levels must be within curriculum')
     self.num_envs = 1
     self.num_agents = 22
     self.agents_per_batch = self.num_agents
@@ -292,27 +240,12 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     super().__init__(buf)
 
     self._env_name = env_name
-    self._render = render
     self._seed = int(seed)
-    # Episode-level draws (ADR settings, probes, random defenders) use their
+    # Episode-level draws (ADR settings and probes) use their
     # own generator so they move nothing else.
     self._episode_rng = np.random.default_rng([self._seed, 0xad5])
     self._frame_stack = frame_stack
     self._sort_players = bool(sort_players)
-    self._curriculum_levels = int(curriculum_levels)
-    self._curriculum_level = 0
-    self._curriculum_results = deque(maxlen=int(curriculum_window))
-    self._curriculum_success_threshold = float(curriculum_success_threshold)
-    self._attacker_only_levels = int(attacker_only_levels)
-    self._curriculum_level_value = curriculum_level_value
-    self._curriculum_evaluation = bool(curriculum_evaluation)
-    self._advantage_mode = env_name == ADVANTAGE_ENV_NAME
-    self._curriculum_enabled = env_name in (
-        '11_vs_11_curriculum', ADVANTAGE_ENV_NAME)
-    self._episode_level = 0
-    self._episode_attackers = 1
-    self._episode_template = 0
-    self._episode_width_spawn = False
     self._episode_loose_ball = False
     self._attacking_left = True
     self._active_mask = np.ones(self.num_agents, dtype=bool)
@@ -320,22 +253,21 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._episode_active_mask = np.ones(self.num_agents, dtype=bool)
     self._step_actions = np.zeros(self.num_agents, dtype=np.int64)
     self._step_rewards = np.zeros(self.num_agents, dtype=np.float32)
-    # A frozen policy plays the whole defending side, so the learner (and the
-    # promotion gate) faces a FIXED opponent instead of its own moving self.
-    # It runs inside this worker process on the CPU; the defending rows are
-    # hidden from the caller exactly like inactive curriculum players.
-    self._frozen_defence_path = frozen_defence_path
-    self._frozen_defence_horizon = frozen_defence_horizon
-    # Who defends the current episode, set at each reset: None (the caller,
-    # self-play), RANDOM_DEFENCE, or a snapshot path (the frozen defence for
-    # every episode, or the ADR probe defence for probe episodes only).
-    self._episode_defence = frozen_defence_path
-    self._frozen_policy = None
-    # (path, inode, mtime) of the file _frozen_policy was loaded from.
-    self._frozen_policy_source = None
-    self._frozen_state = None
-    self._frozen_steps = 0
-    self._full_observations = None
+    # Who defends when the caller does not (gfootball/env/defence.py): the
+    # frozen defence plays every episode (evaluation pools), the probe
+    # defence plays ADR probe episodes.  Either way the defending rows are
+    # hidden from the caller, so they are never trained.
+    def side(spec):
+      return defence.Defence(spec, self.single_action_space.n, self._seed,
+                             memory_window=frozen_defence_horizon,
+                             sort_players=sort_players)
+    self._frozen_defence = (None if frozen_defence_path is None
+                            else side(frozen_defence_path))
+    self._probe_defence = side(adr_probe_defence)
+    # The defence of the current episode (None: the caller, self-play), and
+    # its actions for the next step, computed with each observation.
+    self._episode_defence = self._frozen_defence
+    self._defence_actions = None
     # Entity mode: the engine's raw per-agent views of the latest frame, and
     # the sticky buttons each agent holds (entity_observation.press_buttons).
     self._raw_views = None
@@ -407,7 +339,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         representation=('raw' if self._observation == 'entities'
                         else 'simple115v2'),
         rewards='scoring',
-        render=self._render,
+        render=False,
         write_goal_dumps=False,
         write_full_episode_dumps=False,
         write_video=False,
@@ -417,82 +349,41 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         extra_players=None,
         other_config_options={
             'action_set': 'default',
-            'advantage': advantage_for_level(
-                self._curriculum_level, self._curriculum_levels),
-            'curriculum_level': self._curriculum_level,
-            'curriculum_levels': self._curriculum_levels,
-            'curriculum_evaluation': self._curriculum_evaluation,
-            'fast_mode': not self._render,
+            'fast_mode': True,
             'game_engine_random_seed': self._seed,
             # simple115v2 does not encode sticky actions, and producing them
             # costs ten engine queries per controlled player per step.
             'needs_sticky_actions': False,
             'real_time': False,
-            'uniform_spawn': self._spawn == 'uniform',
-            'width_spawn_fraction': self._width_spawn_fraction,
-            'mixed_shape': self._mixed_shape,
-            'loose_ball_fraction': self._loose_ball_fraction,
         })
 
   def _reset_match(self):
-    if self._curriculum_level_value is not None:
-      shared_level = self._curriculum_level_value.value
-      if shared_level != self._curriculum_level:
-        self._curriculum_results.clear()
-        self._curriculum_level = shared_level
-    self._env.unwrapped._config['curriculum_level'] = self._curriculum_level
-    if self._advantage_mode:
-      self._env.unwrapped._config['advantage'] = advantage_for_level(
-          self._curriculum_level, self._curriculum_levels)
-    if self._adr is not None:
-      self._adr_probe = None
-      if self._episode_rng.random() < self._adr_probe_fraction:
-        self._adr_values, index, edge = self._adr.sample_probe(
-            self._episode_rng)
-        self._adr_probe = (index, edge)
-      else:
-        self._adr_values = self._adr.sample(self._episode_rng)
-      self._env.unwrapped._config['adr_values'] = self._adr_values
-    self._episode_defence = (self._adr_probe_defence
-                             if self._adr_probe is not None
-                             else self._frozen_defence_path)
-    if self._episode_defence not in (None, RANDOM_DEFENCE):
-      # Reload a snapshot replaced on disk since it was loaded: the level gate
-      # rewrites its snapshot when a level is cleared and the trainer
-      # refreshes the ADR probe defence.  Writers replace the file atomically
-      # (save_policy_snapshot), so new weights always come with a new inode.
-      # Checked once per episode, not per step, to spare the file system.
-      stat = os.stat(self._episode_defence)
-      source = (self._episode_defence, stat.st_ino, stat.st_mtime_ns)
-      if source != self._frozen_policy_source:
-        self._frozen_policy = None
-        self._frozen_policy_source = source
+    self._adr_probe = None
+    if self._episode_rng.random() < self._adr_probe_fraction:
+      self._adr_values, index, edge = self._adr.sample_probe(
+          self._episode_rng)
+      self._adr_probe = (index, edge)
+    else:
+      self._adr_values = self._adr.sample(self._episode_rng)
+    self._env.unwrapped._config[adr.VALUES] = self._adr_values
+    self._episode_defence = (self._probe_defence if self._adr_probe is not None
+                             else self._frozen_defence)
+    if self._episode_defence is not None:
+      self._episode_defence.start_episode()
     observations = self._from_engine(self._env.reset())
     self._sticky.fill(0)
-    raw_config = self._env.unwrapped._config
-    ball_x = raw_config.ScenarioConfig().ball_position[0]
-    self._attacking_left = ball_x > 0
-    self._episode_level = self._curriculum_level
-    if self._curriculum_enabled:
-      self._episode_attackers = int(
-          raw_config._values['curriculum_episode_attackers'])
-      self._episode_template = int(
-          raw_config._values['curriculum_episode_template'])
-    self._episode_width_spawn = bool(
-        raw_config._values.get('curriculum_width_spawn', False))
-    self._episode_loose_ball = bool(
-        raw_config._values.get('curriculum_loose_ball', False))
+    scene = adr.read_scene(self._env.unwrapped._config)
+    self._attacking_left = scene.attacking_left
+    self._episode_loose_ball = scene.loose_ball
     self._set_active_players()
-    # A loose-ball spawn presses its held directions on the first step.  Every
-    # row is hidden for that step, so the trainer (which skips all-zero rows)
-    # never trains on actions the policy did not choose.
-    held = np.asarray(raw_config._values.get(
-        'curriculum_held_directions', ()), dtype=np.int64)
-    self._warmup_actions = held if held.size and held.any() else None
+    # A scene with held players (ADR held_share) presses their directions on
+    # the first step.  Every row is hidden for that step, so the trainer
+    # (which skips all-zero rows) never trains on actions the policy did not
+    # choose.
+    held = scene.held_directions
+    self._warmup_actions = held if held.any() else None
     if self._warmup_actions is not None:
       self._active_mask.fill(False)
-    if self._episode_defence is not None:
-      self._frozen_state = {'lstm_h': None, 'lstm_c': None, 'done': None}
     if self._ball_potential_scale or self._player_potential_scale:
       self._set_potentials(observations)
     return observations
@@ -502,98 +393,19 @@ class FootballPufferEnv(pufferlib.PufferEnv):
 
   def _set_active_players(self):
     self._active_mask.fill(True)
-    if self._curriculum_enabled and not self._advantage_mode:
-      _, defenders, _ = curriculum_state(self._episode_level)
-      self._active_mask.fill(False)
-      attacking_offset = 0 if self._attacking_left else 11
-      defending_offset = 11 - attacking_offset
-      self._active_mask[
-          attacking_offset + np.asarray(
-              ATTACKER_ORDER[:self._episode_attackers], dtype=np.intp)] = True
-      if self._episode_level >= self._attacker_only_levels:
-        self._active_mask[defending_offset] = True
-        self._active_mask[
-            defending_offset + np.asarray(
-                DEFENDER_ORDER[:defenders], dtype=np.intp)] = True
     if self._episode_defence is not None:
-      # The frozen, random or ADR probe defence is acted by this worker,
-      # never by the caller, and is never trained.
+      # The defence is acted by this worker, never by the caller.
       self._active_mask[self._defending_rows()] = False
 
   def _adr_info(self):
     """Episode-end ADR fields: whether it was a probe, which setting and
     edge it tested (-1 if none) and every setting it was played with."""
-    if self._adr is None:
-      return {}
     index, edge = self._adr_probe if self._adr_probe else (-1, -1)
     info = {'adr_probe': float(self._adr_probe is not None),
             'adr_parameter': float(index), 'adr_edge': float(edge)}
     for name, value in self._adr_values.items():
       info['adr_' + name] = float(value)
     return info
-
-  def _random_defence(self):
-    """True when uniform random actions play the defending side this
-    episode: the 'random' frozen defence (the base random policy) or an ADR
-    probe against the default random probe defence."""
-    return self._episode_defence == RANDOM_DEFENCE
-
-  def _load_frozen_policy(self):
-    """The episode's defending snapshot, single threaded on the CPU.
-
-    Loaded on first use and kept until _reset_match finds the file replaced
-    on disk (or a reseeding reset() clears it); the per-step callers only
-    read the cached policy.
-    """
-    if self._frozen_policy is None:
-      import torch
-      from gfootball.env.puffer_policy import load_frozen_policy
-      torch.set_num_threads(1)
-      self._torch = torch
-      self._frozen_policy = load_frozen_policy(self._episode_defence, self)
-      self._frozen_generator = torch.Generator().manual_seed(self._seed)
-    return self._frozen_policy
-
-  def _frozen_actions(self):
-    """Actions for the defending rows from the episode's snapshot defence,
-    or uniform random actions when the defence is random
-    (_random_defence)."""
-    if self._random_defence():
-      return self._episode_rng.integers(
-          0, self.single_action_space.n, size=11)
-    self._load_frozen_policy()
-    torch = self._torch
-    # Training without carried memory resets the recurrent state at the start
-    # of every rollout window regardless of episode boundaries, so a policy
-    # trained that way is replayed the same way here (a horizon of None: it
-    # was trained with carried memory).  Episode ends reset it too
-    # (_reset_match).
-    if (self._frozen_defence_horizon is not None and
-        self._frozen_steps % self._frozen_defence_horizon == 0):
-      self._frozen_state['lstm_h'] = self._frozen_state['lstm_c'] = None
-    self._frozen_steps += 1
-    observations = torch.as_tensor(
-        self._full_observations[self._defending_rows()])
-    with torch.no_grad():
-      logits, _ = self._frozen_policy.forward_eval(
-          observations, self._frozen_state)
-      actions = torch.multinomial(
-          torch.softmax(logits.float(), dim=-1), 1,
-          generator=self._frozen_generator).squeeze(-1)
-    return actions.numpy()
-
-  def _record_curriculum_result(self, success):
-    self._curriculum_results.append(float(success))
-    success_rate = float(np.mean(self._curriculum_results))
-    advanced = (
-        len(self._curriculum_results) == self._curriculum_results.maxlen and
-        success_rate >= self._curriculum_success_threshold and
-        self._curriculum_level_value is None and
-        self._curriculum_level < self._curriculum_levels - 1)
-    if advanced:
-      self._curriculum_level += 1
-      self._curriculum_results.clear()
-    return success_rate, advanced
 
   def _from_engine(self, observations):
     """simple115v2 frames of what the engine returned, for this env's own use.
@@ -627,22 +439,13 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       normalize_egocentric(self.observations)
       if self._sort_players:
         sort_players_by_distance(self.observations)
-    if self._episode_defence not in (None, RANDOM_DEFENCE):
-      # The frozen side needs its own rows before they are hidden below, in
-      # the observation its snapshot was trained on: the fixed gate opponent
-      # is a simple115 policy, and every learner must face the same one.
-      reads = self._load_frozen_policy().normalizer.mean.numel()
-      if reads == self.observations.shape[1]:
-        self._full_observations = self.observations.copy()
-      elif self._observation == 'entities' and reads == 115:
-        frames = np.array(observations, dtype=np.float32)
-        normalize_egocentric(frames)
-        if self._sort_players:
-          sort_players_by_distance(frames)
-        self._full_observations = frames
-      else:
-        raise ValueError('frozen defence reads {} features; this match '
-                         'gives {}'.format(reads, self.observations.shape[1]))
+    if self._episode_defence is not None:
+      # The defence reads its rows before they are hidden below.
+      defending = self._defending_rows()
+      self._defence_actions = self._episode_defence.act(
+          self.observations[defending],
+          np.asarray(observations, dtype=np.float32).reshape(
+              self.num_agents, -1)[defending])
     self.observations[~self._active_mask] = 0
 
   def reset(self, seed=None):
@@ -651,18 +454,17 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       # engine is fully determined by these two values: the engine reseeds
       # its RNG from the scenario seed at every kickoff, and spawns depend
       # only on (seed, episode number).  This runs even for an unchanged
-      # seed, so a reused promotion pool replays the same episodes each time.
+      # seed, so a reused evaluation pool replays the same episodes each time.
       self._seed = int(seed)
       config = self._env.unwrapped._config
       config['game_engine_random_seed'] = self._seed
       config['episode_number'] = self._initial_episode_number
-      self._curriculum_results.clear()
-    if self._frozen_defence_path is not None:
-      # A persistent promotion pool replays the same episodes on every
-      # reset: reload the snapshot so its sampling generator restarts from
-      # the seed too.
-      self._frozen_policy = None
-      self._frozen_steps = 0
+      # ADR settings and the defences are drawn here, not by the engine;
+      # only a reseeding reset restarts the defences' streams.
+      self._episode_rng = np.random.default_rng([self._seed, 0xad5])
+      for side in (self._frozen_defence, self._probe_defence):
+        if side is not None:
+          side.reseed(self._seed)
     self._write_observations(self._reset_match())
     self.rewards.fill(0)
     self.terminals.fill(False)
@@ -685,7 +487,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     actions = self._step_actions
     actions[~episode_active_mask] = 0
     if self._episode_defence is not None:
-      actions[self._defending_rows()] = self._frozen_actions()
+      actions[self._defending_rows()] = self._defence_actions
     warmup = self._warmup_actions is not None
     if warmup:
       pressed = self._warmup_actions > 0
@@ -744,29 +546,12 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     if done:
       attacking_return = self._episode_return[
           0 if self._attacking_left else 1]
-      _, active_defenders, distance_progress = curriculum_state(
-          self._episode_level)
-      curriculum_success = attacking_return > 0
-      success_rate, advanced = self._record_curriculum_result(
-          curriculum_success) if self._curriculum_enabled else (0.0, False)
       infos.append({
-          'curriculum_advanced': float(advanced),
-          'curriculum_level': float(self._episode_level),
-          'curriculum_success': float(curriculum_success),
-          'curriculum_success_rate': success_rate,
-          'curriculum_active_attackers': float(self._episode_attackers),
-          'curriculum_active_defenders': float(active_defenders + 1),
-          'curriculum_learning_goalkeeper': float(
-              self._episode_level >= self._attacker_only_levels),
-          'curriculum_distance_progress': distance_progress,
-          'curriculum_template': float(self._episode_template),
-          'curriculum_width_spawn': float(self._episode_width_spawn),
-          'curriculum_loose_ball': float(self._episode_loose_ball),
+          # The attack scored: what ADR probes and every evaluation count.
+          'success': float(attacking_return > 0),
+          'attacking_left': float(self._attacking_left),
+          'loose_ball': float(self._episode_loose_ball),
           **self._adr_info(),
-          'curriculum_attacking_left': float(self._attacking_left),
-          'curriculum_frozen_defence': float(
-              self._frozen_defence_path is not None),
-          'curriculum_evaluation': float(self._curriculum_evaluation),
           # Identifies the match, so an asynchronous evaluator can take a
           # fixed quota of episodes from every match.
           'env_seed': float(self._seed),
@@ -801,9 +586,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
 
 
 def make_vector_env(num_envs=None, num_workers=None, batch_size=None,
-                    reserved_cpus=2, seed=0, centralized_curriculum=False,
-                    envs_per_worker=1, async_batch_workers=None,
-                    **env_kwargs):
+                    reserved_cpus=2, seed=0, envs_per_worker=1,
+                    async_batch_workers=None, **env_kwargs):
   """Create headless matches across PufferLib multiprocessing workers.
 
   Two independent ways to stop a GRF reset (far dearer than a step) from
@@ -829,11 +613,6 @@ def make_vector_env(num_envs=None, num_workers=None, batch_size=None,
     raise ValueError('num_envs must be a multiple of num_workers')
   if batch_size % envs_per_worker:
     raise ValueError('batch_size must be a multiple of envs_per_worker')
-  if centralized_curriculum:
-    if env_kwargs.get('curriculum_level_value') is not None:
-      raise ValueError('centralized curriculum already has a shared level')
-    from multiprocessing import RawValue
-    env_kwargs['curriculum_level_value'] = RawValue('i', 0)
   is_async = async_batch_workers is not None
   if is_async:
     if not 0 < async_batch_workers < num_workers:
@@ -853,5 +632,4 @@ def make_vector_env(num_envs=None, num_workers=None, batch_size=None,
     vecenv.zero_copy = False
     vecenv.sync_traj = False
   vecenv.is_async = is_async
-  vecenv.curriculum_level_value = env_kwargs.get('curriculum_level_value')
   return vecenv

@@ -11,11 +11,12 @@ import torch
 from gfootball.env.puffer_policy import (
     hidden_size_from_state_dict, save_policy_snapshot, upgrade_state_dict)
 from gfootball.examples.train_puffer import (
-    ACTION_NAMES, SHOT_ACTION, FootballPolicy, FootballPuffeRL, GraphedActor,
-    build_config, build_parser,
-    evaluate_promotion, evaluate_promotion_async, explained_variance,
-    generalized_advantages, normalize_advantages,
-    policy_diagnostics, promotion_passes, promotion_statistics)
+    ACTION_NAMES, SHOT_ACTION, FootballPolicy, GraphedActor, PpoUpdate,
+    SegmentCollector,
+    Evaluator, build_config, build_parser, defence_memory_window,
+    evaluate_episodes,
+    explained_variance, generalized_advantages, normalize_advantages,
+    policy_diagnostics)
 
 
 def _env(observation_size=115):
@@ -104,8 +105,8 @@ def test_bptt_forward_matches_stepwise_rollout_with_episode_resets():
     assert torch.allclose(gradient, stepwise_gradients[name], atol=1e-6), name
 
 
-def test_promotion_matches_training_across_rollout_and_episode_boundaries():
-  """Promotion must replay the same recurrent windows as PufferLib rollout."""
+def test_evaluation_matches_training_across_rollout_and_episode_boundaries():
+  """Evaluation must replay the same recurrent windows as PufferLib rollout."""
   for horizon in (3, 32):
     torch.manual_seed(7)
     steps = 2 * horizon + 5
@@ -120,24 +121,28 @@ def test_promotion_matches_training_across_rollout_and_episode_boundaries():
         self.recorded_values.append(values.clone())
         return logits, values
 
-    class TrajectoryEnv:
-      def reset(self, seed):
-        self.step_index = 0
-        self.episode_length = 0
-        return observations[:, 0].numpy(), []
+    class TrajectoryPool:
+      """One match replaying `observations`, episodes ending at `done`."""
+      num_agents = 1
+      driver_env = SimpleNamespace(num_agents=1)
 
-      def step(self, actions):
-        self.step_index += 1
-        self.episode_length += 1
+      def async_reset(self, seed):
+        self.seed, self.step_index, self.episode_length = seed, 0, 0
+
+      def recv(self):
         terminals = done[:, self.step_index].numpy()
         infos = []
         if terminals[0]:
-          infos.append({'curriculum_success': 1.0,
-                        'curriculum_template': 0,
+          infos.append({'success': 1.0, 'env_seed': float(self.seed),
                         'episode_length': self.episode_length})
           self.episode_length = 0
         return (observations[:, self.step_index].numpy(), np.zeros(1),
-                terminals, np.zeros(1, dtype=bool), infos)
+                terminals, np.zeros(1, dtype=bool), infos, np.zeros(1, int),
+                np.ones(1, dtype=bool))
+
+      def send(self, actions):
+        self.step_index += 1
+        self.episode_length += 1
 
     policy = RecordingPolicy(_env(), hidden_size=16)
     policy.recorded_logits, policy.recorded_values = [], []
@@ -151,132 +156,28 @@ def test_promotion_matches_training_across_rollout_and_episode_boundaries():
                                 {'done': done[:, start:stop]})
         expected_logits.append(logits)
         expected_values.append(values.flatten())
-    metrics = evaluate_promotion(policy, TrajectoryEnv(), 3, 17, 'cpu', horizon)
+    metrics = evaluate_episodes(policy, TrajectoryPool(), 3, 17, 'cpu',
+                                horizon)
     assert policy.training  # Evaluation restores the caller's mode.
-    assert metrics['promotion_episodes'] == 3
-    assert metrics['promotion_recurrent_horizon'] == horizon
-    assert torch.allclose(torch.cat(policy.recorded_logits),
+    assert metrics['episodes'] == 3
+    assert metrics['recurrent_horizon'] == horizon
+    # The pool also hands over the frame after the last episode end.
+    assert len(policy.recorded_logits) == steps + 1
+    assert torch.allclose(torch.cat(policy.recorded_logits)[:steps],
                           torch.cat(expected_logits), atol=1e-6)
-    assert torch.allclose(torch.cat(policy.recorded_values),
+    assert torch.allclose(torch.cat(policy.recorded_values)[:steps],
                           torch.cat(expected_values), atol=1e-6)
-
-
-class _ScriptedEnv:
-  """One agent row; every episode lasts `length` steps and ends as told."""
-
-  def __init__(self, length, successes):
-    self.length = length
-    self.successes = list(successes)
-    self.actions = []
-
-  def reset(self, seed):
-    self.step_index = 0
-    self.episode = 0
-    return np.random.RandomState(seed).randn(1, 115).astype(np.float32), []
-
-  def step(self, actions):
-    self.actions.append(int(np.asarray(actions).reshape(-1)[0]))
-    self.step_index += 1
-    infos = []
-    terminal = self.step_index % self.length == 0
-    if terminal:
-      success = self.successes[self.episode % len(self.successes)]
-      infos.append({'curriculum_success': float(success),
-                    'curriculum_template': self.episode % 8,
-                    'episode_length': self.length})
-      self.episode += 1
-    observation = np.random.RandomState(self.step_index).randn(
-        1, 115).astype(np.float32)
-    return (observation, np.zeros(1), np.array([terminal]),
-            np.zeros(1, dtype=bool), infos)
-
-
-def test_greedy_promotion_takes_the_argmax_action():
-  torch.manual_seed(3)
-  policy = FootballPolicy(_env(), hidden_size=16)
-  # Make the actor decisive so argmax and sampling visibly differ.
-  with torch.no_grad():
-    policy.actor.weight.mul_(50)
-  env = _ScriptedEnv(length=4, successes=[1])
-  logits_seen = []
-  original = policy.forward_eval
-
-  def recording_forward_eval(observations, state):
-    logits, values = original(observations, state)
-    logits_seen.append(logits.clone())
-    return logits, values
-
-  policy.forward_eval = recording_forward_eval
-  metrics = evaluate_promotion(policy, env, 2, 5, 'cpu', 4, greedy=True)
-  assert metrics['promotion_greedy'] == 1.0
-  assert metrics['promotion_aborted'] == 0.0
-  expected = [int(logits.argmax(dim=-1)[0]) for logits in logits_seen]
-  assert env.actions == expected
-
-
-def test_promotion_early_abort_stops_hopeless_evaluations():
-  torch.manual_seed(0)
-  policy = FootballPolicy(_env(), hidden_size=16)
-  hopeless = _ScriptedEnv(length=2, successes=[0])
-  metrics = evaluate_promotion(
-      policy, hopeless, 40, 1, 'cpu', 8, early_abort=(6, 0.4))
-  assert metrics['promotion_aborted'] == 1.0
-  assert metrics['promotion_episodes'] == 6
-  assert metrics['promotion_success_rate'] == 0.0
-  assert not promotion_passes(metrics, 0.6, 0.4)
-
-  promising = _ScriptedEnv(length=2, successes=[1, 1, 0])
-  metrics = evaluate_promotion(
-      policy, promising, 12, 1, 'cpu', 8, early_abort=(6, 0.4))
-  assert metrics['promotion_aborted'] == 0.0
-  assert metrics['promotion_episodes'] == 12
 
 
 def test_defaults_lower_entropy_and_spend_less_on_evaluation():
   args = build_parser().parse_args(['--device', 'cpu'])
   assert args.ent_coef == 0.001
-  assert args.promotion_interval == 100
-  assert args.promotion_episodes == 256
-  assert args.frozen_defence_gate is True
-  assert args.greedy_promotion_episodes > 0
-  # Per 100 epochs the original schedule ran 4 x 256 held-out episodes and
-  # the first frozen-gate schedule 512 + 128 + 128, which measured at half
-  # the job.  The gate plus both diagnostics must stay well under either.
-  assert (args.promotion_episodes + args.greedy_promotion_episodes +
-          args.selfplay_promotion_episodes) <= 2 * 256
-
-
-def test_every_level_is_score_gated_by_default():
-  args = build_parser().parse_args(['--device', 'cpu'])
-  assert args.scored_promotion_levels is None
-  args = build_parser().parse_args(
-      ['--device', 'cpu', '--scored-promotion-levels', '4'])
-  assert args.scored_promotion_levels == 4
-
-
-def test_gate_averages_the_two_weakest_templates():
-  episodes = []
-  for template in range(8):
-    rate = 0.3 if template == 7 else 0.7
-    episodes.extend({
-        'curriculum_template': template,
-        'curriculum_success': float(index < rate * 10),
-    } for index in range(10))
-  metrics = promotion_statistics(episodes)
-  assert math.isclose(metrics['promotion_worst_template_success_rate'], 0.3)
-  assert math.isclose(
-      metrics['promotion_worst_two_template_success_rate'], 0.5)
-  # One weak template no longer blocks promotion on its own ...
-  assert promotion_passes(metrics, 0.6, 0.4)
-  # ... but a genuine hole in two templates still does.
-  episodes[-20:] = ({
-      'curriculum_template': 6 + (index >= 10),
-      'curriculum_success': float(index % 10 < 2),
-  } for index in range(20))
-  metrics = promotion_statistics(episodes)
-  assert math.isclose(
-      metrics['promotion_worst_two_template_success_rate'], 0.2)
-  assert not promotion_passes(metrics, 0.6, 0.4)
+  assert args.evaluation_interval == 100
+  # Per 100 epochs the level gate ran up to 384 held-out episodes, which
+  # measured at nearly half the job; a check (one random-defender score per
+  # difficulty) must stay well under that.
+  difficulties = args.evaluation_difficulties.split(',')
+  assert len(difficulties) * args.evaluation_episodes <= 256
 
 
 def test_episode_end_clears_recurrent_memory():
@@ -340,27 +241,8 @@ def test_policy_diagnostics_distinguish_uniform_and_collapsed_policies():
   assert collapsed['policy_max_probability'].item() > 0.99
 
 
-def test_promotion_requires_overall_and_every_heldout_template():
-  episodes = []
-  for template in range(8):
-    episodes.extend({
-        'curriculum_template': template,
-        'curriculum_success': float(success),
-    } for success in ([1] * 7 + [0] * 3))
-  metrics = promotion_statistics(episodes)
-  assert promotion_passes(metrics, 0.6, 0.4)
-  assert metrics['promotion_template_0_success_rate'] == 0.7
-
-  episodes[-10:] = ({
-      'curriculum_template': 7,
-      'curriculum_success': 0.0,
-  } for _ in range(10))
-  metrics = promotion_statistics(episodes)
-  assert not promotion_passes(metrics, 0.6, 0.4)
-
-
 def test_config_satisfies_pufferlib_batching_constraints():
-  args = build_parser().parse_args(['--device', 'cpu', '--no-async-collection'])
+  args = build_parser().parse_args(['--device', 'cpu'])
   num_agents = 660
   config = build_config(args, num_agents)
   horizon = config['bptt_horizon']
@@ -373,93 +255,112 @@ def test_config_satisfies_pufferlib_batching_constraints():
   assert config['minibatch_size'] <= config['max_minibatch_size']
   # PufferLib requires at least one buffer row per agent.
   assert segments >= num_agents
-  # One segment per agent per epoch keeps rollout and BPTT state aligned.
-  assert segments == num_agents
+  # Whole segments per agent keep rollout and BPTT state aligned.
+  assert segments % num_agents == 0
 
 
-def test_shaping_controls_share_discount_and_stay_out_of_promotion():
-  """CLI scales stay opt-in and promotion construction receives neither."""
-  from gfootball.examples.train_puffer import _make_promotion_env
+class _RecordingPools:
+  """A pool factory for Evaluator that records how each pool was built."""
+
+  def __init__(self):
+    self.built = []
+
+  def __call__(self, **kwargs):
+    self.built.append(kwargs)
+    return SimpleNamespace(kwargs=kwargs, close=lambda: None)
+
+
+def test_shaping_controls_share_discount_and_stay_out_of_evaluation():
+  """CLI scales stay opt-in and evaluation pools receive neither."""
   defaults = build_parser().parse_args([])
   assert defaults.ball_potential == defaults.player_potential == 0
   args = build_parser().parse_args([
       '--ball-potential', '1', '--player-potential', '0.3', '--gamma', '0.997'])
   assert args.player_potential == 0.3
   assert build_config(args, 660)['gamma'] == 0.997
-  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
-    _make_promotion_env(args, SimpleNamespace(value=4))
-  assert 'ball_potential_scale' not in make.call_args.kwargs
-  assert 'player_potential_scale' not in make.call_args.kwargs
+  pools = _RecordingPools()
+  with patch('gfootball.examples.train_puffer.evaluate_episodes'):
+    Evaluator(args, make_pool=pools).score(None, 0.5)
+  assert 'ball_potential_scale' not in pools.built[0]
+  assert 'player_potential_scale' not in pools.built[0]
 
 
-def test_loose_ball_shaping_and_width_spawn_are_opt_in_and_training_only():
-  """Both default off; the gate is built with neither.
-
-  The fade only changes shaping, which promotion never uses, and width spawns
-  are a training distribution: the gate keeps scoring the level's own scenes.
-  """
-  from gfootball.examples.train_puffer import _make_promotion_env
+def test_loose_ball_shaping_is_opt_in_and_training_only():
+  """The player-potential fade defaults off and changes shaping only, which
+  evaluation never uses."""
   defaults = build_parser().parse_args([])
   assert defaults.player_potential_fade_speed == 0
-  assert defaults.width_spawn_fraction == 0
   args = build_parser().parse_args([
-      '--player-potential', '0.3', '--player-potential-fade-speed', '0.5',
-      '--width-spawn-fraction', '0.5'])
+      '--player-potential', '0.3', '--player-potential-fade-speed', '0.5'])
   assert args.player_potential_fade_speed == 0.5
-  assert args.width_spawn_fraction == 0.5
-  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
-    _make_promotion_env(args, SimpleNamespace(value=4))
-  assert 'player_potential_fade_speed' not in make.call_args.kwargs
-  assert 'width_spawn_fraction' not in make.call_args.kwargs
+  pools = _RecordingPools()
+  with patch('gfootball.examples.train_puffer.evaluate_episodes'):
+    Evaluator(args, make_pool=pools).score(None, 0.5)
+  assert 'player_potential_fade_speed' not in pools.built[0]
 
 
-def test_mixed_shape_reaches_the_gate_and_loose_balls_stay_in_training():
-  """The mixed shape defines the level, so the gate plays it too; loose-ball
-  spawns are a training distribution only.  Both default off."""
-  from gfootball.examples.train_puffer import _make_promotion_env
-  defaults = build_parser().parse_args([])
-  assert defaults.mixed_shape is False
-  assert defaults.loose_ball_fraction == 0
-  args = build_parser().parse_args(
-      ['--mixed-shape', '--loose-ball-fraction', '0.5'])
-  assert args.mixed_shape is True and args.loose_ball_fraction == 0.5
-  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
-    _make_promotion_env(args, SimpleNamespace(value=2))
-  assert make.call_args.kwargs['mixed_shape'] is True
-  assert 'loose_ball_fraction' not in make.call_args.kwargs
-
-
-def test_adr_is_opt_in_and_probe_results_move_the_shared_ranges():
-  """--adr is off by default; probe results in episode infos are recorded at
-  their setting's edge (other episodes are ignored), and the gate pool never
-  samples from the ADR ranges."""
+def test_probe_results_move_the_shared_ranges():
+  """Probe results in episode infos are recorded at their setting's edge
+  (other episodes are ignored)."""
   from gfootball import adr
-  from gfootball.examples.train_puffer import (
-      _make_promotion_env, record_adr_probes)
+  from gfootball.examples.train_puffer import record_adr_probes
   defaults = build_parser().parse_args([])
-  assert defaults.adr is False
   assert defaults.adr_probe_fraction == 0.2
   assert defaults.adr_buffer_size == 64
   assert (defaults.adr_low_threshold, defaults.adr_high_threshold) == (0.3, 0.6)
-  assert defaults.random_baseline_levels == '5,9,14'
   randomizer = adr.AutomaticDomainRandomization(buffer_size=2)
   index = adr.PARAMETER_INDEX['fetch_distance']
   infos = [
       {'adr_probe': 1.0, 'adr_parameter': float(index),
-       'adr_edge': float(adr.UPPER), 'curriculum_success': 1.0},
+       'adr_edge': float(adr.UPPER), 'success': 1.0},
       {'adr_probe': 0.0, 'adr_parameter': -1.0, 'adr_edge': -1.0,
-       'curriculum_success': 1.0},
-      {'curriculum_success': 0.0},
+       'success': 1.0},
+      {'success': 0.0},
       {'adr_probe': 1.0, 'adr_parameter': float(index),
-       'adr_edge': float(adr.UPPER), 'curriculum_success': 1.0},
+       'adr_edge': float(adr.UPPER), 'success': 1.0},
   ]
   assert record_adr_probes(randomizer, infos) == 2
   low, high = randomizer.ranges()[index]
   assert high > adr.PARAMETERS[index].start and low == adr.PARAMETERS[index].start
-  args = build_parser().parse_args(['--adr'])
-  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
-    _make_promotion_env(args, SimpleNamespace(value=0))
-  assert 'adr_shared' not in make.call_args.kwargs
+
+
+def test_evaluation_scores_on_fixed_adr_difficulty_scenes():
+  """The evaluator scores on ADR scenes at fixed test difficulties (adr
+  set_difficulty), never on the ranges training has reached and never with
+  probes, one seed per difficulty, and keeps one pool per defence."""
+  from gfootball import adr
+  from gfootball.examples import train_puffer
+  assert build_parser().parse_args([]).evaluation_difficulties == '0.25,0.5,1.0'
+  seen = []
+
+  def fake_evaluate(policy, pool, episodes, seed, device, recurrent_horizon):
+    ranges = adr.AutomaticDomainRandomization(
+        shared=pool.kwargs['adr_shared']).ranges()
+    seen.append((pool.kwargs, seed, episodes))
+    return {'success_rate': float(ranges[adr.PARAMETER_INDEX['blockers'], 1])}
+
+  args = build_parser().parse_args(['--evaluation-difficulties', '0.5,1.0'])
+  pools = _RecordingPools()
+  evaluator = Evaluator(args, make_pool=pools)
+  with patch.object(train_puffer, 'evaluate_episodes', fake_evaluate):
+    for _ in range(2):
+      metrics = evaluator.baseline(policy=None)
+      evaluator.score(None, 0.5)
+  blockers = adr.PARAMETERS[adr.PARAMETER_INDEX['blockers']]
+  assert metrics == {
+      'vs_random/difficulty_0.5/success_rate':
+          blockers.start + 0.5 * (blockers.maximum - blockers.start),
+      'vs_random/difficulty_1.0/success_rate': blockers.maximum}
+  # One pool for the random defence and one for self-play, built once.
+  assert [kwargs['frozen_defence_path'] for kwargs in pools.built] == [
+      'random', None]
+  for kwargs, seed, episodes in seen:
+    assert kwargs['adr_probe_fraction'] == 0.0
+    assert episodes == args.evaluation_episodes
+  assert seen[0][1] != seen[1][1]
+  # Same difficulty, same scenes, whatever the defence (the probe refresh
+  # compares defences on them) and on every check.
+  assert seen[0][1] == seen[2][1] == seen[3][1]
 
 
 def test_adr_probe_defence_is_replaced_only_when_clearly_weaker_than_self_play():
@@ -477,21 +378,21 @@ def test_adr_probe_defence_is_replaced_only_when_clearly_weaker_than_self_play()
   torch.manual_seed(0)
   old = FootballPolicy(_env(), hidden_size=16).eval()
   learner = FootballPolicy(_env(), hidden_size=16).eval()
-  args = build_parser().parse_args(['--adr', '--random-baseline-levels', '5,9'])
+  args = build_parser().parse_args([])
   observations = torch.randn(4, 115)
   for vs_probe, vs_self, replaced in ((0.50, 0.45, False), (0.60, 0.45, True)):
     with tempfile.TemporaryDirectory() as directory:
       path = directory + '/adr_probe_defence.pt'
       save_policy_snapshot(old, path)
 
-      def fake_run(args, policy, level_value, level, device, episodes,
-                   frozen_defence_path=None, **_):
-        return {'promotion_success_rate':
-                vs_probe if frozen_defence_path == path else vs_self}
+      class FakeEvaluator:
+        difficulties = [0.5, 1.0]
 
-      with patch.object(train_puffer, '_run_promotion', fake_run):
-        metrics = train_puffer.refresh_adr_probe_defence(
-            args, learner, SimpleNamespace(value=0), path)
+        def score(self, policy, difficulty, defence=None):
+          return {'success_rate': vs_probe if defence == path else vs_self}
+
+      metrics = train_puffer.refresh_adr_probe_defence(
+          args, FakeEvaluator(), learner, path)
       expected = learner if replaced else old
       restored = load_frozen_policy(path, _env())
       with torch.no_grad():
@@ -502,41 +403,61 @@ def test_adr_probe_defence_is_replaced_only_when_clearly_weaker_than_self_play()
       assert math.isclose(metrics['adr_probe/vs_self'], vs_self)
 
 
-def test_spawn_mode_defaults_to_curriculum_and_reaches_the_gate():
-  """The gate must score on the same spawn distribution the policy trains on."""
-  from gfootball.examples.train_puffer import _make_promotion_env
-  assert build_parser().parse_args([]).spawn == 'curriculum'
-  args = build_parser().parse_args(['--spawn', 'uniform'])
-  with patch('gfootball.examples.train_puffer.make_vector_env') as make:
-    _make_promotion_env(args, SimpleNamespace(value=0))
-  assert make.call_args.kwargs['spawn'] == 'uniform'
+def test_evaluation_needs_two_workers():
+  """Evaluation pools are asynchronous, which needs at least two workers."""
+  args = build_parser().parse_args(['--evaluation-workers', '1'])
+  try:
+    Evaluator(args, make_pool=_RecordingPools())
+  except ValueError:
+    pass
+  else:
+    raise AssertionError('one evaluation worker must be refused')
 
 
-def test_gate_replays_memory_the_way_each_policy_was_trained():
-  """The gate evaluates both sides with the memory they were trained with.
+def test_evaluation_difficulties_are_checked_up_front():
+  """A difficulty outside [0, 1] is refused when the Evaluator is built,
+  before training starts, not at the first evaluation."""
+  args = build_parser().parse_args(['--evaluation-difficulties', '0.5,1.5'])
+  try:
+    Evaluator(args, make_pool=_RecordingPools())
+  except ValueError:
+    pass
+  else:
+    raise AssertionError('difficulty 1.5 must be refused')
+
+
+def test_snapshot_defences_replay_one_memory_window():
+  """Training probes and evaluation pools replay a snapshot defence with
+  the same window: --frozen-defence-horizon, else this run's own."""
+  def window(flags):
+    return defence_memory_window(build_parser().parse_args(flags))
+
+  assert window([]) == 32
+  assert window(['--carry-lstm-memory']) is None
+  assert window(['--frozen-defence-horizon', '64']) == 64
+  assert window(['--frozen-defence-horizon', '0']) is None
+
+
+def test_evaluation_replays_memory_the_way_each_policy_was_trained():
+  """Evaluation plays both sides with the memory they were trained with.
 
   The evaluated policy restarts memory every bptt window unless the run
-  carries memory, and the frozen opponent follows the run by default; an
-  opponent file trained elsewhere (--frozen-defence-init) can be given its
-  own window, 0 meaning whole episodes.
+  carries memory, and a frozen defence follows the run by default; a
+  snapshot trained elsewhere (a probe defence from another run) can be
+  given its own window, 0 meaning whole episodes.
   """
-  from gfootball.examples.train_puffer import (
-      _make_promotion_env, _run_promotion)
   cases = (([], 32, 32),
            (['--bptt-horizon', '128'], 128, 128),
            (['--carry-lstm-memory'], None, None),
            (['--carry-lstm-memory', '--frozen-defence-horizon', '32'],
             None, 32),
            (['--frozen-defence-horizon', '0'], 32, None))
-  for flags, policy_window, opponent_window in cases:
+  for flags, policy_window, defence_window in cases:
     args = build_parser().parse_args(['--device', 'cpu'] + flags)
-    with patch('gfootball.examples.train_puffer.make_vector_env') as make:
-      _make_promotion_env(args, SimpleNamespace(value=0))
-    assert make.call_args.kwargs['frozen_defence_horizon'] == opponent_window
-    # A mocked pool reports itself async, so the async evaluator is chosen.
-    with patch('gfootball.examples.train_puffer.make_vector_env'), patch(
-        'gfootball.examples.train_puffer.evaluate_promotion_async') as evaluate:
-      _run_promotion(args, None, SimpleNamespace(value=0), 0, 'cpu', 4)
+    pools = _RecordingPools()
+    with patch('gfootball.examples.train_puffer.evaluate_episodes') as evaluate:
+      Evaluator(args, make_pool=pools).score(None, 0.5, 'random')
+    assert pools.built[0]['frozen_defence_horizon'] == defence_window
     assert evaluate.call_args.kwargs['recurrent_horizon'] == policy_window
 
 
@@ -561,52 +482,20 @@ def test_learning_rate_follows_training_progress():
   assert cosine_learning_rate(1e-3, 3 * total, total) == 0.0
 
 
-def test_gpu_filler_accepts_the_trainer_call_and_only_spins():
-  """main() builds GpuFiller(matrix_size=..., kind=args.gpu_filler_kind).
+def test_gpu_filler_is_the_spin_kernel_only():
+  """main() builds GpuFiller() with no options.
 
   Only the spin-kernel filler is offered: a filler that replays a CUDA graph
   advances the global CUDA generator and crashed alongside captured graphs.
   """
   from gfootball.examples.gpu_filler import GpuFiller
-  args = build_parser().parse_args([])
-  assert args.gpu_filler_kind == 'sleep'
-  GpuFiller(matrix_size=args.gpu_filler_matrix_size, kind=args.gpu_filler_kind)
-  try:
-    GpuFiller(kind='matmul')
-  except ValueError:
-    pass
-  else:
-    raise AssertionError('a graph-replaying filler must be rejected')
+  GpuFiller()
   try:
     build_parser().parse_args(['--gpu-filler-kind', 'matmul'])
   except SystemExit:
     pass
   else:
-    raise AssertionError('--gpu-filler-kind matmul must not be accepted')
-
-
-def test_gate_score_is_logged_per_level_against_the_level_entry_policy():
-  """Each gate result is also logged under its own level's name.
-
-  The gate opponent is the policy as it was on entering the level, fixed for
-  as long as the level trains, so each level's line should rise while that
-  level is learning and go flat when it stalls.
-  """
-  from gfootball.examples.train_puffer import FootballPuffeRL
-  trainer = object.__new__(FootballPuffeRL)
-  trainer.record_promotion(5, {
-      'promotion_success_rate': 0.4,
-      'promotion_worst_two_template_success_rate': 0.2,
-      'promotion_episodes': 256.0,
-      'promotion_mean_episode_length': 90.0}, advanced=False)
-  logged = trainer.promotion_metrics
-  assert logged['promotion_success_rate'] == 0.4
-  assert logged['level_entry/success_rate'] == 0.4
-  assert logged['level_entry/level_5/success_rate'] == 0.4
-  assert logged['level_entry/level_5/worst_two_template_success_rate'] == 0.2
-  assert logged['level_entry/level_5/episodes'] == 256.0
-  assert not any(key.startswith('level_entry/level_4') for key in logged)
-  assert not hasattr(build_parser().parse_args([]), 'initial_opponent_interval')
+    raise AssertionError('--gpu-filler-kind must not be accepted')
 
 
 def test_padded_episode_layout_gives_the_same_window_forward():
@@ -648,31 +537,27 @@ def test_every_update_epoch_is_one_step_over_the_whole_rollout():
   """
   torch.manual_seed(0)
   segments, horizon = 12, 8
-  trainer = FootballPuffeRL.__new__(FootballPuffeRL)
-  trainer.config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5,
-                        ent_coef=0.001, max_grad_norm=0.5, device='cpu',
-                        update_epochs=3)
-  trainer.observations = torch.randn(segments, horizon, 115)
-  trainer.terminals = (torch.rand(segments, horizon) < 0.1).float()
-  trainer.actions = torch.randint(0, 19, (segments, horizon))
-  trainer.logprobs = -3 * torch.rand(segments, horizon)
-  trainer.uncompiled_policy = trainer.policy = FootballPolicy(
-      _env(), hidden_size=16)
-  trainer.optimizer = torch.optim.Adam(trainer.policy.parameters(), lr=3e-4)
-  trainer.optimizer_steps = 0
-  trainer.graph_update = False
-  trainer._epoch_values = None
+  config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5,
+                ent_coef=0.001, max_grad_norm=0.5, device='cpu',
+                update_epochs=3)
+  rollout = SimpleNamespace(
+      observations=torch.randn(segments, horizon, 115),
+      terminals=(torch.rand(segments, horizon) < 0.1).float(),
+      actions=torch.randint(0, 19, (segments, horizon)),
+      logprobs=-3 * torch.rand(segments, horizon))
+  policy = FootballPolicy(_env(), hidden_size=16)
+  ppo = PpoUpdate(policy, torch.optim.Adam(policy.parameters(), lr=3e-4),
+                  rollout, config)
   trainable = torch.rand(segments, horizon) < 0.7
   trainable[4] = False
   segment_index = trainable.any(dim=1).nonzero().flatten()
-  trainer._stage_epoch(*(torch.randn(segments, horizon) for _ in range(3)),
-                       trainable)
 
-  trainer._update(segment_index)
+  totals = ppo.update(segment_index,
+                      *(torch.randn(segments, horizon) for _ in range(3)),
+                      trainable)
 
-  transitions = trainer._totals[
-      FootballPuffeRL.LOSS_NAMES.index('minibatch_transitions')]
-  assert trainer.optimizer_steps == 3
+  transitions = totals[PpoUpdate.LOSS_NAMES.index('minibatch_transitions')]
+  assert ppo.optimizer_steps == 3
   assert transitions == 3 * trainable.sum()
   assert '--minibatch-segments' not in build_parser().format_help()
 
@@ -705,8 +590,7 @@ class _AsyncScriptedPool:
     for position, match in enumerate(order):
       if self.steps[match] and self.steps[match] % self.lengths[match] == 0:
         terminals[position] = True
-        infos.append({'curriculum_success': float(self.successes[match]),
-                      'curriculum_template': int(match) % 8,
+        infos.append({'success': float(self.successes[match]),
                       'episode_length': int(self.lengths[match]),
                       'env_seed': float(self.seed + match)})
     observations = np.ones((len(order), 115), dtype=np.float32)
@@ -720,35 +604,31 @@ class _AsyncScriptedPool:
       self.clock[match] += self.lengths[match] / 10
 
 
-def test_async_promotion_takes_a_fixed_quota_from_every_match():
+def test_evaluation_takes_a_fixed_quota_from_every_match():
   """Short (successful) episodes must not crowd out long (failed) ones."""
   torch.manual_seed(0)
   policy = FootballPolicy(_env(), hidden_size=16)
   # Half the matches score in 2 steps, half fail after 20.
   lengths = [2, 2, 20, 20]
   pool = _AsyncScriptedPool(lengths, successes=[1, 1, 0, 0])
-  metrics = evaluate_promotion_async(policy, pool, 8, 3, 'cpu', 4)
-  assert metrics['promotion_episodes'] == 8
-  assert metrics['promotion_success_rate'] == 0.5
+  metrics = evaluate_episodes(policy, pool, 8, 3, 'cpu', 4)
+  assert metrics['episodes'] == 8
+  assert metrics['success_rate'] == 0.5
 
 
-def test_async_promotion_does_not_depend_on_batching_or_timing():
+def test_evaluation_does_not_depend_on_batching_or_timing():
   torch.manual_seed(0)
   policy = FootballPolicy(_env(), hidden_size=16)
   lengths = [3, 5, 7, 11, 13]
-  for early_abort in (None, (10, 0.9)):
-    results = []
-    for batch in (1, 2, 4):
-      pool = _AsyncScriptedPool(lengths, successes=[1, 0, 1, 0, 1],
-                                batch=batch)
-      results.append(evaluate_promotion_async(
-          policy, pool, 20, 9, 'cpu', 4, early_abort=early_abort))
-    assert results[0]['promotion_aborted'] == float(early_abort is not None)
-    # Identical up to float summation order in the averaged diagnostics.
-    for other in results[1:]:
-      assert other.keys() == results[0].keys()
-      for name, value in results[0].items():
-        assert math.isclose(other[name], value, rel_tol=1e-6), name
+  results = []
+  for batch in (1, 2, 4):
+    pool = _AsyncScriptedPool(lengths, successes=[1, 0, 1, 0, 1], batch=batch)
+    results.append(evaluate_episodes(policy, pool, 20, 9, 'cpu', 4))
+  # Identical up to float summation order in the averaged diagnostics.
+  for other in results[1:]:
+    assert other.keys() == results[0].keys()
+    for name, value in results[0].items():
+      assert math.isclose(other[name], value, rel_tol=1e-6), name
 
 
 def test_masked_losses_equal_the_indexed_losses():
@@ -775,7 +655,6 @@ def test_masked_losses_equal_the_indexed_losses():
 
 def test_async_collection_sizes_the_rollout_buffer():
   args = build_parser().parse_args(['--device', 'cpu'])
-  assert args.async_collection and args.async_promotion
   assert args.overlap_collection
   config = build_config(args, 660)
   # Room for the epoch being trained, one segment in progress per match,
@@ -865,44 +744,40 @@ def test_graphed_update_matches_the_eager_update():
     for carry_memory in (False, True):
       results = []
       for graph in (False, True):
-        trainer = FootballPuffeRL.__new__(FootballPuffeRL)
-        trainer.config = config
-        trainer.observations = observations.clone()
-        trainer.actions = actions.clone()
-        trainer.logprobs = logprobs.clone()
-        trainer.uncompiled_policy = trainer.policy = copy.deepcopy(base)
+        rollout = SimpleNamespace(
+            observations=observations.clone(), actions=actions.clone(),
+            logprobs=logprobs.clone(),
+            terminals=torch.zeros(segments, horizon, device=device))
+        policy = copy.deepcopy(base)
+        # The real collector's starting memory: one agent per match, so its
+        # blocks are the rollout's rows (a third of them in play keeps the
+        # buffer at least the two epochs it needs).
+        collector = SegmentCollector(
+            SimpleNamespace(num_agents=segments // 3,
+                            driver_env=SimpleNamespace(num_agents=1)),
+            policy, rollout, horizon, device, carry_memory=carry_memory)
         rate = (torch.tensor(schedule[0], device=device) if graph
                 else schedule[0])
-        trainer.optimizer = torch.optim.Adam(
-            trainer.policy.parameters(), lr=rate, eps=1e-5,
-            capturable=graph)
-        trainer.optimizer_steps = 0
-        trainer.graph_update = graph
-        trainer._update_graph = trainer._update_pool = None
-        trainer._update_capacity = None
-        trainer.update_captures = 0
-        trainer._epoch_values = None
-        trainer.carry_memory = carry_memory
-        trainer.segment_h = torch.zeros(segments, 16, device=device)
-        trainer.segment_c = torch.zeros(segments, 16, device=device)
-        trainer.terminals = torch.zeros(segments, horizon, device=device)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=rate, eps=1e-5,
+                                     capturable=graph)
+        ppo = PpoUpdate(policy, optimizer, rollout, config, graph=graph,
+                        starting_memory=collector.starting_memory)
         totals = []
         for terminals, memory, learning_rate in zip(layouts, memories,
                                                     schedule):
-          trainer.terminals.copy_(terminals)
-          trainer.segment_h.copy_(memory[0])
-          trainer.segment_c.copy_(memory[1])
-          set_learning_rate(trainer.optimizer, learning_rate)
-          trainer._stage_epoch(*epoch, trainable)
+          rollout.terminals.copy_(terminals)
+          if carry_memory:
+            collector.segment_h.copy_(memory[0])
+            collector.segment_c.copy_(memory[1])
+          set_learning_rate(optimizer, learning_rate)
           before = torch.cat([p.detach().flatten().clone()
-                              for p in trainer.policy.parameters()])
-          trainer._update(segment_index)
-          totals.append(trainer._totals.clone())
+                              for p in policy.parameters()])
+          totals.append(ppo.update(segment_index, *epoch, trainable))
         final = torch.cat([p.detach().flatten()
-                           for p in trainer.policy.parameters()])
+                           for p in policy.parameters()])
         results.append((final, before, torch.stack(totals),
-                        trainer.optimizer_steps))
-        captures = trainer.update_captures
+                        ppo.optimizer_steps))
+        captures = ppo.captures
       (eager, _, eager_totals, eager_steps), (
           graphed, graphed_before, graph_totals, graph_steps) = results
       assert eager_steps == graph_steps == 9
@@ -1015,7 +890,7 @@ def test_transformer_network_needs_entity_observations():
 def test_lstm_cell_checkpoints_still_load():
   """Runs from the LSTMCell era wrote cell.* keys; they must still load.
 
-  Every checkpoint and level-entry snapshot before the packed cuDNN forward
+  Every checkpoint and policy snapshot before the packed cuDNN forward
   holds the recurrence as LSTMCell parameters, the same tensors nn.LSTM
   names rnn.*_l0.
   """
@@ -1094,6 +969,7 @@ class _OneMatchPool:
     self.observations = observations
     self.done = done
     self.step = 0
+    self.num_agents = 2
     self.driver_env = SimpleNamespace(num_agents=2)
 
   def recv(self):
@@ -1106,37 +982,21 @@ class _OneMatchPool:
     self.step += 1
 
 
-def _collecting_trainer(pool, policy, horizon, carry_memory):
-  """An async-collecting trainer over `pool` with room for three segments."""
-  import contextlib
-  from collections import defaultdict
+def _collector_and_update(pool, policy, horizon, carry_memory):
+  """A collector over `pool` with room for three segments, and its update."""
   segments = 6
-  trainer = FootballPuffeRL.__new__(FootballPuffeRL)
-  trainer.config = dict(
-      bptt_horizon=horizon, device='cpu', clip_coef=0.2, vf_clip_coef=0.2,
-      vf_coef=0.5, ent_coef=0.0, max_grad_norm=0.5, update_epochs=1)
-  trainer.vecenv = pool
-  trainer.total_agents = 2
-  trainer.segments = segments
-  trainer.uncompiled_policy = trainer.policy = policy
-  trainer.overlap_collection = False
-  trainer.carry_memory = carry_memory
-  trainer._init_async_collection()
-  trainer.graph_actor = False
-  trainer.graphed_actor = None
-  trainer.graph_update = False
-  trainer.amp_context = contextlib.nullcontext()
-  trainer.profile = lambda *args, **kwargs: None
-  trainer.epoch = trainer.global_step = 0
-  trainer.stats = defaultdict(list)
-  trainer.observations = torch.zeros(segments, horizon, 115)
-  trainer.actions = torch.zeros(segments, horizon, dtype=torch.long)
-  for name in ('logprobs', 'rewards', 'terminals', 'values'):
-    setattr(trainer, name, torch.zeros(segments, horizon))
-  trainer.optimizer = torch.optim.Adam(policy.parameters(), lr=0.0)
-  trainer.optimizer_steps = 0
-  trainer._epoch_values = None
-  return trainer
+  rollout = SimpleNamespace(
+      observations=torch.zeros(segments, horizon, 115),
+      actions=torch.zeros(segments, horizon, dtype=torch.long),
+      **{name: torch.zeros(segments, horizon)
+         for name in ('logprobs', 'rewards', 'terminals', 'values')})
+  collector = SegmentCollector(pool, policy, rollout, horizon, 'cpu',
+                               carry_memory=carry_memory)
+  config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5, ent_coef=0.0,
+                max_grad_norm=0.5, update_epochs=1)
+  ppo = PpoUpdate(policy, torch.optim.Adam(policy.parameters(), lr=0.0),
+                  rollout, config, starting_memory=collector.starting_memory)
+  return collector, ppo, rollout
 
 
 def test_collector_memory_is_what_training_replays():
@@ -1157,13 +1017,13 @@ def test_collector_memory_is_what_training_replays():
   for carry_memory in (False, True):
     torch.manual_seed(1)
     policy = FootballPolicy(_env(), hidden_size=16)
-    trainer = _collecting_trainer(_OneMatchPool(observations, done), policy,
-                                  horizon, carry_memory)
+    collector, ppo, rollout = _collector_and_update(
+        _OneMatchPool(observations, done), policy, horizon, carry_memory)
     for _ in range(steps):
-      trainer._collect_batch()
+      collector._collect_batch()
 
     state = {'lstm_h': None, 'lstm_c': None, 'done': None}
-    blocks = list(trainer.complete_blocks)
+    blocks = list(collector.complete_blocks)
     assert len(blocks) == 2
     for step in range(steps):
       if step % horizon == 0 and not carry_memory:
@@ -1174,41 +1034,35 @@ def test_collector_memory_is_what_training_replays():
       rows = blocks[step // horizon] * 2 + torch.arange(2)
       column = step % horizon
       expected = torch.log_softmax(logits, dim=-1).gather(
-          1, trainer.actions[rows, column].view(-1, 1)).squeeze(1)
-      assert torch.allclose(trainer.logprobs[rows, column], expected,
+          1, rollout.actions[rows, column].view(-1, 1)).squeeze(1)
+      assert torch.allclose(rollout.logprobs[rows, column], expected,
                             atol=1e-5), (carry_memory, step)
 
     # The epoch trains the newest segment, which starts mid-episode.
-    trainer._claim_training_blocks()
-    trainable = trainer.row_training[:, None].expand(-1, horizon).clone()
-    trainer._stage_epoch(trainer.values, torch.randn(6, horizon),
-                         torch.randn(6, horizon), trainable)
-    trainer._update(trainer.training_rows)
-    totals = dict(zip(FootballPuffeRL.LOSS_NAMES, trainer._totals.tolist()))
+    rows, training_rows = collector.claim_training_rows()
+    trainable = training_rows[:, None].expand(-1, horizon).clone()
+    totals = ppo.update(rows, rollout.values, torch.randn(6, horizon),
+                        torch.randn(6, horizon), trainable)
+    totals = dict(zip(PpoUpdate.LOSS_NAMES, totals.tolist()))
     assert totals['approx_kl'] < 1e-10, (carry_memory, totals)
     assert math.isclose(totals['importance'], 1.0, abs_tol=1e-6)
 
 
-def test_promotion_can_carry_memory_through_whole_episodes():
+def test_evaluation_can_carry_memory_through_whole_episodes():
   """recurrent_horizon=None clears memory only at episode ends.
 
-  A policy trained with carried memory is evaluated the way it acts, so
-  both evaluators must match a window longer than the whole evaluation.
+  A policy trained with carried memory is evaluated the way it acts, so the
+  evaluator must match a window longer than the whole evaluation.
   """
   torch.manual_seed(0)
   policy = FootballPolicy(_env(), hidden_size=16)
-  pairs = [
-      [evaluate_promotion(policy, _ScriptedEnv(length=9, successes=[1, 0]),
-                          4, 5, 'cpu', window) for window in (None, 1000)],
-      [evaluate_promotion_async(
-          policy, _AsyncScriptedPool([3, 5, 7], successes=[1, 0, 1]),
-          12, 9, 'cpu', window) for window in (None, 1000)],
-  ]
-  for carried, windowed in pairs:
-    assert carried['promotion_recurrent_horizon'] == 0.0
-    for name, value in windowed.items():
-      if name != 'promotion_recurrent_horizon':
-        assert math.isclose(carried[name], value, rel_tol=1e-6), name
+  carried, windowed = [evaluate_episodes(
+      policy, _AsyncScriptedPool([3, 5, 7], successes=[1, 0, 1]),
+      12, 9, 'cpu', window) for window in (None, 1000)]
+  assert carried['recurrent_horizon'] == 0.0
+  for name, value in windowed.items():
+    if name != 'recurrent_horizon':
+      assert math.isclose(carried[name], value, rel_tol=1e-6), name
 
 
 if __name__ == '__main__':

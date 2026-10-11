@@ -19,7 +19,6 @@ from gfootball.env import football_action_set
 from gfootball.env import observation_rotation
 from gfootball.env import puffer_env
 from gfootball.env.wrappers import Simple115StateWrapper
-from gfootball import curriculum
 
 
 def reference_simple115(observation, fixed_positions):
@@ -77,13 +76,6 @@ def reference_rotate_sticky_actions(sticky_actions_state, config):
     rotated.append(action_to_state[observation_rotation.flip_single_action(
         sticky_actions[i], config)])
   return rotated
-
-
-def reference_episode_duration(level):
-  """The game_duration formula as it was inlined in the curriculum scenario."""
-  attackers, defenders, progress = curriculum.curriculum_state(level)
-  near_goal = min(599, 119 + 40 * (attackers - 1 + defenders))
-  return int(near_goal + (3000 - near_goal) * progress)
 
 
 def make_player_observations(rng, n_left, n_right, views=2, per_view=11):
@@ -156,12 +148,6 @@ class ObservationEquivalenceTest(absltest.TestCase):
       once = observation_rotation.rotate_sticky_actions(state, config)
       twice = observation_rotation.rotate_sticky_actions(once, config)
       self.assertEqual(list(twice), state)
-
-  def test_episode_duration_matches_the_inlined_formula(self):
-    for level in range(curriculum.TOTAL_LEVELS):
-      self.assertEqual(curriculum.curriculum_episode_duration(level),
-                       reference_episode_duration(level),
-                       'level {}'.format(level))
 
   def test_normalizing_only_active_rows_matches_normalizing_all(self):
     """puffer_env skips inactive rows; they are zeroed either way."""

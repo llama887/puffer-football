@@ -1,8 +1,8 @@
 """Score one policy's attack against a chosen defence, optionally on video.
 
-This is the fixed-opponent check used to compare training runs: the gate's
-own numbers are against each run's own snapshots, so they do not compare
-across runs, but the same attack-vs-defence match on the same scenes does.
+This is the fixed-opponent check used to compare training runs: the same
+attack-vs-defence match on the same scenes, whatever opponents each run
+trained against.
 
 The attack is --checkpoint.  The defence (--defence) is:
   self      the same policy (what ADR training episodes play)
@@ -10,9 +10,13 @@ The attack is --checkpoint.  The defence (--defence) is:
   idle      no action at all
   PATH      any policy snapshot, simple115 or entity observation (the
             fixed defender used to score runs is a simple115 MLP)
+The defence is gfootball/env/defence.py, exactly what the training env and
+its evaluation pools play.
 Scenes (--scene):
-  level:L            the gate's evaluation scenes of curriculum level L
-  adr:start          every ADR setting at its level-0 start value
+  adr:difficulty:D   every ADR setting uniform over its range at test
+                     difficulty D (adr set_difficulty; what the trainer's
+                     evaluations play)
+  adr:start          every ADR setting at its start value
   adr:full           every ADR setting uniform over its ranges
   adr:pin:NAME:EDGE  as adr:full with NAME pinned at edge 0 (low) or 1
                      (high), exactly like an ADR probe
@@ -30,51 +34,48 @@ import argparse
 import json
 import os
 import tempfile
-from types import SimpleNamespace
 
 import numpy as np
-import torch
 
 import gfootball.env as football_env
 from gfootball import adr
-from gfootball.curriculum import (
-    ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, advantage_for_level)
+from gfootball.env import defence
 from gfootball.env import entity_observation
 from gfootball.env import wrappers
-from gfootball.env.puffer_env import (
-    normalize_egocentric, sort_players_by_distance)
-from gfootball.env.puffer_policy import load_frozen_policy
 from gfootball.examples.train_puffer import ACTION_NAMES
 
 # Training resets the recurrent state every rollout window (32 steps), so
-# the policies are replayed the same way.
+# both sides restart their memory every 32 of their own steps and at every
+# episode start (gfootball/env/defence.py).  Scores from before the defence
+# module (2026-10-11) used other seeds and windows, so they do not reproduce
+# exactly.
 HORIZON = 32
 
 
-def adr_ranges(log_path):
-  """{setting: (low, high)}: valid limits, or a training log's last ranges."""
-  ranges = {p.name: (p.minimum, p.maximum) for p in adr.PARAMETERS}
-  if log_path:
-    with open(log_path) as log:
-      lines = [line for line in log if line.startswith('ADR {')]
-    last = json.loads(lines[-1][4:])
-    ranges = {name: (last['adr/{}/low'.format(name)],
-                     last['adr/{}/high'.format(name)]) for name in ranges}
-  return ranges
+def scene_ranges(scene, log_path):
+  """The ADR ranges a --scene draws its episodes from.
 
-
-def scene_values(scene, ranges, rng):
-  """ADR settings for one episode, or None for a level scene."""
+  A test difficulty's ranges, the start values (points), or for full and
+  pin scenes every setting's valid limits, or with --adr-log the ranges of
+  that training log's last `ADR {json}` line.  Any other scene is refused,
+  so a misspelt or retired one (level:L) never quietly plays full ranges.
+  """
+  randomizer = adr.AutomaticDomainRandomization()
   kind = scene.split(':')
-  if kind[0] == 'level':
-    return None
-  if kind[1] == 'start':
-    return {p.name: float(p.start) for p in adr.PARAMETERS}
-  values = {name: float(rng.uniform(low, high)) if high > low else float(low)
-            for name, (low, high) in ranges.items()}
-  if kind[1] == 'pin':
-    values[kind[2]] = float(ranges[kind[2]][int(kind[3])])
-  return values
+  parts = {'difficulty': 3, 'start': 2, 'full': 2, 'pin': 4}
+  if kind[0] != 'adr' or len(kind) < 2 or parts.get(kind[1]) != len(kind):
+    raise ValueError('unknown --scene {!r} (see the module docstring)'.format(
+        scene))
+  if kind[1] == 'difficulty':
+    randomizer.set_difficulty(float(kind[2]))
+  elif kind[1] != 'start':
+    if log_path:
+      with open(log_path) as log:
+        lines = [line for line in log if line.startswith('ADR {')]
+      randomizer.load_metrics(json.loads(lines[-1][4:]))
+    else:
+      randomizer.set_difficulty(1.0)
+  return randomizer
 
 
 def main():
@@ -88,86 +89,63 @@ def main():
   parser.add_argument('--video-dir', default=None)
   parser.add_argument('--output', required=True)
   args = parser.parse_args()
-  level = int(args.scene.split(':')[1]) if args.scene.startswith('level') else 0
-  ranges = adr_ranges(args.adr_log)
+  ranges = scene_ranges(args.scene, args.adr_log)
+  pinned = args.scene.split(':')[2:] if ':pin:' in args.scene else None
   video = args.video_dir is not None
   options = {
-      'action_set': 'default',
-      'advantage': advantage_for_level(level, ADVANTAGE_LEVELS),
-      'curriculum_level': level, 'curriculum_levels': ADVANTAGE_LEVELS,
-      'curriculum_evaluation': True, 'game_engine_random_seed': args.seed,
+      'action_set': 'default', 'game_engine_random_seed': args.seed,
       'physics_steps_per_frame': 10, 'real_time': False}
   if video:
     options.update({'display_game_stats': True, 'render_resolution_x': 1280,
                     'render_resolution_y': 720, 'video_format': 'webm'})
   env = football_env.create_environment(
-      env_name=ADVANTAGE_ENV_NAME, representation='raw', rewards='scoring',
+      env_name=adr.SCENARIO, representation='raw', rewards='scoring',
       render=video, write_goal_dumps=False, write_full_episode_dumps=video,
       write_video=video, dump_frequency=1,
       logdir=args.video_dir if video else tempfile.mkdtemp(),
       number_of_left_players_agent_controls=11,
       number_of_right_players_agent_controls=11,
       other_config_options=options)
-  space = SimpleNamespace(
-      single_action_space=SimpleNamespace(n=len(ACTION_NAMES)))
-  policy = load_frozen_policy(args.checkpoint, space)
-  defence = (policy if args.defence == 'self' else None
-             if args.defence in ('random', 'idle')
-             else load_frozen_policy(args.defence, space))
+  # Both sides are fixed policies played like the training env's defence
+  # ('self' defends with the attacking checkpoint); separate seeds keep
+  # their sampling noise independent.
+  attacking_side = defence.Defence(args.checkpoint, len(ACTION_NAMES),
+                                   args.seed, memory_window=HORIZON)
+  defending_side = defence.Defence(
+      args.checkpoint if args.defence == 'self' else args.defence,
+      len(ACTION_NAMES), args.seed + 1, memory_window=HORIZON)
   # Scenes have their own generator so every defence sees the same scenes.
   scene_rng = np.random.default_rng([args.seed, 0xad5])
-  rng = np.random.default_rng([args.seed, 0xde4])
-  generators = [torch.Generator().manual_seed(args.seed + 1),
-                torch.Generator().manual_seed(args.seed + 2)]
   sticky = np.zeros((22, entity_observation.STICKY_ACTIONS), np.float32)
-
-  def rows_for(model, raw):
-    """The observation `model` was trained on, for all 22 agents."""
-    if model.normalizer.mean.numel() == entity_observation.SIZE:
-      return entity_observation.build(raw, sticky)
-    frames = wrappers.Simple115StateWrapper.convert_observation(raw, True)
-    normalize_egocentric(frames)
-    sort_players_by_distance(frames)
-    return frames
-
-  def act(model, rows, state, generator):
-    with torch.no_grad():
-      logits, _ = model.forward_eval(torch.from_numpy(rows), state)
-      return torch.multinomial(torch.softmax(logits.float(), -1), 1,
-                               generator=generator).squeeze(-1).numpy()
 
   episodes = []
   try:
     for _ in range(args.episodes):
-      values = scene_values(args.scene, ranges, scene_rng)
-      if values is not None:
-        env.unwrapped._config['adr_values'] = values
+      if pinned:
+        # Exactly like an ADR probe: one setting at one edge of its range.
+        values = ranges.sample_pinned(
+            scene_rng, adr.PARAMETER_INDEX[pinned[0]], int(pinned[1]))
+      else:
+        values = ranges.sample(scene_rng)
+      env.unwrapped._config[adr.VALUES] = values
       raw = env.reset()
       sticky.fill(0)
-      config = env.unwrapped._config
-      held = np.asarray(config._values.get('curriculum_held_directions',
-                                           [0] * 22), np.int64)
-      attacking_left = config.ScenarioConfig().ball_position[0] > 0
+      scene = adr.read_scene(env.unwrapped._config)
+      held = scene.held_directions
+      attacking_side.start_episode()
+      defending_side.start_episode()
+      attacking_left = scene.attacking_left
       attack = slice(0, 11) if attacking_left else slice(11, 22)
       defend = slice(11, 22) if attacking_left else slice(0, 11)
       flip = 1.0 if attacking_left else -1.0
       done, steps, reward = False, 0, 0.0
       regained, goal_side, pressure = False, [], []
       while not done:
-        if steps % HORIZON == 0:
-          states = [{'lstm_h': None, 'lstm_c': None, 'done': None}
-                    for _ in range(2)]
+        rows = entity_observation.build(raw, sticky)
+        frames = wrappers.Simple115StateWrapper.convert_observation(raw, True)
         actions = np.zeros(22, np.int64)
-        # Drawn for all 22 rows, then the attack's kept: this consumes the
-        # generator exactly as the scorer behind the recorded results did
-        # (trace_chase.py), so the same seed reproduces those numbers.
-        actions[attack] = act(policy, rows_for(policy, raw),
-                              states[0], generators[0])[attack]
-        if defence is not None:
-          actions[defend] = act(defence, rows_for(defence, raw)[defend],
-                                states[1], generators[1])
-        elif args.defence == 'random':
-          actions[defend] = rng.integers(0, len(ACTION_NAMES), 11)
+        actions[attack] = attacking_side.act(rows[attack], frames[attack])
+        actions[defend] = defending_side.act(rows[defend], frames[defend])
         # A loose-ball ADR scene opens with held directions pressed, as in
         # training.
         if steps == 0 and held.any():

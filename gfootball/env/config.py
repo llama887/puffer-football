@@ -89,8 +89,6 @@ class Config(object):
         'display_game_stats': True,
         'dump_full_episodes': False,
         'dump_scores': False,
-        'curriculum_level': 0,
-        'curriculum_levels': 11,
         'fast_mode': False,
         'players': ['agent:left_players=1'],
         'level': '11_vs_11_stochastic',

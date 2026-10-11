@@ -35,11 +35,10 @@ fi
 PUFFER_SOCCER=${PUFFER_SOCCER:-/scratch/$USER/Puffer-Soccer}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 
-# Single-seed results on this task are not reliable: the same configuration
-# clears level 0 anywhere between 175 and 2275 epochs depending on the seed.
-# Submit as an array to get one run per seed, e.g. `sbatch --array=0-2 ...`;
-# each task derives its seed from SEED_BASE and keeps its own run directory.
-# Summarize a set of runs with scripts/summarize_runs.py.
+# Single-seed results on this task are not reliable: seeds of the same
+# configuration differ as much as different configurations do.  Submit as an
+# array to get one run per seed, e.g. `sbatch --array=0-2 ...`; each task
+# derives its seed from SEED_BASE and keeps its own run directory.
 SEED_BASE=${SEED_BASE:-20260917}
 if [[ -n ${SLURM_ARRAY_TASK_ID:-} ]]; then
   SEED=${SEED:-$((SEED_BASE + SLURM_ARRAY_TASK_ID))}
@@ -51,16 +50,15 @@ fi
 
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
 WANDB_GROUP=${WANDB_GROUP:-self-play-lstm-ppo}
-ENV_NAME=${ENV_NAME:-11_vs_11_advantage}
-# PPO defaults are the September 29 level-0 study's winner (trial 22, 0.921
-# level-0 success against the fixed opponent; README, "Tuning level 0").
-LEARNING_RATE=${LEARNING_RATE:-0.000706}
+# PPO defaults are the entities-transformer settings of the September 29
+# tuning study (trial 3), which every run since October 2 has used.
+LEARNING_RATE=${LEARNING_RATE:-0.000543}
 # 0.01 kept every run within 10% of a uniform policy after 3000+ epochs.
-ENT_COEF=${ENT_COEF:-0.00129}
-VF_COEF=${VF_COEF:-0.774}
-CLIP_COEF=${CLIP_COEF:-0.119}
-GAMMA=${GAMMA:-0.999}
-GAE_LAMBDA=${GAE_LAMBDA:-0.960}
+ENT_COEF=${ENT_COEF:-0.00159}
+VF_COEF=${VF_COEF:-0.428}
+CLIP_COEF=${CLIP_COEF:-0.132}
+GAMMA=${GAMMA:-0.995}
+GAE_LAMBDA=${GAE_LAMBDA:-0.927}
 # Potential-based shaping on ball progress toward the attacked goal
 # (Ng, Harada & Russell 1999): F = gamma*Phi(s') - Phi(s) with
 # Phi = BALL_POTENTIAL * ball x toward the attacked goal (in [-1, 1]); the
@@ -68,7 +66,7 @@ GAE_LAMBDA=${GAE_LAMBDA:-0.960}
 # optimal policy unchanged; 0 disables.  Uses GAMMA above as the discount,
 # which it must: a different discount leaves a real reward proportional
 # to Phi.
-BALL_POTENTIAL=${BALL_POTENTIAL:-0.585}
+BALL_POTENTIAL=${BALL_POTENTIAL:-0.5}
 # Distance of the nearest teammate to the ball, combined
 # with the ball potential before the same discounted potential difference.
 PLAYER_POTENTIAL=${PLAYER_POTENTIAL:-0}
@@ -76,72 +74,39 @@ PLAYER_POTENTIAL=${PLAYER_POTENTIAL:-0}
 # (ball-direction units: dribble <~0.27, struck ball ~1), so kicking costs no
 # potential; 0 keeps the plain distance potential.
 PLAYER_POTENTIAL_FADE_SPEED=${PLAYER_POTENTIAL_FADE_SPEED:-0}
-# SPAWN=uniform ignores curriculum levels and places the ball and players
-# uniformly over the pitch, all onside (advantage env only).
-SPAWN=${SPAWN:-curriculum}
-# Share of training episodes whose outfield players (not the goal-side
-# blockers) keep their level x but spawn uniformly across the pitch width;
-# the gate never uses it.  0 disables.
-WIDTH_SPAWN_FRACTION=${WIDTH_SPAWN_FRACTION:-0}
-# MIXED_SHAPE=1: from level 1 some attackers start ahead of the ball, onside
-# and clear of the shooting lane (part of the level; the gate plays it too).
-MIXED_SHAPE=${MIXED_SHAPE:-0}
-MIXED_SHAPE_ARGS=(--no-mixed-shape)
-if [[ $MIXED_SHAPE == 1 ]]; then
-  MIXED_SHAPE_ARGS=(--mixed-shape)
-fi
-# Share of training episodes that open as a race for a still ball (dead-ball
-# practice); the gate never uses it.  0 disables.
-LOOSE_BALL_FRACTION=${LOOSE_BALL_FRACTION:-0}
-# ADR=1: automatic domain randomization instead of the level curriculum
-# (gfootball/adr.py); the level gate is off and ranges grow and shrink with
-# probe episodes.  ADR_PROBE_DEFENCE defends the probes: 'random' (uniform
-# random defenders) or a policy file, which the learner replaces once it
-# scores ADR_PROBE_REFRESH_MARGIN more against it than against its own
-# defence (checked every ADR_PROBE_REFRESH_INTERVAL epochs).
-ADR=${ADR:-0}
-ADR_ARGS=(--no-adr)
-if [[ $ADR == 1 ]]; then
-  ADR_ARGS=(--adr --adr-probe-fraction "${ADR_PROBE_FRACTION:-0.2}"
-            --adr-buffer-size "${ADR_BUFFER_SIZE:-64}"
-            --adr-low-threshold "${ADR_LOW_THRESHOLD:-0.3}"
-            --adr-high-threshold "${ADR_HIGH_THRESHOLD:-0.6}"
-            --adr-probe-defence "${ADR_PROBE_DEFENCE:-random}"
-            --adr-probe-refresh-interval "${ADR_PROBE_REFRESH_INTERVAL:-1000}"
-            --adr-probe-refresh-margin "${ADR_PROBE_REFRESH_MARGIN:-0.1}")
-fi
-# Levels at which every check scores the policy against uniform random
-# defenders (the base random policy); empty disables.
-RANDOM_BASELINE_LEVELS=${RANDOM_BASELINE_LEVELS-5,9,14}
+# ADR (gfootball/adr.py): every episode draws its settings from ranges that
+# grow and shrink with probe episodes.  ADR_PROBE_DEFENCE defends the probes:
+# 'random' (uniform random defenders) or a policy file, which the learner
+# replaces once it scores ADR_PROBE_REFRESH_MARGIN more against it than
+# against its own defence (checked every ADR_PROBE_REFRESH_INTERVAL epochs).
+ADR_ARGS=(--adr-probe-fraction "${ADR_PROBE_FRACTION:-0.2}"
+          --adr-buffer-size "${ADR_BUFFER_SIZE:-64}"
+          --adr-low-threshold "${ADR_LOW_THRESHOLD:-0.3}"
+          --adr-high-threshold "${ADR_HIGH_THRESHOLD:-0.6}"
+          --adr-probe-defence "${ADR_PROBE_DEFENCE:-random}"
+          --adr-probe-refresh-interval "${ADR_PROBE_REFRESH_INTERVAL:-1000}"
+          --adr-probe-refresh-margin "${ADR_PROBE_REFRESH_MARGIN:-0.1}")
+# Every EVALUATION_INTERVAL epochs the policy is scored against uniform random
+# defenders on fixed ADR scenes at each test difficulty (every setting from
+# its start value out to that share of the way to its limits); empty
+# disables.
+EVALUATION_INTERVAL=${EVALUATION_INTERVAL:-100}
+EVALUATION_DIFFICULTIES=${EVALUATION_DIFFICULTIES-0.25,0.5,1.0}
+EVALUATION_EPISODES=${EVALUATION_EPISODES:-64}
+EVALUATION_WORKERS=${EVALUATION_WORKERS:-$NUM_WORKERS}
 # Optimizer steps per rollout.  Each step trains on the whole rollout (one
 # segment per agent, ~0.6 GB on the GPU at 46 matches), so there is no
 # minibatch size to set.
-UPDATE_EPOCHS=${UPDATE_EPOCHS:-7}
+UPDATE_EPOCHS=${UPDATE_EPOCHS:-3}
 BPTT_HORIZON=${BPTT_HORIZON:-32}
 HIDDEN_SIZE=${HIDDEN_SIZE:-256}
 # OBSERVATION=entities: egocentric offsets to players, ball, goals and
 # touchlines, ball owner, keepers, offside, sticky buttons and steps left
 # (gfootball/env/entity_observation.py);
 # NETWORK=transformer runs attention over its players and ball (needs it).
-OBSERVATION=${OBSERVATION:-simple115}
-NETWORK=${NETWORK:-mlp}
+OBSERVATION=${OBSERVATION:-entities}
+NETWORK=${NETWORK:-transformer}
 FRAME_STACK=${FRAME_STACK:-1}
-START_LEVEL=${START_LEVEL:-0}
-# 256 episodes every 25 epochs was ~40% of a job and 512+128+128 every 100
-# against a frozen defence was ~50%.  256+64+64 every 100 epochs; larger and rarer
-# is cheaper and less noisy, and a hopeless evaluation stops after a quarter.
-PROMOTION_INTERVAL=${PROMOTION_INTERVAL:-100}
-PROMOTION_EPISODES=${PROMOTION_EPISODES:-256}
-PROMOTION_MIN_EPISODES=${PROMOTION_MIN_EPISODES:-64}
-PROMOTION_WORKERS=${PROMOTION_WORKERS:-$NUM_WORKERS}
-PROMOTION_EARLY_ABORT_MARGIN=${PROMOTION_EARLY_ABORT_MARGIN:-0.2}
-GREEDY_PROMOTION_EPISODES=${GREEDY_PROMOTION_EPISODES:-64}
-SELFPLAY_PROMOTION_EPISODES=${SELFPLAY_PROMOTION_EPISODES:-64}
-# Every level is score-gated.  The 200-epoch timer above level 3 pushed two
-# seeds from level 4 to level 20 with success at zero once level 3 fell.
-# Set SCORED_PROMOTION_LEVELS=4 to restore the old escalator.
-SCORED_PROMOTION_LEVELS=${SCORED_PROMOTION_LEVELS:-21}
-TIMED_PROMOTION_EPOCHS=${TIMED_PROMOTION_EPOCHS:-200}
 # Throughput.  Agent steps trained per second, one L40S, level 0:
 #   main as it was (32 CPUs)                          4.8k
 #   + game data in node-local memory                 17k
@@ -159,10 +124,6 @@ TIMED_PROMOTION_EPOCHS=${TIMED_PROMOTION_EPOCHS:-200}
 # environments stepping while the update runs on the GPU, acting with a copy
 # of the policy synced after every update (at most one update stale; the
 # stored log-prob keeps PPO's ratio exact).
-ASYNC_COLLECTION_ARGS=(--async-collection)
-if [[ ${ASYNC_COLLECTION:-1} == 0 ]]; then
-  ASYNC_COLLECTION_ARGS=(--no-async-collection)
-fi
 OVERLAP_ARGS=(--overlap-collection)
 if [[ ${OVERLAP_COLLECTION:-1} == 0 ]]; then
   OVERLAP_ARGS=(--no-overlap-collection)
@@ -184,46 +145,25 @@ if [[ ${COMPILE:-0} == 1 ]]; then
   COMPILE_ARGS=(--compile --compile-mode "${COMPILE_MODE:-reduce-overhead}")
 fi
 LOG_INTERVAL_SECONDS=${LOG_INTERVAL_SECONDS:-5}
-ASYNC_PROMOTION_ARGS=(--async-promotion)
-if [[ ${ASYNC_PROMOTION:-1} == 0 ]]; then
-  ASYNC_PROMOTION_ARGS=(--no-async-promotion)
-fi
-# Greedy and self-play diagnostic evaluations run on every Nth promotion check
-# (and on any check that passes the gate); they never decide promotion.
-DIAGNOSTIC_PROMOTION_EVERY=${DIAGNOSTIC_PROMOTION_EVERY:-4}
 # Torch warns about GPU jobs below 75% utilization, which counts the time any
 # kernel is running.  The trainer keeps it up itself (GPU_FILLER=1) with
 # single-thread spin kernels on a side stream, which occupy one SM: 91% mean
 # utilization at a 3% cost.  Filler matmuls spread over the device and slowed
-# the latency-bound update (1024^2: 60k instead of 143k).  The old external
-# heartbeat (GPU_HEARTBEAT=1) is a separate process, which time-slices the
-# GPU; it cut SPS to less than half.
-GPU_FILLER_ARGS=(--gpu-filler --gpu-filler-kind "${GPU_FILLER_KIND:-sleep}"
-                 --gpu-filler-matrix-size "${GPU_FILLER_MATRIX_SIZE:-1024}")
+# the latency-bound update (1024^2: 60k instead of 143k), and an external
+# heartbeat process time-sliced the GPU and cut SPS to less than half.
+GPU_FILLER_ARGS=(--gpu-filler)
 if [[ ${GPU_FILLER:-1} == 0 ]]; then
   GPU_FILLER_ARGS=(--no-gpu-filler)
 fi
-GPU_HEARTBEAT=${GPU_HEARTBEAT:-0}
 ANNEAL_LR_ARGS=(--no-anneal-lr)
-if [[ ${ANNEAL_LR:-1} == 1 ]]; then
+if [[ ${ANNEAL_LR:-0} == 1 ]]; then
   ANNEAL_LR_ARGS=(--anneal-lr)
 fi
-# The score gate plays against a frozen snapshot of the policy taken on
-# entering the level, so "attackers score 60%" is a fixed target rather than
-# the same network's ever-improving defence.  FROZEN_DEFENCE_GATE=0 restores
-# the live self-play gate.
-FROZEN_GATE_ARGS=(--frozen-defence-gate)
-if [[ ${FROZEN_DEFENCE_GATE:-1} == 0 ]]; then
-  FROZEN_GATE_ARGS=(--no-frozen-defence-gate)
-fi
-# FROZEN_DEFENCE_INIT: start the gate opponent from a fixed policy file.
-if [[ -n ${FROZEN_DEFENCE_INIT:-} ]]; then
-  FROZEN_GATE_ARGS+=(--frozen-defence-init "$FROZEN_DEFENCE_INIT")
-fi
-# FROZEN_DEFENCE_HORIZON: the memory window that opponent file was trained
-# with (0: whole episodes); by default the same as this run's.
+# FROZEN_DEFENCE_HORIZON: the memory window a snapshot probe defence trained
+# by another run used (0: whole episodes); by default the same as this run's.
+FROZEN_DEFENCE_ARGS=()
 if [[ -n ${FROZEN_DEFENCE_HORIZON:-} ]]; then
-  FROZEN_GATE_ARGS+=(--frozen-defence-horizon "$FROZEN_DEFENCE_HORIZON")
+  FROZEN_DEFENCE_ARGS=(--frozen-defence-horizon "$FROZEN_DEFENCE_HORIZON")
 fi
 # CARRY_LSTM_MEMORY=1 keeps recurrent memory across rollout segments (cleared
 # only at episode ends) and trains each segment from the memory it started
@@ -232,8 +172,6 @@ MEMORY_ARGS=(--no-carry-lstm-memory)
 if [[ ${CARRY_LSTM_MEMORY:-0} == 1 ]]; then
   MEMORY_ARGS=(--carry-lstm-memory)
 fi
-# Gate success needed to advance a level; above 1 keeps training on one level.
-CURRICULUM_SUCCESS_THRESHOLD=${CURRICULUM_SUCCESS_THRESHOLD:-0.6}
 
 mkdir -p "$RUN_ROOT/checkpoints" "$REPO/sbatch/logs"
 
@@ -274,42 +212,23 @@ if [[ ! -e "$REPO/resources" ]]; then
     "$REPO/resources"
 fi
 
-export GPU_HEARTBEAT_TARGET_UTILIZATION="${GPU_HEARTBEAT_TARGET_UTILIZATION:-85}"
-export GPU_HEARTBEAT_CHECK_INTERVAL=0.2
-export GPU_HEARTBEAT_MATRIX_SIZE=6144
-export GPU_HEARTBEAT_DTYPE=bfloat16
-
 cleanup() {
   if [[ -n ${LOCAL_DATA:-} ]]; then
     rm -rf "$LOCAL_DATA"
-  fi
-  if [ -n "${HEARTBEAT_PID:-}" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
-    kill "$HEARTBEAT_PID"
-    wait "$HEARTBEAT_PID" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
 
 nvidia-smi
-if [[ $GPU_HEARTBEAT == 1 ]]; then
-  nice -n 19 "$PUFFER_SOCCER/.venv/bin/python" -u \
-    "$PUFFER_SOCCER/sbatch/gpu_heartbeat.py" &
-  HEARTBEAT_PID=$!
-  echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
-fi
 
 cd "$RUN_ROOT"
 "$ENV_PREFIX/bin/python" -u -m gfootball.examples.train_puffer \
   "${ANNEAL_LR_ARGS[@]}" \
   --device cuda \
-  --env-name "$ENV_NAME" \
   --num-workers "$NUM_WORKERS" \
   --envs-per-worker "$ENVS_PER_WORKER" \
-  "${ASYNC_COLLECTION_ARGS[@]}" \
   "${OVERLAP_ARGS[@]}" \
   "${GRAPH_ARGS[@]}" \
-  --diagnostic-promotion-every "$DIAGNOSTIC_PROMOTION_EVERY" \
-  "${ASYNC_PROMOTION_ARGS[@]}" \
   "${GPU_FILLER_ARGS[@]}" \
   "${COMPILE_ARGS[@]}" \
   --log-interval-seconds "$LOG_INTERVAL_SECONDS" \
@@ -317,8 +236,6 @@ cd "$RUN_ROOT"
   --hidden-size "$HIDDEN_SIZE" \
   --observation "$OBSERVATION" \
   --network "$NETWORK" \
-  --curriculum-window 20 \
-  --curriculum-success-threshold "$CURRICULUM_SUCCESS_THRESHOLD" \
   --learning-rate "$LEARNING_RATE" \
   --ent-coef "$ENT_COEF" \
   --vf-coef "$VF_COEF" \
@@ -327,28 +244,17 @@ cd "$RUN_ROOT"
   --ball-potential "$BALL_POTENTIAL" \
   --player-potential "$PLAYER_POTENTIAL" \
   --player-potential-fade-speed "$PLAYER_POTENTIAL_FADE_SPEED" \
-  --spawn "$SPAWN" \
-  --width-spawn-fraction "$WIDTH_SPAWN_FRACTION" \
-  "${MIXED_SHAPE_ARGS[@]}" \
-  --loose-ball-fraction "$LOOSE_BALL_FRACTION" \
   "${ADR_ARGS[@]}" \
-  --random-baseline-levels "$RANDOM_BASELINE_LEVELS" \
+  --evaluation-interval "$EVALUATION_INTERVAL" \
+  --evaluation-difficulties "$EVALUATION_DIFFICULTIES" \
+  --evaluation-episodes "$EVALUATION_EPISODES" \
+  --evaluation-workers "$EVALUATION_WORKERS" \
   --gae-lambda "$GAE_LAMBDA" \
   --update-epochs "$UPDATE_EPOCHS" \
   --bptt-horizon "$BPTT_HORIZON" \
   "${MEMORY_ARGS[@]}" \
   --seed "$SEED" \
-  --start-level "$START_LEVEL" \
-  --promotion-interval "$PROMOTION_INTERVAL" \
-  --promotion-episodes "$PROMOTION_EPISODES" \
-  --promotion-min-episodes "$PROMOTION_MIN_EPISODES" \
-  --promotion-workers "$PROMOTION_WORKERS" \
-  --promotion-early-abort-margin "$PROMOTION_EARLY_ABORT_MARGIN" \
-  --greedy-promotion-episodes "$GREEDY_PROMOTION_EPISODES" \
-  --selfplay-promotion-episodes "$SELFPLAY_PROMOTION_EPISODES" \
-  "${FROZEN_GATE_ARGS[@]}" \
-  --scored-promotion-levels "$SCORED_PROMOTION_LEVELS" \
-  --timed-promotion-epochs "$TIMED_PROMOTION_EPOCHS" \
+  "${FROZEN_DEFENCE_ARGS[@]}" \
   --total-timesteps "$TOTAL_TIMESTEPS" \
   --wandb \
   --wandb-project google-football-fast-rl \
