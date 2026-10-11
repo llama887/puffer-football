@@ -955,6 +955,10 @@ class Evaluator:
   """
 
   def __init__(self, args, make_pool=make_vector_env):
+    # Pools run asynchronously, so at least one worker must be left out of
+    # every batch (PufferLib needs 0 < batch workers < workers).
+    if args.evaluation_workers < 2:
+      raise ValueError('--evaluation-workers must be at least 2')
     self.difficulties = [
         float(x) for x in args.evaluation_difficulties.split(',') if x]
     self._args = args
@@ -968,14 +972,15 @@ class Evaluator:
       self._defence_window = None
 
   def score(self, policy, difficulty, defence=None):
-    """_evaluation_metrics of --evaluation-episodes episodes at `difficulty`
-    against `defence`."""
+    """_evaluation_metrics of at least --evaluation-episodes episodes at
+    `difficulty` against `defence` (ceil(episodes / workers) per match)."""
     args = self._args
     if defence not in self._pools:
       shared = adr.shared_ranges()
       workers = args.evaluation_workers
       self._pools[defence] = (self._make_pool(
           num_envs=workers, num_workers=workers, batch_size=workers,
+          # Its own batch size, not --async-batch-workers (training's).
           reserved_cpus=0, async_batch_workers=max(1, workers // 3),
           seed=args.seed + 1000000, frame_stack=args.frame_stack,
           sort_players=args.sort_players, observation=args.observation,
@@ -1076,7 +1081,9 @@ def build_parser():
   # random-defender score at each test difficulty and, with a snapshot probe
   # defence, the refresh check.
   parser.add_argument('--evaluation-interval', type=int, default=100)
-  parser.add_argument('--evaluation-workers', type=int, default=30)
+  parser.add_argument('--evaluation-workers', type=int, default=30,
+                      help='worker processes per evaluation pool (at least '
+                           '2; one pool per defence stays alive)')
   parser.add_argument('--evaluation-difficulties', default='0.25,0.5,1.0',
                       help='test difficulties (adr set_difficulty: every '
                            'setting from its start value out to this share '
@@ -1084,7 +1091,8 @@ def build_parser():
                            'scores the policy against random defenders; '
                            'empty disables')
   parser.add_argument('--evaluation-episodes', type=int, default=64,
-                      help='episodes per difficulty and defence')
+                      help='at least this many episodes per difficulty '
+                           'and defence: ceil(episodes / workers) per match')
   parser.add_argument('--anneal-lr', action=argparse.BooleanOptionalAction,
                       default=False)
   parser.add_argument('--learning-rate', type=float, default=3e-4)
@@ -1469,11 +1477,14 @@ def main():
   finally:
     if filler is not None:
       filler.stop()
-    evaluator.close()
-    model_path = trainer.close()
-    if logger is not None:
-      logger.close(model_path)
-    print('Saved model: {}'.format(model_path), flush=True)
+    # The model is saved first: closing the evaluation pools can hang.
+    try:
+      model_path = trainer.close()
+      if logger is not None:
+        logger.close(model_path)
+      print('Saved model: {}'.format(model_path), flush=True)
+    finally:
+      evaluator.close()
 
 
 if __name__ == '__main__':

@@ -160,6 +160,7 @@ def test_evaluation_matches_training_across_rollout_and_episode_boundaries():
     assert metrics['episodes'] == 3
     assert metrics['recurrent_horizon'] == horizon
     # The pool also hands over the frame after the last episode end.
+    assert len(policy.recorded_logits) == steps + 1
     assert torch.allclose(torch.cat(policy.recorded_logits)[:steps],
                           torch.cat(expected_logits), atol=1e-6)
     assert torch.allclose(torch.cat(policy.recorded_values)[:steps],
@@ -355,7 +356,9 @@ def test_evaluation_scores_on_fixed_adr_difficulty_scenes():
     assert kwargs['adr_probe_fraction'] == 0.0
     assert episodes == args.evaluation_episodes
   assert seen[0][1] != seen[1][1]
-  assert seen[0][1] == seen[3][1]
+  # Same difficulty, same scenes, whatever the defence (the probe refresh
+  # compares defences on them) and on every check.
+  assert seen[0][1] == seen[2][1] == seen[3][1]
 
 
 def test_adr_probe_defence_is_replaced_only_when_clearly_weaker_than_self_play():
@@ -396,6 +399,17 @@ def test_adr_probe_defence_is_replaced_only_when_clearly_weaker_than_self_play()
       assert metrics['adr_probe/replaced'] == float(replaced)
       assert math.isclose(metrics['adr_probe/vs_probe'], vs_probe)
       assert math.isclose(metrics['adr_probe/vs_self'], vs_self)
+
+
+def test_evaluation_needs_two_workers():
+  """Evaluation pools are asynchronous, which needs at least two workers."""
+  args = build_parser().parse_args(['--evaluation-workers', '1'])
+  try:
+    Evaluator(args, make_pool=_RecordingPools())
+  except ValueError:
+    pass
+  else:
+    raise AssertionError('one evaluation worker must be refused')
 
 
 def test_evaluation_replays_memory_the_way_each_policy_was_trained():
@@ -568,7 +582,7 @@ class _AsyncScriptedPool:
       self.clock[match] += self.lengths[match] / 10
 
 
-def test_async_evaluation_takes_a_fixed_quota_from_every_match():
+def test_evaluation_takes_a_fixed_quota_from_every_match():
   """Short (successful) episodes must not crowd out long (failed) ones."""
   torch.manual_seed(0)
   policy = FootballPolicy(_env(), hidden_size=16)
@@ -580,7 +594,7 @@ def test_async_evaluation_takes_a_fixed_quota_from_every_match():
   assert metrics['success_rate'] == 0.5
 
 
-def test_async_evaluation_does_not_depend_on_batching_or_timing():
+def test_evaluation_does_not_depend_on_batching_or_timing():
   torch.manual_seed(0)
   policy = FootballPolicy(_env(), hidden_size=16)
   lengths = [3, 5, 7, 11, 13]
