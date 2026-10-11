@@ -1,8 +1,8 @@
 """Score one policy's attack against a chosen defence, optionally on video.
 
-This is the fixed-opponent check used to compare training runs: the gate's
-own numbers are against each run's own snapshots, so they do not compare
-across runs, but the same attack-vs-defence match on the same scenes does.
+This is the fixed-opponent check used to compare training runs: the same
+attack-vs-defence match on the same scenes, whatever opponents each run
+trained against.
 
 The attack is --checkpoint.  The defence (--defence) is:
   self      the same policy (what ADR training episodes play)
@@ -11,8 +11,10 @@ The attack is --checkpoint.  The defence (--defence) is:
   PATH      any policy snapshot, simple115 or entity observation (the
             fixed defender used to score runs is a simple115 MLP)
 Scenes (--scene):
-  level:L            the gate's evaluation scenes of curriculum level L
-  adr:start          every ADR setting at its level-0 start value
+  adr:difficulty:D   every ADR setting uniform over its range at test
+                     difficulty D (adr set_difficulty; what the trainer's
+                     evaluations play)
+  adr:start          every ADR setting at its start value
   adr:full           every ADR setting uniform over its ranges
   adr:pin:NAME:EDGE  as adr:full with NAME pinned at edge 0 (low) or 1
                      (high), exactly like an ADR probe
@@ -37,8 +39,6 @@ import torch
 
 import gfootball.env as football_env
 from gfootball import adr
-from gfootball.curriculum import (
-    ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, advantage_for_level)
 from gfootball.env import entity_observation
 from gfootball.env import wrappers
 from gfootball.env.puffer_env import (
@@ -64,10 +64,12 @@ def adr_ranges(log_path):
 
 
 def scene_values(scene, ranges, rng):
-  """ADR settings for one episode, or None for a level scene."""
+  """ADR settings for one episode."""
   kind = scene.split(':')
-  if kind[0] == 'level':
-    return None
+  if kind[1] == 'difficulty':
+    randomizer = adr.AutomaticDomainRandomization()
+    randomizer.set_difficulty(float(kind[2]))
+    return randomizer.sample(rng)
   if kind[1] == 'start':
     return {p.name: float(p.start) for p in adr.PARAMETERS}
   values = {name: float(rng.uniform(low, high)) if high > low else float(low)
@@ -88,20 +90,16 @@ def main():
   parser.add_argument('--video-dir', default=None)
   parser.add_argument('--output', required=True)
   args = parser.parse_args()
-  level = int(args.scene.split(':')[1]) if args.scene.startswith('level') else 0
   ranges = adr_ranges(args.adr_log)
   video = args.video_dir is not None
   options = {
-      'action_set': 'default',
-      'advantage': advantage_for_level(level, ADVANTAGE_LEVELS),
-      'curriculum_level': level, 'curriculum_levels': ADVANTAGE_LEVELS,
-      'curriculum_evaluation': True, 'game_engine_random_seed': args.seed,
+      'action_set': 'default', 'game_engine_random_seed': args.seed,
       'physics_steps_per_frame': 10, 'real_time': False}
   if video:
     options.update({'display_game_stats': True, 'render_resolution_x': 1280,
                     'render_resolution_y': 720, 'video_format': 'webm'})
   env = football_env.create_environment(
-      env_name=ADVANTAGE_ENV_NAME, representation='raw', rewards='scoring',
+      env_name=adr.SCENARIO, representation='raw', rewards='scoring',
       render=video, write_goal_dumps=False, write_full_episode_dumps=video,
       write_video=video, dump_frequency=1,
       logdir=args.video_dir if video else tempfile.mkdtemp(),
@@ -140,13 +138,12 @@ def main():
   try:
     for _ in range(args.episodes):
       values = scene_values(args.scene, ranges, scene_rng)
-      if values is not None:
-        env.unwrapped._config['adr_values'] = values
+      env.unwrapped._config['adr_values'] = values
       raw = env.reset()
       sticky.fill(0)
       config = env.unwrapped._config
-      held = np.asarray(config._values.get('curriculum_held_directions',
-                                           [0] * 22), np.int64)
+      held = np.asarray(config._values.get('held_directions', [0] * 22),
+                        np.int64)
       attacking_left = config.ScenarioConfig().ball_position[0] > 0
       attack = slice(0, 11) if attacking_left else slice(11, 22)
       defend = slice(11, 22) if attacking_left else slice(0, 11)

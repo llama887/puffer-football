@@ -2,8 +2,8 @@
 
 Both the trainer and the environment workers need this network: the trainer
 to learn it, the workers to run a frozen copy of it as the defending side
-during promotion evaluation.  Keeping it here avoids importing the whole PPO
-loop (and PufferLib's trainer) inside every environment process.
+during evaluation and ADR probes.  Keeping it here avoids importing the whole
+PPO loop (and PufferLib's trainer) inside every environment process.
 """
 
 import os
@@ -269,7 +269,7 @@ class FootballPolicy(torch.nn.Module):
   def forward_eval(self, observations, state):
     """Advance one environment step for every agent row.
 
-    Used for acting (the trainer's collector, promotion, frozen defenders),
+    Used for acting (the trainer's collector, evaluation, frozen defenders),
     where each row carries its own memory in `state` from step to step.
     torch.lstm_cell is the fused kernel LSTMCell runs, so a CUDA graph of
     this step captures cleanly.

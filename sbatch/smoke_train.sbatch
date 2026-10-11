@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=football-gate-smoke
+#SBATCH --job-name=football-adr-smoke
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=32G
@@ -13,7 +13,7 @@ set -euo pipefail
 REPO=/scratch/fyy2003/repos/football
 ENV_PREFIX="$REPO/.venv"
 TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
-RUN_ROOT=/scratch/fyy2003/experiments/football-gate-smoke-${SLURM_JOB_ID}
+RUN_ROOT=/scratch/fyy2003/experiments/football-adr-smoke-${SLURM_JOB_ID}
 mkdir -p "$RUN_ROOT/checkpoints"
 module purge
 export PATH="$ENV_PREFIX/bin:$PATH"
@@ -24,13 +24,12 @@ export GFOOTBALL_FONT="$REPO/third_party/fonts/AlegreyaSansSC-ExtraBold.ttf"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONUNBUFFERED=1
 cd "$RUN_ROOT"
 # 8 workers x 22 agents x 32 horizon = 5632 steps per epoch; 7 epochs total,
-# promotion every 3 epochs -> evaluations at epochs 0, 3, 6.
+# an evaluation every 3 epochs -> ADR lines at epochs 0, 3, 6.  Probe
+# results reach the trainer, so the ranges can already move.
 python -u -m gfootball.examples.train_puffer \
-  --device cpu --env-name 11_vs_11_advantage --num-workers 8 \
+  --device cpu --num-workers 8 \
   --total-timesteps $((7 * 8 * 22 * 32)) \
-  --promotion-interval 3 --promotion-episodes 32 --promotion-workers 8 \
-  --greedy-promotion-episodes 16 --selfplay-promotion-episodes 16 \
-  --promotion-early-abort-margin 0.2 \
-  --curriculum-success-threshold 0.01 --promotion-worst-template-threshold 0.0 \
-  --seed 3 --no-wandb --data-dir "$RUN_ROOT/checkpoints" 2>&1 | grep -E "PROMOTION|Traceback|Error|error|Saved model|^\{" | cut -c1-2500
-echo "--- snapshots"; ls -la "$RUN_ROOT/checkpoints" | grep -i frozen
+  --evaluation-interval 3 --evaluation-episodes 16 --evaluation-workers 8 \
+  --evaluation-difficulties 0.25,1.0 --adr-probe-fraction 0.5 \
+  --adr-buffer-size 2 --no-gpu-filler \
+  --seed 3 --no-wandb --data-dir "$RUN_ROOT/checkpoints" 2>&1 | grep -E "^ADR|Traceback|Error|error|Saved model|^\{" | cut -c1-2500

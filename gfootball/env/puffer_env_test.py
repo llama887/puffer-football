@@ -8,27 +8,23 @@ import gymnasium
 import numpy as np
 import torch
 
+from gfootball import adr
 from gfootball.env import puffer_env
 from gfootball.env import config
 from gfootball.env import entity_observation
 from gfootball.env import observation_rotation
 from gfootball.env.puffer_policy import FootballPolicy, save_policy_snapshot
-from gfootball.curriculum import (
-    ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, ALIGNMENT_SCHEDULE,
-    ATTACKER_ONLY_LEVELS, FULL_LATERAL_HALF_WIDTH, KEEPER_LEVELS,
-    MAX_GOALSIDE_BLOCKERS, NARROW_LATERAL_HALF_WIDTH, SPAWN_TEMPLATE_COUNT,
-    TOTAL_LEVELS, advantage_for_level, curriculum_episode,
-    curriculum_geometry, curriculum_state, expected_goalside_blockers,
-    goalside_blockers, keeper_spawn_offset, lateral_half_width)
 
 
-def _advantage_config(advantage, evaluation=True, seed=0):
+START = {parameter.name: parameter.start for parameter in adr.PARAMETERS}
+
+
+def _scene_config(seed=0, values=None):
+  """A config whose scenario builds ADR scenes from `values` (default: the
+  start values)."""
   return config.Config({
-      'level': ADVANTAGE_ENV_NAME,
-      'advantage': advantage,
-      'curriculum_level': 0,
-      'curriculum_levels': ADVANTAGE_LEVELS,
-      'curriculum_evaluation': evaluation,
+      'level': adr.SCENARIO,
+      'adr_values': dict(values or START),
       'game_engine_random_seed': seed,
       'players': ['agent:left_players=11,right_players=11'],
   })
@@ -119,7 +115,7 @@ class PufferEnvTest(absltest.TestCase):
   def test_entity_observations_describe_one_world_from_both_sides(self):
     """Entity rows come from the live engine, one view per team."""
     env = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, seed=3, frame_stack=1,
+        seed=3, frame_stack=1,
         observation='entities')
     try:
       self.assertEqual(env.single_observation_space.shape,
@@ -150,12 +146,12 @@ class PufferEnvTest(absltest.TestCase):
       env.close()
     with self.assertRaises(ValueError):
       puffer_env.FootballPufferEnv(
-          env_name=ADVANTAGE_ENV_NAME, frame_stack=4, observation='entities')
+          frame_stack=4, observation='entities')
 
   def test_tracked_sticky_buttons_match_the_engine(self):
     """The buttons the observation reports are the ones the engine holds."""
     env = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, seed=5, frame_stack=1,
+        seed=5, frame_stack=1,
         observation='entities')
     rng = np.random.default_rng(0)
     sticky = entity_observation.CONTEXT_FEATURE_INDEX['sticky']
@@ -183,83 +179,6 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       env.close()
 
-  def test_curriculum_adds_players_before_moving_from_goal(self):
-    cfg = config.Config({
-        'level': '11_vs_11_curriculum',
-        'curriculum_level': 0,
-        'curriculum_levels': TOTAL_LEVELS,
-        'game_engine_random_seed': 7,
-        'players': ['agent:left_players=11,right_players=11'],
-    })
-    cfg.NewScenario(0)
-    initial = cfg.ScenarioConfig()
-    self.assertFalse(initial.use_magnet)
-    self.assertLen(initial.left_team, 11)
-    self.assertLen(initial.right_team, 11)
-    self.assertGreaterEqual(abs(initial.ball_position[0]), 0.88)
-    self.assertLessEqual(abs(initial.ball_position[0]), 0.92)
-    self.assertEqual(initial.game_duration, 119)
-    ball = tuple(initial.ball_position[i] for i in range(2))
-    if ball[0] > 0:
-      attackers, attacker_side = initial.left_team[1:], 1
-      defenders, defender_side = initial.right_team[1:], -1
-    else:
-      attackers, attacker_side = initial.right_team[1:], -1
-      defenders, defender_side = initial.left_team[1:], 1
-    attacker_distances = [
-        math.hypot(attacker_side * player.position[0] - ball[0],
-                   attacker_side * player.position[1] - ball[1])
-        for player in attackers]
-    defender_distances = [
-        math.hypot(defender_side * player.position[0] - ball[0],
-                   defender_side * player.position[1] - ball[1])
-        for player in defenders]
-    expected_attackers = curriculum_episode(0, 7, 1)[0]
-    self.assertEqual(
-        sum(distance < 0.25 for distance in attacker_distances),
-        expected_attackers)
-    self.assertEqual(sum(distance < 0.25 for distance in defender_distances), 0)
-    self.assertGreater(np.median(defender_distances), 0.4)
-    defending_team = initial.right_team if ball[0] > 0 else initial.left_team
-    self.assertAlmostEqual(abs(defending_team[0].position[1]), 0.36)
-    self.assertEqual(initial.reverse_team_processing, ball[0] < 0)
-    # The keeper walks into the goal one level at a time.
-    for level, offset in enumerate((0.36, 0.0)):
-      cfg['curriculum_level'] = level
-      cfg.NewScenario(0)
-      keeper_level = cfg.ScenarioConfig()
-      defending = (keeper_level.right_team
-                   if keeper_level.ball_position[0] > 0
-                   else keeper_level.left_team)
-      self.assertAlmostEqual(abs(defending[0].position[1]), offset)
-      self.assertEqual(keeper_level.game_duration, 119)
-    cfg['curriculum_level'] = 13
-    cfg.NewScenario(0)
-    misaligned = cfg.ScenarioConfig()
-    self.assertFalse(misaligned.use_magnet)
-    self.assertAlmostEqual(abs(misaligned.ball_position[0]), 0.90)
-    self.assertEqual(misaligned.game_duration, 119)
-    cfg['curriculum_level'] = 25
-    cfg.NewScenario(0)
-    all_attackers = cfg.ScenarioConfig()
-    self.assertAlmostEqual(abs(all_attackers.ball_position[0]), 0.90)
-    self.assertEqual(all_attackers.game_duration, 519)
-    cfg['curriculum_level'] = 35
-    cfg.NewScenario(0)
-    full_near_goal = cfg.ScenarioConfig()
-    self.assertAlmostEqual(abs(full_near_goal.ball_position[0]), 0.90)
-    self.assertEqual(full_near_goal.game_duration, 599)
-    cfg['curriculum_level'] = 40
-    cfg.NewScenario(0)
-    middle = cfg.ScenarioConfig()
-    self.assertAlmostEqual(abs(middle.ball_position[0]), 0.45)
-    self.assertEqual(middle.game_duration, 1799)
-    cfg['curriculum_level'] = TOTAL_LEVELS - 1
-    cfg.NewScenario(0)
-    mature = cfg.ScenarioConfig()
-    self.assertAlmostEqual(mature.ball_position[0], 0.0)
-    self.assertEqual(mature.game_duration, 3000)
-
   def test_unsorted_mode_keeps_the_raw_slot_order(self):
     env = puffer_env.FootballPufferEnv(
         env_name='tests.symmetric', seed=7, frame_stack=1,
@@ -276,120 +195,24 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       env.close()
 
-  def test_curriculum_player_counts(self):
-    self.assertEqual(curriculum_state(0), (1, 0, 0.0))
-    self.assertEqual(curriculum_state(13), (1, 0, 0.0))
-    self.assertEqual(curriculum_state(14), (2, 0, 0.0))
-    self.assertEqual(curriculum_state(17), (3, 0, 0.0))
-    self.assertEqual(curriculum_state(25), (11, 0, 0.0))
-    self.assertEqual(curriculum_state(26), (11, 1, 0.0))
-    self.assertEqual(curriculum_state(35), (11, 10, 0.0))
-    self.assertAlmostEqual(curriculum_state(40)[2], 0.5)
-    self.assertEqual(curriculum_state(TOTAL_LEVELS - 1), (11, 10, 1.0))
-    self.assertEqual(ATTACKER_ONLY_LEVELS, 26)
-
-  def test_alignment_levels_sit_on_the_measured_transition(self):
-    # A constant-shot reference scores 1.000 at alignment 0.0, 0.432 at 0.2
-    # and 0.000 at 0.4, so the schedule has to be dense inside [0, 0.4]
-    # rather than spread evenly to 1.0.
-    self.assertEqual(list(ALIGNMENT_SCHEDULE), sorted(ALIGNMENT_SCHEDULE))
-    self.assertEqual(ALIGNMENT_SCHEDULE[-1], 1.0)
-    inside = [value for value in ALIGNMENT_SCHEDULE if value <= 0.4]
-    outside = len(ALIGNMENT_SCHEDULE) - len(inside)
-    self.assertGreaterEqual(len(inside), 2 * outside)
-    self.assertLessEqual(
-        max(b - a for a, b in zip(inside, inside[1:])), 0.0501)
-
-  def test_early_levels_change_exactly_one_thing(self):
-    keeper = [curriculum_geometry(level)[0] for level in range(TOTAL_LEVELS)]
-    alignment = [
-        curriculum_geometry(level)[1] for level in range(TOTAL_LEVELS)]
-    self.assertEqual((keeper[0], alignment[0]), (0.0, 0.0))
-    self.assertEqual((keeper[-1], alignment[-1]), (1.0, 1.0))
-    self.assertEqual(keeper, sorted(keeper))
-    self.assertEqual(alignment, sorted(alignment))
-    # The keeper finishes closing the goal before the carrier is ever
-    # misaligned, so no early level moves two knobs at once.
-    for level in range(TOTAL_LEVELS):
-      if alignment[level] > 0:
-        self.assertEqual(keeper[level], 1.0)
-    # Level 0 stays the open-goal, aligned-carrier anchor.
-    self.assertAlmostEqual(keeper_spawn_offset(0), 0.36)
-    self.assertAlmostEqual(keeper_spawn_offset(TOTAL_LEVELS - 1), 0.0)
-    offsets = [keeper_spawn_offset(level) for level in range(KEEPER_LEVELS)]
-    self.assertEqual(len(set(offsets)), KEEPER_LEVELS)
-
-  def test_second_attacker_fades_in_over_several_levels(self):
-    for level, expected in ((13, 0.0), (14, 1 / 3), (15, 2 / 3), (16, 1.0)):
-      attackers = [
-          curriculum_episode(level, 7, episode)[0]
-          for episode in range(2000)
-      ]
-      self.assertAlmostEqual(
-          sum(count == 2 for count in attackers) / len(attackers),
-          expected, delta=0.04)
-    # The mix phase ends on two attackers, so the step to three is one player.
-    self.assertEqual(
-        {curriculum_episode(16, 7, episode)[0] for episode in range(200)},
-        {2})
-    self.assertEqual(
-        {curriculum_episode(17, 7, episode)[0] for episode in range(200)},
-        {3})
-
-  def test_training_spawns_cover_heldout_template_angles(self):
-    cfg = config.Config({
-        'level': '11_vs_11_curriculum',
-        'curriculum_level': 0,
-        'curriculum_levels': TOTAL_LEVELS,
-        'game_engine_random_seed': 0,
-        'players': ['agent:left_players=11,right_players=11'],
-    })
-    depths = []
-    for episode in range(8):
-      cfg.NewScenario(episode)
-      scenario = cfg.ScenarioConfig()
-      attack_right = scenario.ball_position[0] > 0
-      team = scenario.left_team if attack_right else scenario.right_team
-      side = 1 if attack_right else -1
-      carrier = team[2].position
-      offset = side * carrier[1] - scenario.ball_position[1]
-      gap = side * (scenario.ball_position[0] - side * carrier[0])
-      phase = (scenario.ball_position[1] / 0.03 + 1) / 2
-      template = cfg._values['curriculum_episode_template']
-      depths.append(abs(scenario.ball_position[0]))
-      self.assertGreaterEqual(phase, 1 / 6 + 2 / 3 * template / 8)
-      self.assertLess(phase, 1 / 6 + 2 / 3 * (template + 1) / 8)
-      self.assertAlmostEqual(gap, 0.03)
-      self.assertLess(abs(offset), 0.007)
-      self.assertGreaterEqual(depths[-1], 0.88)
-      self.assertLessEqual(depths[-1], 0.92)
-
-    self.assertGreater(max(depths) - min(depths), 0.025)
-
-    cfg['curriculum_evaluation'] = True
-    for episode in range(8):
-      cfg.NewScenario(episode)
-      phase = (cfg.ScenarioConfig().ball_position[1] / 0.03 + 1) / 2
-      template = cfg._values['curriculum_episode_template']
-      self.assertAlmostEqual(
-          phase, 1 / 6 + 2 / 3 * (template + 0.5) / 8)
-
-  def test_advantage_scenes_differ_for_every_seed_and_episode(self):
+  def test_scenes_differ_for_every_seed_and_episode(self):
     """Consecutive worker seeds through consecutive episodes are new scenes.
 
-    The promotion gate runs worker seeds s, s+1, ... through episodes 0, 1,
-    ...  When a scene's randomness depended only on seed + episode, worker
-    i's episode e and worker i+1's episode e-1 were the same scene: the
-    256-episode gate replayed 38 scenes and three training seeds one apart
-    shared 36 of them.
+    Evaluation runs worker seeds s, s+1, ... through episodes 0, 1, ...  When
+    a scene's randomness depended only on seed + episode, worker i's episode
+    e and worker i+1's episode e-1 were the same scene (an old 256-episode
+    evaluation replayed 38 scenes), so scenes are keyed on the (seed,
+    episode) pair.
     """
     scenes = set()
     for seed, episode in ((100, 5), (101, 4), (102, 3), (105, 0)):
-      cfg = _advantage_config(0.75, evaluation=True, seed=seed)
+      cfg = _scene_config(seed=seed)
       cfg.NewScenario(episode)
       scenario = cfg.ScenarioConfig()
-      scenes.add((round(scenario.ball_position[0], 6),
-                  round(scenario.ball_position[1], 6)))
+      scenes.add(tuple(round(p.position[axis], 6)
+                       for team in (scenario.left_team, scenario.right_team)
+                       for p in team
+                       for axis in (0, 1)))
     self.assertLen(scenes, 4)
 
   def test_episodes_end_when_the_ball_goes_out_of_play(self):
@@ -398,258 +221,65 @@ class PufferEnvTest(absltest.TestCase):
     A goal kick, corner or throw-in then never restarts and the match sits
     frozen until the timeout, so the episode ends as soon as play stops.
     """
-    for advantage in (1.0, 0.5, 0.0):
-      cfg = _advantage_config(advantage)
+    limits = {p.name: p.maximum for p in adr.PARAMETERS}
+    for values in (START, limits):
+      cfg = _scene_config(values=values)
       cfg.NewScenario(0)
       self.assertTrue(cfg.ScenarioConfig().end_episode_on_out_of_play)
-    cfg = _advantage_config(1.0)
-    cfg['uniform_spawn'] = True
-    cfg.NewScenario(0)
-    self.assertTrue(cfg.ScenarioConfig().end_episode_on_out_of_play)
 
-  def test_uniform_spawn_places_everyone_legally_across_the_pitch(self):
-    """Uniform spawn: whole pitch, keepers in their box, nobody offside."""
-    balls = []
-    for seed in range(150):
-      cfg = _advantage_config(1.0, evaluation=False, seed=seed)
-      cfg['uniform_spawn'] = True
-      cfg.NewScenario(seed % 5)
-      scenario = cfg.ScenarioConfig()
-      ball = (scenario.ball_position[0], scenario.ball_position[1])
-      balls.append(ball)
-      self.assertTrue(scenario.offsides)
-      self.assertLen(scenario.left_team, 11)
-      self.assertLen(scenario.right_team, 11)
-      # The left team is stored in world coordinates, the right team in its
-      # own mirrored frame.
-      left = [(p.position[0], p.position[1]) for p in scenario.left_team]
-      right = [(-p.position[0], -p.position[1]) for p in scenario.right_team]
-      for x, y in left + right + [ball]:
-        self.assertLessEqual(abs(x), 1.0)
-        self.assertLessEqual(abs(y), 0.42)
-      for keeper_x, keeper_y in ((-left[0][0], left[0][1]),
-                                 (right[0][0], right[0][1])):
-        self.assertGreaterEqual(keeper_x, 0.84)
-        self.assertLessEqual(abs(keeper_y), 0.2)
-      # The left team attacks +x, the right team -x.  An attacker in the
-      # opponents' half may be no nearer their goal line than both the ball
-      # and the second-last opponent.
-      for attackers, defenders, sign in ((left, right, 1.0),
-                                         (right, left, -1.0)):
-        second_last = sorted((sign * x for x, _ in defenders),
-                             reverse=True)[1]
-        line = max(0.0, sign * ball[0], second_last)
-        for x, _ in attackers:
-          self.assertLessEqual(sign * x, line + 1e-6)
-    xs = [x for x, _ in balls]
-    ys = [y for _, y in balls]
-    self.assertLess(min(xs), -0.6)
-    self.assertGreater(max(xs), 0.6)
-    self.assertLess(min(ys), -0.2)
-    self.assertGreater(max(ys), 0.2)
+  def test_attackers_ahead_start_onside_and_out_of_the_shooting_lane(self):
+    """attackers_ahead puts that many attackers between the ball and the goal.
 
-  def test_spawn_mode_reaches_the_scenario(self):
-    env = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=3,
-        curriculum_levels=ADVANTAGE_LEVELS, spawn='uniform')
-    try:
-      env.reset()
-      self.assertTrue(env._env.unwrapped._config['uniform_spawn'])
-    finally:
-      env.close()
-    with self.assertRaisesRegex(ValueError, 'spawn'):
-      puffer_env.FootballPufferEnv(spawn='random')
-
-  def test_width_spawn_moves_players_across_the_width_only(self):
-    """Width spawn keeps the level's distances, ball and goal-side blockers.
-
-    In a training episode drawn for it, every outfield player except the
-    goal-side blockers keeps the x its level gives it and takes a uniform y
-    across the pitch, so nobody starts lined up on the ball and the nearest
-    player has to go and get it.  The ball, the blockers and the keepers stay
-    where the level puts them, and gate (evaluation) episodes never use it.
+    They are onside (no nearer the goal line than the second-last defender)
+    and out of the shooting lane, so they never block the carrier's shot.
     """
-    def layout(fraction, seed, advantage, evaluation=False):
-      cfg = _advantage_config(advantage, evaluation=evaluation, seed=seed)
-      cfg['width_spawn_fraction'] = fraction
-      cfg.NewScenario(seed % 7)
-      scenario = cfg.ScenarioConfig()
-      attack_right = scenario.ball_position[0] > 0
-      # AddPlayer flips both axes for the right team; undo it for world space.
-      left = [(p.position[0], p.position[1]) for p in scenario.left_team]
-      right = [(-p.position[0], -p.position[1]) for p in scenario.right_team]
-      attackers, defenders = (left, right) if attack_right else (right, left)
-      ball = (scenario.ball_position[0], scenario.ball_position[1])
-      return (ball, attackers, defenders,
-              cfg['curriculum_goalside_defenders'],
-              cfg['curriculum_width_spawn'])
-
-    carrier_offsets = []
-    for seed in range(40):
-      for advantage in (1.0, 0.5):
-        ball, attackers, defenders, blockers, flag = layout(0.0, seed, advantage)
-        self.assertFalse(flag)
-        wide_ball, wide_attackers, wide_defenders, wide_blockers, wide_flag = (
-            layout(1.0, seed, advantage))
-        self.assertTrue(wide_flag)
-        self.assertEqual(ball, wide_ball)
-        self.assertEqual(blockers, wide_blockers)
-        for (x, _), (wide_x, wide_y) in zip(attackers + defenders,
-                                           wide_attackers + wide_defenders):
-          # Only the overlap relaxation may nudge x, by under a player width.
-          self.assertLess(abs(x - wide_x), 0.03)
-          self.assertLessEqual(abs(wide_y), 0.42)
-        # Keepers and goal-side blockers keep their lateral places.
-        for index in [0] + list(range(1, 1 + blockers)):
-          self.assertLess(abs(defenders[index][1] - wide_defenders[index][1]),
-                          0.03)
-        self.assertLess(abs(attackers[0][1] - wide_attackers[0][1]), 0.03)
-        # The carrier normally stands right behind the ball.
-        self.assertLess(abs(attackers[1][1] - ball[1]), 0.03)
-        carrier_offsets.append(abs(wide_attackers[1][1] - wide_ball[1]))
-        # The gate never sees a width spawn.
-        gate = layout(1.0, seed, advantage, evaluation=True)
-        self.assertEqual(gate[:4], layout(0.0, seed, advantage,
-                                          evaluation=True)[:4])
-        self.assertFalse(gate[4])
-    self.assertGreater(max(carrier_offsets), 0.25)
-    self.assertGreater(np.mean(carrier_offsets), 0.1)
-    drawn = sum(layout(0.5, seed, 0.75)[4] for seed in range(200))
-    self.assertBetween(drawn, 70, 130)
-
-  def test_mixed_shape_puts_onside_attackers_ahead_of_the_ball(self):
-    """From level 1, some attackers start between the ball and the goal.
-
-    Without it no attacker ever starts ahead of the ball from level 3 up, so
-    "forward" is the right move from every spawn.  The ones placed ahead are
-    onside (no nearer the goal line than the second-last defender) and out
-    of the shooting lane, so they never block the shot the level is built
-    around.  Level 0, the anchor, is unchanged, and so are the ball, the
-    keepers and the goal-side blockers.  It is part of the level, so gate
-    scenes use it too.
-    """
-    def layout(mixed, seed, level, evaluation):
-      cfg = _advantage_config(
-          advantage_for_level(level, ADVANTAGE_LEVELS),
-          evaluation=evaluation, seed=seed)
-      cfg['mixed_shape'] = mixed
-      cfg.NewScenario(seed % 7)
-      scenario = cfg.ScenarioConfig()
-      attack_right = scenario.ball_position[0] > 0
-      flip = 1.0 if attack_right else -1.0
-      left = [(flip * p.position[0], flip * p.position[1])
-              for p in scenario.left_team]
-      right = [(-flip * p.position[0], -flip * p.position[1])
-               for p in scenario.right_team]
-      attackers, defenders = (left, right) if attack_right else (right, left)
-      ball = (flip * scenario.ball_position[0],
-              flip * scenario.ball_position[1])
-      return ball, attackers, defenders, cfg['curriculum_goalside_defenders']
-
-    for evaluation in (False, True):
-      for seed in range(25):
-        self.assertEqual(layout(True, seed, 0, evaluation),
-                         layout(False, seed, 0, evaluation))
-        for level in (1, 3, 9, 14, 18):
-          ball, attackers, defenders, blockers = layout(
-              True, seed, level, evaluation)
-          plain_ball, _, plain_defenders, _ = layout(
-              False, seed, level, evaluation)
-          self.assertEqual(ball, plain_ball)
-          self.assertEqual(defenders[0], plain_defenders[0])  # keeper
-          for rank in range(1, 1 + blockers):
-            self.assertLess(abs(defenders[rank][0] - plain_defenders[rank][0]) +
-                            abs(defenders[rank][1] - plain_defenders[rank][1]),
-                            0.03)
+    for seed in range(25):
+      for count in (1, 2, 3):
+        for distance in (0.3, 0.55):
+          cfg = _scene_config(seed=seed, values=dict(
+              START, ball_distance=distance, attackers_ahead=float(count)))
+          cfg.NewScenario(seed % 7)
+          scenario = cfg.ScenarioConfig()
+          attack_right = scenario.ball_position[0] > 0
+          flip = 1.0 if attack_right else -1.0
+          left = [(flip * p.position[0], flip * p.position[1])
+                  for p in scenario.left_team]
+          right = [(-flip * p.position[0], -flip * p.position[1])
+                   for p in scenario.right_team]
+          attackers, defenders = (left, right) if attack_right else (
+              right, left)
+          ball = (flip * scenario.ball_position[0],
+                  flip * scenario.ball_position[1])
           ahead = [(x, y) for x, y in attackers[1:] if x > ball[0] + 0.02]
-          self.assertGreaterEqual(len(ahead), min(3, level), (level, seed))
-          second_last = sorted(x for x, _ in defenders)[-2]
-          line = max(ball[0], second_last)
+          self.assertGreaterEqual(len(ahead), count, (count, seed))
+          line = max(ball[0], sorted(x for x, _ in defenders)[-2])
           for x, y in attackers:
-            self.assertLessEqual(x, line + 1e-6, (level, seed))
+            self.assertLessEqual(x, line + 1e-6, (count, seed))
           for x, y in ahead:
             # The lane narrows from the posts (|y| = 0.044) to the ball.
             along = (x - ball[0]) / (1.0 - ball[0])
             centre = ball[1] * (1.0 - along)
             self.assertGreater(abs(y - centre), 0.044 * along + 0.015,
-                               (level, seed))
+                               (count, seed))
 
-  def test_loose_ball_spawn_matches_the_dead_ball_situation(self):
-    """A loose-ball spawn starts like a real dead ball, made winnable.
-
-    Measured dead balls have the nearest attacker 0.4-0.9 from a still ball,
-    the players holding a direction, and the defenders usually farther away.
-    In a training episode drawn for it, the ball stays where the level puts
-    it, the nearest attacker starts a fetch distance away that grows with the
-    level, every defender (keeper included) starts farther than that on the
-    low levels, and about half the outfield players are given a direction to
-    hold on the first step.  Gate episodes never use it.
-    """
-    def layout(fraction, seed, level, evaluation=False):
-      cfg = _advantage_config(
-          advantage_for_level(level, ADVANTAGE_LEVELS),
-          evaluation=evaluation, seed=seed)
-      cfg['loose_ball_fraction'] = fraction
-      cfg.NewScenario(seed % 7)
-      scenario = cfg.ScenarioConfig()
-      attack_right = scenario.ball_position[0] > 0
-      left = [(p.position[0], p.position[1]) for p in scenario.left_team]
-      right = [(-p.position[0], -p.position[1]) for p in scenario.right_team]
-      attackers, defenders = (left, right) if attack_right else (right, left)
-      ball = np.array((scenario.ball_position[0], scenario.ball_position[1]))
-      nearest = lambda team: min(np.hypot(x - ball[0], y - ball[1])
-                                 for x, y in team)
-      return (tuple(ball), nearest(attackers[1:]), nearest(defenders),
-              cfg['curriculum_loose_ball'],
-              list(cfg['curriculum_held_directions']))
-
-    directions = {1, 2, 3, 4, 5, 6, 7, 8}
-    for level in (0, 2, 5, 10, 14):
-      fetches = []
-      for seed in range(30):
-        ball, attacker, defender, loose, held = layout(1.0, seed, level)
-        plain_ball, plain_attacker, _, plain_loose, plain_held = layout(
-            0.0, seed, level)
-        self.assertTrue(loose)
-        self.assertFalse(plain_loose)
-        self.assertEqual(plain_held, [0] * 22)
-        self.assertEqual(ball, plain_ball)
-        self.assertGreater(attacker, plain_attacker)
-        fetches.append(attacker)
-        if level <= 5:
-          self.assertGreater(defender, attacker + 0.01, (level, seed))
-        else:
-          self.assertGreater(defender, attacker - 0.03, (level, seed))
-        self.assertLen(held, 22)
-        self.assertEqual(held[0], 0)   # keepers never get a held direction
-        self.assertEqual(held[11], 0)
-        self.assertTrue(set(held) <= directions | {0})
-        self.assertGreater(sum(h > 0 for h in held), 0)
-        gate = layout(1.0, seed, level, evaluation=True)
-        self.assertFalse(gate[3])
-        self.assertEqual(gate[4], [0] * 22)
-      if level >= 10:
-        self.assertGreater(max(fetches), 0.5, level)
-      if level == 0:
-        self.assertLess(max(fetches), 0.13)
-    drawn = sum(layout(0.5, seed, 5)[3] for seed in range(200))
-    self.assertBetween(drawn, 70, 130)
-
-  def test_loose_ball_warmup_presses_held_directions_outside_training(self):
-    """The first step of a loose-ball episode presses the held directions.
+  def test_held_directions_are_pressed_on_the_first_step_outside_training(
+      self):
+    """The first step of a scene with held players (ADR held_share) presses
+    the held directions.
 
     Every row is hidden on that step, so the trainer (which skips all-zero
     rows) never learns from actions the policy did not choose and the step
     pays nothing; from the next step the policy acts on players that are
     already running, with those buttons held.
     """
+    shared = adr.shared_ranges()
+    adr.AutomaticDomainRandomization(shared=shared).set_range(
+        'held_share', 1.0, 1.0)
     env = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=5,
-        curriculum_levels=ADVANTAGE_LEVELS, observation='entities',
-        loose_ball_fraction=1.0)
+        frame_stack=1, seed=5, observation='entities', adr_shared=shared)
     try:
       observations, _ = env.reset()
-      held = np.asarray(env._env.unwrapped._config['curriculum_held_directions'])
+      held = np.asarray(env._env.unwrapped._config['held_directions'])
       self.assertGreater((held > 0).sum(), 0)
       self.assertFalse(np.any(observations))
       observations, rewards, _, _, _ = env.step(np.zeros(22, dtype=np.int32))
@@ -664,7 +294,7 @@ class PufferEnvTest(absltest.TestCase):
       env.close()
 
   def test_adr_values_build_the_scene_they_describe(self):
-    """With 'adr_values' the scene comes from explicit settings, not a level.
+    """With 'adr_values' the scene comes from explicit settings.
 
     Each value is honoured: the ball's distance from the attacked goal line
     and its y, the number of goal-side blockers (fractions add one by
@@ -672,13 +302,11 @@ class PufferEnvTest(absltest.TestCase):
     distance), the nearest outfield defender's extra distance (head start),
     attackers ahead of the ball (onside, lane clear), the share of players
     holding a direction, and offside once the formation is a real match
-    shape.  The level-0 starting values give a level-0 scene.
+    shape.  The start values give the start scene.
     """
-    from gfootball import adr
 
     def scene(values, seed):
-      cfg = _advantage_config(1.0, evaluation=False, seed=seed)
-      cfg['adr_values'] = values
+      cfg = _scene_config(seed=seed, values=values)
       cfg.NewScenario(seed % 7)
       scenario = cfg.ScenarioConfig()
       attack_right = scenario.ball_position[0] > 0
@@ -701,12 +329,12 @@ class PufferEnvTest(absltest.TestCase):
       cfg, scenario, ball, attackers, defenders = scene(start, seed)
       self.assertAlmostEqual(ball[0], 0.9, places=6)
       self.assertAlmostEqual(nearest(attackers[1:], ball), 0.03, delta=0.01)
-      self.assertEqual(cfg['curriculum_goalside_defenders'], 1)
-      # The level-0 ring is squeezed up to 0.04 (the room in front of the
+      self.assertEqual(cfg['goalside_blockers'], 1)
+      # The start ring is squeezed up to 0.04 (the room in front of the
       # ball) ahead against the goal line;
       # nobody is placed ahead of it.
       self.assertEqual(sum(x > ball[0] + 0.05 for x, _ in attackers[1:]), 0)
-      self.assertEqual(list(cfg['curriculum_held_directions']), [0] * 22)
+      self.assertEqual(list(cfg['held_directions']), [0] * 22)
       self.assertFalse(scenario.offsides)
 
     values = dict(start, ball_distance=0.55, ball_lateral=-0.2, blockers=2.0,
@@ -717,10 +345,10 @@ class PufferEnvTest(absltest.TestCase):
       self.assertAlmostEqual(ball[0], 0.45, places=6)
       # ball_lateral is a pitch y, the same for both attack directions.
       self.assertAlmostEqual(scenario.ball_position[1], -0.2, places=6)
-      self.assertEqual(cfg['curriculum_goalside_defenders'], 2)
+      self.assertEqual(cfg['goalside_blockers'], 2)
       self.assertAlmostEqual(nearest(attackers[1:], ball), 0.4, delta=0.02)
       self.assertAlmostEqual(nearest(defenders[1:], ball), 0.5, delta=0.03)
-      held = list(cfg['curriculum_held_directions'])
+      held = list(cfg['held_directions'])
       self.assertEqual(held[0], 0)
       self.assertEqual(held[11], 0)
       self.assertEqual(sum(h > 0 for h in held), 20)
@@ -730,7 +358,7 @@ class PufferEnvTest(absltest.TestCase):
     for seed in range(200):
       cfg, scenario, ball, attackers, defenders = scene(
           dict(start, blockers=1.5, attackers_ahead=1.5), seed)
-      counts.append(cfg['curriculum_goalside_defenders'])
+      counts.append(cfg['goalside_blockers'])
     self.assertBetween(np.mean(counts), 1.35, 1.65)
 
     for seed in range(20):
@@ -745,13 +373,12 @@ class PufferEnvTest(absltest.TestCase):
   def test_adr_env_draws_each_episode_from_the_live_shared_ranges(self):
     """An ADR env samples every episode from the shared ranges, so a range
     the trainer moves takes effect at the next episode in every worker."""
-    from gfootball import adr
     shared = adr.shared_ranges()
     randomizer = adr.AutomaticDomainRandomization(shared=shared)
     randomizer.set_range('ball_distance', 0.3, 0.3)
     env = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=3,
-        curriculum_levels=ADVANTAGE_LEVELS, adr_shared=shared)
+        frame_stack=1, seed=3,
+        adr_shared=shared)
     try:
       env.reset()
       ball = env._env.unwrapped._config.ScenarioConfig().ball_position[0]
@@ -763,22 +390,42 @@ class PufferEnvTest(absltest.TestCase):
       self.assertAlmostEqual(abs(ball) / 54.4, 0.5, places=4)
     finally:
       env.close()
-    with self.assertRaisesRegex(ValueError, 'adr'):
-      puffer_env.FootballPufferEnv(adr_shared=shared)  # not the advantage env
     with self.assertRaisesRegex(ValueError, 'adr_probe_fraction'):
-      puffer_env.FootballPufferEnv(env_name=ADVANTAGE_ENV_NAME,
-                                   adr_shared=shared, adr_probe_fraction=1.5)
+      puffer_env.FootballPufferEnv(adr_shared=shared, adr_probe_fraction=1.5)
+
+  def test_evaluation_scenes_replay_exactly_after_every_reseed(self):
+    """An env on fixed test ranges (no probes) draws the same scenes after
+    every reset(seed): an evaluation pool is reused between checks, and each
+    check has to replay the episodes a freshly built pool would."""
+    shared = adr.shared_ranges()
+    adr.AutomaticDomainRandomization(shared=shared).set_difficulty(0.5)
+    env = puffer_env.FootballPufferEnv(
+        frame_stack=1, seed=3, adr_shared=shared)
+
+    def scenes():
+      drawn = []
+      for episode in range(3):
+        env.reset(seed=100) if episode == 0 else env.reset()
+        ball = env._env.unwrapped._config.ScenarioConfig().ball_position
+        drawn.append((dict(env._adr_values), (ball[0], ball[1])))
+      return drawn
+
+    try:
+      first = scenes()
+      self.assertNotEqual(first[0][0], first[1][0])
+      self.assertEqual(scenes(), first)
+    finally:
+      env.close()
 
   def test_adr_probe_episodes_play_random_defenders_outside_training(self):
     """A probe episode pins one setting's edge, the defending side plays
     uniform random actions with its rows hidden (so it is never trained),
     and the episode end reports the setting, the edge and the result."""
-    from gfootball import adr
     shared = adr.shared_ranges()
     for fraction, probe in ((1.0, True), (0.0, False)):
       env = puffer_env.FootballPufferEnv(
-          env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=11,
-          curriculum_levels=ADVANTAGE_LEVELS, adr_shared=shared,
+          frame_stack=1, seed=11,
+          adr_shared=shared,
           adr_probe_fraction=fraction)
       try:
         observations, _ = env.reset()
@@ -799,7 +446,7 @@ class PufferEnvTest(absltest.TestCase):
           self.assertIn(int(info['adr_edge']), (adr.LOWER, adr.UPPER))
         else:
           self.assertEqual(info['adr_edge'], -1.0)
-        self.assertIn('curriculum_success', info)
+        self.assertIn('success', info)
         self.assertAlmostEqual(info['adr_ball_distance'], 0.10, places=6)
       finally:
         env.close()
@@ -811,7 +458,6 @@ class PufferEnvTest(absltest.TestCase):
     never trained), training episodes stay self-play, and a snapshot replaced
     on disk takes over at the next episode: that is how the trainer
     refreshes the probe opponent."""
-    from gfootball import adr
     spaces = SimpleNamespace(
         single_observation_space=gymnasium.spaces.Box(
             low=-1, high=1, shape=(115,), dtype=np.float32),
@@ -829,8 +475,8 @@ class PufferEnvTest(absltest.TestCase):
     save_always(5, snapshot)
     shared = adr.shared_ranges()
     probing = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=11,
-        curriculum_levels=ADVANTAGE_LEVELS, adr_shared=shared,
+        frame_stack=1, seed=11,
+        adr_shared=shared,
         adr_probe_fraction=1.0, adr_probe_defence=snapshot)
     try:
       observations, _ = probing.reset()
@@ -844,8 +490,8 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       probing.close()
     training = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=11,
-        curriculum_levels=ADVANTAGE_LEVELS, adr_shared=shared,
+        frame_stack=1, seed=11,
+        adr_shared=shared,
         adr_probe_fraction=0.0, adr_probe_defence=snapshot)
     try:
       observations, _ = training.reset()
@@ -857,9 +503,8 @@ class PufferEnvTest(absltest.TestCase):
     """frozen_defence_path='random' plays the defending side with uniform
     random actions (the base random policy) and loads no file."""
     env = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=4,
-        curriculum_levels=ADVANTAGE_LEVELS, frozen_defence_path='random',
-        curriculum_evaluation=True)
+        frame_stack=1, seed=4,
+        frozen_defence_path='random')
     try:
       observations, _ = env.reset()
       self.assertFalse(np.any(observations[env._defending_rows()]))
@@ -872,76 +517,8 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       env.close()
 
-  def test_width_spawn_fraction_reaches_the_scenario(self):
-    env = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=3,
-        curriculum_levels=ADVANTAGE_LEVELS, width_spawn_fraction=0.5)
-    try:
-      env.reset()
-      self.assertEqual(env._env.unwrapped._config['width_spawn_fraction'], 0.5)
-    finally:
-      env.close()
-
-  def test_inactive_curriculum_players_are_hidden_and_forced_idle(self):
+  def test_without_magnet_players_need_a_direction_to_move(self):
     env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
-    try:
-      observations, _ = env.reset()
-      expected_active = env._episode_attackers + 1
-      self.assertEqual(env._active_mask.sum(), expected_active)
-      self.assertEqual(np.any(observations, axis=1).sum(), expected_active)
-      raw_env = env._env.unwrapped._env
-      initial = np.concatenate(
-          [raw_env.observation()['left_team'],
-           raw_env.observation()['right_team']])
-      class RecordingEnv:
-        def __init__(self, wrapped):
-          self.wrapped = wrapped
-          self.actions = None
-
-        def step(self, actions):
-          self.actions = np.asarray(actions).copy()
-          return self.wrapped.step(actions)
-
-        def __getattr__(self, name):
-          return getattr(self.wrapped, name)
-
-      env._env = RecordingEnv(env._env)
-      requested = np.arange(22, dtype=np.int32) % 19
-      expected = requested.copy()
-      expected[~env._active_mask] = 0
-      env.step(requested)
-      np.testing.assert_array_equal(env._env.actions, expected)
-      for _ in range(4):
-        env.step(np.full(22, 5, dtype=np.int32))
-      after = np.concatenate(
-          [raw_env.observation()['left_team'],
-           raw_env.observation()['right_team']])
-      movement = np.linalg.norm(after - initial, axis=1)
-      self.assertLess(movement[~env._active_mask].max(), 0.002)
-      self.assertGreater(movement[env._active_mask].max(), 0.002)
-    finally:
-      env.close()
-
-  def test_attacker_only_levels_keep_physical_goalkeeper_out_of_learning(self):
-    env = puffer_env.FootballPufferEnv(
-        frame_stack=1, seed=7, attacker_only_levels=11)
-    try:
-      observations, _ = env.reset()
-      self.assertEqual(env._active_mask.sum(), env._episode_attackers)
-      self.assertEqual(
-          np.any(observations, axis=1).sum(), env._episode_attackers)
-      raw = env._env.unwrapped._env.observation()
-      self.assertLen(raw['left_team'], 11)
-      self.assertLen(raw['right_team'], 11)
-      defending_goalkeeper = 0 if env._attacking_left else 11
-      self.assertFalse(env._active_mask[defending_goalkeeper])
-      env.step(np.zeros(22, dtype=np.int32))
-    finally:
-      env.close()
-
-  def test_later_levels_without_magnet_require_direction_to_move(self):
-    env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
-    env._curriculum_level = 1
     try:
       env.reset()
       raw_env = env._env.unwrapped._env
@@ -971,57 +548,6 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       env.close()
 
-  def test_first_curriculum_attempt_uses_short_credit_horizon(self):
-    env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
-    try:
-      env.reset()
-      for episode_length in range(1, 602):
-        _, _, terminals, _, _ = env.step(np.zeros(22, dtype=np.int32))
-        if terminals.all():
-          break
-      self.assertEqual(episode_length, 120)
-    finally:
-      env.close()
-
-  def test_curriculum_advances_only_after_mastery_window(self):
-    env = puffer_env.FootballPufferEnv(
-        env_name='tests.symmetric', curriculum_levels=3,
-        curriculum_window=3, curriculum_success_threshold=2 / 3)
-    try:
-      self.assertFalse(env._record_curriculum_result(True)[1])
-      self.assertFalse(env._record_curriculum_result(False)[1])
-      success_rate, advanced = env._record_curriculum_result(True)
-      self.assertTrue(advanced)
-      self.assertAlmostEqual(success_rate, 2 / 3)
-      self.assertEqual(env._curriculum_level, 1)
-      self.assertEmpty(env._curriculum_results)
-    finally:
-      env.close()
-
-  def test_shared_curriculum_moves_all_matches_together(self):
-    from multiprocessing import RawValue
-    level = RawValue('i', 0)
-    env = puffer_env.FootballPufferEnv(
-        frame_stack=1, seed=7, attacker_only_levels=ATTACKER_ONLY_LEVELS,
-        curriculum_level_value=level)
-    try:
-      env.reset()
-      level.value = 1
-      env.reset()
-      self.assertEqual(env._episode_level, 1)
-      self.assertEqual(env._active_mask.sum(), 1)
-      level.value = 25
-      env.reset()
-      self.assertEqual(env._episode_level, 25)
-      self.assertEqual(env._active_mask.sum(), 11)
-      level.value = 26
-      env.reset()
-      self.assertEqual(env._episode_level, 26)
-      # Eleven attackers, plus the now-controllable keeper and one defender.
-      self.assertEqual(env._active_mask.sum(), 13)
-    finally:
-      env.close()
-
   def test_two_matches_run_in_parallel(self):
     env = puffer_env.make_vector_env(
         num_envs=2, num_workers=2, batch_size=2, reserved_cpus=0,
@@ -1040,131 +566,43 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       env.close()
 
-  def test_level_zero_lateral_band_stays_inside_the_scoreable_region(self):
-    """Level 0 must not spawn the ball where nothing can score from.
-
-    Measured at advantage 1.00: success is 0.98 at |ball_y| 0.088 but 0.13 by
-    0.113, and always-shot is zero beyond 0.079.  The anchor level has to sit
-    inside that, and the band has to widen monotonically after it.
-    """
-    self.assertAlmostEqual(
-        lateral_half_width(1.0), NARROW_LATERAL_HALF_WIDTH)
-    self.assertAlmostEqual(
-        lateral_half_width(0.4), FULL_LATERAL_HALF_WIDTH)
-    self.assertAlmostEqual(
-        lateral_half_width(0.0), FULL_LATERAL_HALF_WIDTH)
-    widths = [lateral_half_width(advantage_for_level(level))
-              for level in range(ADVANTAGE_LEVELS)]
-    self.assertEqual(widths, sorted(widths))
-    self.assertLess(widths[0], 0.10)
-    # The band holds at level-0 width until the blocker fade is complete
-    # (level 5), so the two ramps never move on the same level.
-    for level in range(6):
-      self.assertAlmostEqual(widths[level], NARROW_LATERAL_HALF_WIDTH)
-      self.assertAlmostEqual(
-          expected_goalside_blockers(advantage_for_level(level)),
-          1.0 + 0.2 * level)
-    self.assertGreater(widths[6], NARROW_LATERAL_HALF_WIDTH)
-    self.assertAlmostEqual(
-        expected_goalside_blockers(advantage_for_level(6)), 2.2)
-
-    cfg = config.Config({
-        'level': ADVANTAGE_ENV_NAME,
-        'advantage': 1.0,
-        'curriculum_level': 0,
-        'curriculum_levels': ADVANTAGE_LEVELS,
-        'curriculum_evaluation': True,
-        'game_engine_random_seed': 0,
-        'players': ['agent:left_players=11,right_players=11'],
-    })
-    templates = {}
-    for episode in range(2 * SPAWN_TEMPLATE_COUNT):
-      cfg.NewScenario(episode)
-      ball_y = cfg.ScenarioConfig().ball_position[1]
-      self.assertLessEqual(abs(ball_y), NARROW_LATERAL_HALF_WIDTH + 1e-6)
-      templates[int(cfg._values['curriculum_episode_template'])] = ball_y
-    self.assertEqual(len(templates), SPAWN_TEMPLATE_COUNT)
-    # Every template still names a distinct lateral spawn inside the band.
-    self.assertEqual(len(set(round(y, 6) for y in templates.values())),
-                     SPAWN_TEMPLATE_COUNT)
-
-  def test_goalside_blockers_fade_in_by_at_most_a_fifth_per_level(self):
-    """No level may add a whole blocker at once; level 0 keeps exactly one.
-
-    Three seeds cleared levels 0-2 and collapsed on level 3, which is where
-    the rounded schedule dropped the second blocker in one step.
-    """
-    draws = [(k + 0.5) / 1000 for k in range(1000)]
-    for draw in (0.0, 0.5, 0.999):
-      self.assertEqual(goalside_blockers(1.0, draw), 1)
-      self.assertEqual(goalside_blockers(0.0, draw), MAX_GOALSIDE_BLOCKERS)
-    means = []
-    for level in range(ADVANTAGE_LEVELS):
-      advantage = advantage_for_level(level)
-      counts = [goalside_blockers(advantage, draw) for draw in draws]
-      self.assertLessEqual(max(counts) - min(counts), 1)
-      means.append(sum(counts) / len(counts))
-      self.assertAlmostEqual(
-          means[-1], expected_goalside_blockers(advantage), places=2)
-    self.assertEqual(means, sorted(means))
-    for earlier, later in zip(means, means[1:]):
-      self.assertLessEqual(later - earlier, 0.2 + 1e-6)
-    # Level 3 used to be a hard two-blocker level; now it is 60% likely.
-    self.assertAlmostEqual(means[3], 1.6, places=2)
-
   def test_lone_blocker_side_is_mirrored_at_random(self):
-    """A lone blocker takes either lane, so mirror templates are equally hard.
+    """A lone blocker takes either lane, so mirror scenes are equally hard.
 
     It used to sit on the world -y side of the ball every time, which put it
-    inside the goal mouth only for balls spawned on the +y side: template 7
-    scored 0.50 at level 0 while its mirror, template 0, scored 0.64-0.97.
+    inside the goal mouth only for balls on the +y side: one side of the
+    pitch scored 0.50 while its mirror scored 0.64-0.97.
     """
-    sides = {template: set() for template in range(SPAWN_TEMPLATE_COUNT)}
+    sides = {True: set(), False: set()}
     offsets = []
     for seed in range(40):
-      cfg = _advantage_config(1.0, seed=seed)
-      for _ in range(SPAWN_TEMPLATE_COUNT):
+      cfg = _scene_config(seed=seed)
+      for _ in range(16):
         cfg.NewScenario()
-        self.assertEqual(cfg._values['curriculum_goalside_defenders'], 1)
+        self.assertEqual(cfg._values['goalside_blockers'], 1)
         (offset,) = _blocker_world_offsets(cfg, 1)
         self.assertAlmostEqual(abs(offset), 0.085, delta=0.02)
         offsets.append(offset)
-        sides[cfg._values['curriculum_episode_template']].add(offset > 0)
+        sides[cfg.ScenarioConfig().ball_position[0] > 0].add(offset > 0)
     self.assertAlmostEqual(
         sum(offset > 0 for offset in offsets) / len(offsets), 0.5, delta=0.1)
-    for template, seen in sides.items():
-      self.assertEqual(seen, {True, False}, template)
+    for attack_right, seen in sides.items():
+      self.assertEqual(seen, {True, False}, attack_right)
 
   def test_second_blocker_mirrors_the_first_and_the_third_fills_the_middle(self):
     """Two blockers must leave the shot line open; only the third closes it."""
-    cfg = _advantage_config(0.75)  # exactly two blockers, no fade
-    for _ in range(2 * SPAWN_TEMPLATE_COUNT):
+    cfg = _scene_config(values=dict(START, ball_distance=0.55, blockers=2.0))
+    for _ in range(16):
       cfg.NewScenario()
-      self.assertEqual(cfg._values['curriculum_goalside_defenders'], 2)
+      self.assertEqual(cfg._values['goalside_blockers'], 2)
       # Mirroring may swap which of the pair takes which lane.
       low, high = sorted(_blocker_world_offsets(cfg, 2))
       self.assertAlmostEqual(low, -0.085, delta=0.02)
       self.assertAlmostEqual(high, 0.085, delta=0.02)
-    cfg = _advantage_config(0.5)  # exactly three
+    cfg = _scene_config(values=dict(START, ball_distance=0.55, blockers=3.0))
     cfg.NewScenario()
-    self.assertEqual(cfg._values['curriculum_goalside_defenders'], 3)
+    self.assertEqual(cfg._values['goalside_blockers'], 3)
     self.assertAlmostEqual(_blocker_world_offsets(cfg, 3)[2], 0.0, delta=0.02)
-
-  def test_blocker_fade_is_deterministic_per_episode_and_hits_its_rate(self):
-    # NewScenario(inc) ADVANCES the episode counter by inc, so a fresh config
-    # per pass is what makes the two passes see the same episode numbers.
-    def counts_for(passes):
-      cfg = _advantage_config(advantage_for_level(3), evaluation=False)
-      counts = []
-      for _ in range(passes):
-        cfg.NewScenario()
-        counts.append(cfg._values['curriculum_goalside_defenders'])
-      return counts
-
-    counts = counts_for(200)
-    self.assertEqual(counts, counts_for(200))
-    self.assertEqual(set(counts), {1, 2})
-    self.assertAlmostEqual(sum(counts) / len(counts), 1.6, delta=0.1)
 
   def test_potential_shaping_telescopes_to_minus_the_start_potential(self):
     """Ng et al. (1999): F = gamma*Phi(s') - Phi(s), Phi(absorbing) = 0.
@@ -1206,8 +644,8 @@ class PufferEnvTest(absltest.TestCase):
       self.assertEqual(puffer_env.ball_potential(advance, 2.0) +
                        puffer_env.ball_potential(-advance, 2.0), 0.0)
     env = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
-        curriculum_levels=ADVANTAGE_LEVELS, ball_potential_scale=1.0,
+        frame_stack=1, seed=7,
+        ball_potential_scale=1.0,
         potential_gamma=0.997)
     try:
       env.reset()
@@ -1313,8 +751,7 @@ class PufferEnvTest(absltest.TestCase):
     for ball_scale, player_scale, stack, fade in ((1.0, 0.3, 1, 0.0),
                                                   (0.0, 1.0, 4, 0.0),
                                                   (0.585, 1.0, 1, 0.5)):
-      common = dict(env_name=ADVANTAGE_ENV_NAME, frame_stack=stack,
-                    seed=7, curriculum_levels=ADVANTAGE_LEVELS)
+      common = dict(frame_stack=stack, seed=7)
       env = puffer_env.FootballPufferEnv(
           **common, ball_potential_scale=ball_scale,
           player_potential_scale=player_scale, potential_gamma=gamma,
@@ -1338,7 +775,7 @@ class PufferEnvTest(absltest.TestCase):
             sides = difference[:, 0] if attacking_left else difference[::-1, 0]
             discounted += gamma ** step * sides
             if infos:
-              for key in ('curriculum_success', 'left_episode_return',
+              for key in ('success', 'left_episode_return',
                           'right_episode_return', 'score_reward'):
                 self.assertEqual(infos[0][key], plain_infos[0][key])
               break
@@ -1355,22 +792,14 @@ class PufferEnvTest(absltest.TestCase):
       for value in (-1, float('inf'), float('nan')):
         with self.assertRaisesRegex(ValueError, 'finite and non-negative'):
           puffer_env.FootballPufferEnv(**{name: value})
-    for value in (-0.1, 1.5, float('nan')):
-      with self.assertRaisesRegex(ValueError, 'width_spawn_fraction'):
-        puffer_env.FootballPufferEnv(env_name=ADVANTAGE_ENV_NAME,
-                                     width_spawn_fraction=value)
-    with self.assertRaisesRegex(ValueError, 'width_spawn_fraction'):
-      puffer_env.FootballPufferEnv(width_spawn_fraction=0.5)  # not advantage
 
   def test_ball_shaping_rewards_both_sides_and_leaves_success_alone(self):
     scale, gamma = 1.0, 0.99
     env = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
-        curriculum_levels=ADVANTAGE_LEVELS, ball_potential_scale=scale,
+        frame_stack=1, seed=7,
+        ball_potential_scale=scale,
         potential_gamma=gamma)
-    plain = puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
-        curriculum_levels=ADVANTAGE_LEVELS)
+    plain = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
     try:
       env.reset()
       plain.reset()
@@ -1410,9 +839,9 @@ class PufferEnvTest(absltest.TestCase):
       self.assertTrue(infos)
       info = infos[0]
       # Success and the score returns are untouched by shaping.
-      self.assertIn(info['curriculum_success'], (0.0, 1.0))
+      self.assertIn(info['success'], (0.0, 1.0))
       self.assertEqual(
-          info['curriculum_success'],
+          info['success'],
           float(info['left_episode_return' if env._attacking_left
                      else 'right_episode_return'] > 0))
       self.assertAlmostEqual(
@@ -1427,9 +856,10 @@ class PufferEnvTest(absltest.TestCase):
   def test_frozen_defence_reads_the_observation_it_was_trained_on(self):
     """A simple115 snapshot defends an entity-observation match.
 
-    The fixed gate opponent was trained on simple115, and every model must
-    face the same opponent, so its rows are simple115 whatever the learner
-    reads: exactly the rows a simple115 match would give it.
+    The fixed defender runs are scored against was trained on simple115,
+    and every model must face the same opponent, so its rows are simple115
+    whatever the learner reads: exactly the rows a simple115 match would
+    give it.
     """
     torch.manual_seed(0)
     spaces = SimpleNamespace(
@@ -1439,8 +869,8 @@ class PufferEnvTest(absltest.TestCase):
     snapshot = self.create_tempfile('simple_defence.pt').full_path
     save_policy_snapshot(FootballPolicy(spaces, hidden_size=16), snapshot)
     matches = [puffer_env.FootballPufferEnv(
-        env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=11,
-        curriculum_levels=ADVANTAGE_LEVELS, frozen_defence_path=snapshot,
+        frame_stack=1, seed=11,
+        frozen_defence_path=snapshot,
         observation=observation) for observation in ('entities', 'simple115')]
     try:
       (entity_rows, _), (simple_rows, _) = [m.reset() for m in matches]
@@ -1481,8 +911,8 @@ class PufferEnvTest(absltest.TestCase):
 
     def make():
       env = puffer_env.FootballPufferEnv(
-          env_name=ADVANTAGE_ENV_NAME, frame_stack=1, seed=7,
-          curriculum_levels=ADVANTAGE_LEVELS, frozen_defence_path=snapshot,
+          frame_stack=1, seed=7,
+          frozen_defence_path=snapshot,
           frozen_defence_horizon=4)
       env._env = RecordingEnv(env._env)
       return env
@@ -1528,8 +958,7 @@ class PufferEnvTest(absltest.TestCase):
         if infos:
           break
       self.assertTrue(infos)
-      self.assertEqual(infos[0]['curriculum_frozen_defence'], 1.0)
-      self.assertIn(infos[0]['curriculum_attacking_left'], (0.0, 1.0))
+      self.assertIn(infos[0]['attacking_left'], (0.0, 1.0))
       # A new episode starts the frozen memory from zero again.
       self.assertIsNone(env._frozen_state['lstm_h'])
     finally:

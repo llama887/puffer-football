@@ -14,8 +14,8 @@ def _fresh(**kwargs):
   return adr.AutomaticDomainRandomization(**kwargs)
 
 
-def test_ranges_start_as_points_at_level_zero():
-  """Every range starts as the single level-0 value, inside its limits."""
+def test_ranges_start_as_points_at_the_start_scene():
+  """Every range starts as the single start value, inside its limits."""
   randomizer = _fresh()
   ranges = randomizer.ranges()
   assert ranges.shape == (len(adr.PARAMETERS), 2)
@@ -129,6 +129,31 @@ def test_entropy_rises_as_ranges_widen():
   assert np.isfinite(before)
   randomizer.record(adr.PARAMETER_INDEX['ball_lateral'], adr.UPPER, 1)
   assert randomizer.entropy() > before
+
+
+def test_difficulty_spans_a_fixed_share_of_the_way_to_the_limits():
+  """A test difficulty d fixes every range from its start value out to d of
+  the way to each valid limit: 0 is the start scene, 1 every limit.  The
+  same d always gives the same ranges, so scores compare across runs."""
+  randomizer = _fresh()
+  randomizer.set_difficulty(0.0)
+  for (low, high), parameter in zip(randomizer.ranges(), adr.PARAMETERS):
+    assert low == high == parameter.start
+  randomizer.set_difficulty(1.0)
+  for (low, high), parameter in zip(randomizer.ranges(), adr.PARAMETERS):
+    assert (low, high) == (parameter.minimum, parameter.maximum)
+  randomizer.set_difficulty(0.25)
+  for (low, high), parameter in zip(randomizer.ranges(), adr.PARAMETERS):
+    np.testing.assert_allclose(
+        [low, high],
+        [parameter.start - 0.25 * (parameter.start - parameter.minimum),
+         parameter.start + 0.25 * (parameter.maximum - parameter.start)])
+  for bad in (-0.1, 1.5):
+    try:
+      randomizer.set_difficulty(bad)
+    except ValueError:
+      continue
+    raise AssertionError('difficulty {} accepted'.format(bad))
 
 
 def _middle_half(name):

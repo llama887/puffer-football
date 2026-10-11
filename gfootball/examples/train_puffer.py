@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Recurrent PPO self-play training for the football curriculum.
+"""Recurrent PPO self-play training on ADR scenes (gfootball/adr.py).
 
 One shared trunk feeds an LSTM; the actor and critic read the same recurrent
 state and train under a single optimizer.  The vector env always exposes 22
-agent rows, but the curriculum only controls a few of them at the early
-levels, so every loss is masked down to the rows that are actually playing.
+agent rows, but some are hidden (a frozen probe defence, the first step of a
+scene with held directions), so every loss is masked down to the rows the
+learner actually played.
 """
 
 import argparse
@@ -24,8 +25,6 @@ import pufferlib
 from pufferlib import pufferl
 import pufferlib.pytorch
 
-from multiprocessing import RawValue
-
 from gfootball import adr
 from gfootball.env.puffer_env import RANDOM_DEFENCE, make_vector_env
 from gfootball.env import football_action_set
@@ -33,9 +32,6 @@ from gfootball.env import football_action_set
 from gfootball.env.puffer_policy import (  # noqa: F401
     FootballPolicy, RunningNormalizer, episode_batch_sizes, episode_pieces,
     save_policy_snapshot)
-from gfootball.curriculum import (
-    ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, ATTACKER_ONLY_LEVELS,
-    SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS, curriculum_episode_duration)
 
 
 ACTION_NAMES = tuple(
@@ -127,71 +123,13 @@ def policy_diagnostics(logits):
   }
 
 
-def promotion_statistics(episodes):
-  """Summarize held-out success overall and for the weakest spawn."""
-  by_template = defaultdict(list)
-  for episode in episodes:
-    by_template[int(episode['curriculum_template'])].append(
-        float(episode['curriculum_success']))
-  success_rate = sum(map(float, (
-      episode['curriculum_success'] for episode in episodes))) / len(episodes)
-  template_rates = {
-      template: sum(values) / len(values)
-      for template, values in by_template.items()
-  }
-  ranked = sorted(template_rates.values())
-  metrics = {
-      'promotion_success_rate': success_rate,
-      'promotion_worst_template_success_rate': ranked[0] if ranked else 0.0,
-      # One template is a 32-64 episode bin, so a single worst template
-      # flickers around the threshold from check to check.  Averaging the two
-      # weakest still refuses a policy with a hole in it while halving the
-      # noise the gate has to see through.
-      'promotion_worst_two_template_success_rate': (
-          sum(ranked[:2]) / len(ranked[:2]) if ranked else 0.0),
-      'promotion_templates_covered': float(len(template_rates)),
-  }
-  metrics.update({
-      'promotion_template_{}_success_rate'.format(template):
-      template_rates.get(template, 0.0)
-      for template in range(SPAWN_TEMPLATE_COUNT)
-  })
-  return metrics
-
-
-def promotion_min_episodes(args):
-  """Episodes an evaluation must run before early abort may end it.
-
-  Enough to cover every spawn template a few times over, so a hopeless
-  verdict is never called on a handful of unlucky draws.
-  """
-  if args.promotion_min_episodes > 0:
-    return args.promotion_min_episodes
-  return max(SPAWN_TEMPLATE_COUNT * 4, args.promotion_episodes // 4)
-
-
-def promotion_passes(metrics, success_threshold, worst_template_threshold):
-  """Overall success and the mean of the two weakest templates both pass."""
-  return (
-      metrics['promotion_templates_covered'] == SPAWN_TEMPLATE_COUNT and
-      metrics['promotion_success_rate'] >= success_threshold and
-      metrics['promotion_worst_two_template_success_rate'] >=
-      worst_template_threshold)
-
-
-def evaluate_promotion(policy, vecenv, episodes, seed, device,
-                       recurrent_horizon, greedy=False, early_abort=None):
+def evaluate_episodes(policy, vecenv, episodes, seed, device,
+                      recurrent_horizon):
   """Evaluate with the same recurrent windows as PufferLib training rollouts.
 
   Memory restarts every `recurrent_horizon` steps, as the training rollout
   restarts it at every segment; None keeps it for the whole episode, for a
   policy trained with carried memory.  Episode ends always clear it.
-  `greedy` takes the argmax action instead of sampling, which shows whether
-  the network has actually learned a shot underneath a near-uniform
-  distribution.  `early_abort` is an optional `(after_episodes, min_rate)`
-  pair: once that many episodes are in, a success rate below the floor ends
-  the evaluation early, since it cannot pass the gate and the remaining
-  episodes would only refine a number nobody acts on.
   """
   if recurrent_horizon is not None and recurrent_horizon < 1:
     raise ValueError('recurrent_horizon must be positive or None')
@@ -209,16 +147,10 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device,
   reservoir_rng = random.Random(seed)
   decisions = 0
   steps = 0
-  aborted = False
   was_training = policy.training
   policy.eval()
   try:
     while len(rows) < episodes:
-      if early_abort is not None and len(rows) >= early_abort[0]:
-        rate = sum(float(row['curriculum_success']) for row in rows) / len(rows)
-        if rate < early_abort[1]:
-          aborted = True
-          break
       # PuffeRL.evaluate starts every rollout window from zero memory. Keep
       # this clock independent of episode resets, just like the collector.
       if recurrent_horizon is not None and steps % recurrent_horizon == 0:
@@ -236,12 +168,9 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device,
           slot = reservoir_rng.randrange(steps + 1)
           if slot < reservoir_capacity:
             logits_reservoir[slot] = sampled_logits
-        if greedy:
-          actions = logits.argmax(dim=-1)
-        else:
-          actions = torch.multinomial(
-              torch.softmax(logits.float(), dim=-1), 1,
-              generator=generator).squeeze(-1)
+        actions = torch.multinomial(
+            torch.softmax(logits.float(), dim=-1), 1,
+            generator=generator).squeeze(-1)
       active_actions = actions[active].cpu()
       action_counts += torch.bincount(
           active_actions, minlength=len(ACTION_NAMES))
@@ -252,47 +181,39 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device,
       state['done'] = torch.as_tensor(
           np.asarray(terminals), device=device)
       for info in infos:
-        if 'curriculum_success' in info and len(rows) < episodes:
+        if 'success' in info and len(rows) < episodes:
           rows.append(info)
   finally:
     policy.train(was_training)
-  return _promotion_metrics(rows, action_counts, decisions,
-                            logits_reservoir, recurrent_horizon, greedy,
-                            aborted)
+  return _evaluation_metrics(rows, action_counts, decisions,
+                             logits_reservoir, recurrent_horizon)
 
 
-def _promotion_metrics(rows, action_counts, decisions, active_logits_rows,
-                       recurrent_horizon, greedy, aborted):
-  metrics = promotion_statistics(rows)
+def _evaluation_metrics(rows, action_counts, decisions, active_logits_rows,
+                        recurrent_horizon):
   diagnostics = policy_diagnostics(torch.cat(active_logits_rows))
   action_counts = action_counts.cpu()
   decisions = max(1, int(decisions))
-  metrics.update({
+  return {
+      'success_rate': sum(float(row['success']) for row in rows) / len(rows),
       # 0: memory ran through whole episodes.
-      'promotion_recurrent_horizon': float(recurrent_horizon or 0),
-      'promotion_greedy': float(greedy),
-      'promotion_aborted': float(aborted),
-      'promotion_episodes': float(len(rows)),
-      'promotion_mean_episode_length': sum(
+      'recurrent_horizon': float(recurrent_horizon or 0),
+      'episodes': float(len(rows)),
+      'mean_episode_length': sum(
           row['episode_length'] for row in rows) / len(rows),
-      'promotion_possession_fraction': sum(
+      'possession_fraction': sum(
           row.get('possession_fraction', 0.0) for row in rows) / len(rows),
-      'promotion_mean_ball_advance': sum(
+      'mean_ball_advance': sum(
           row.get('mean_ball_advance', 0.0) for row in rows) / len(rows),
-      'promotion_max_action_fraction': (
-          action_counts.max().item() / decisions),
-      'promotion_shot_fraction': action_counts[SHOT_ACTION].item() / decisions,
+      'max_action_fraction': action_counts.max().item() / decisions,
+      'shot_fraction': action_counts[SHOT_ACTION].item() / decisions,
+      **{name: value.item() for name, value in diagnostics.items()},
       **{
-          'promotion_{}'.format(name): value.item()
-          for name, value in diagnostics.items()
-      },
-      **{
-          'promotion_action_{}_fraction'.format(name):
+          'action_{}_fraction'.format(name):
           action_counts[index].item() / decisions
           for index, name in enumerate(ACTION_NAMES)
       },
-  })
-  return metrics
+  }
 
 
 def _match_gumbel_noise(seed, match_ids, match_steps, rows, actions):
@@ -310,32 +231,29 @@ def _match_gumbel_noise(seed, match_ids, match_steps, rows, actions):
   return noise.reshape(len(match_ids) * rows, actions)
 
 
-def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
-                             recurrent_horizon, greedy=False,
-                             early_abort=None):
-  """evaluate_promotion for a pool whose matches run at their own pace.
+def evaluate_episodes_async(policy, vecenv, episodes, seed, device,
+                            recurrent_horizon):
+  """evaluate_episodes for a pool whose matches run at their own pace.
 
   Every match contributes its first ceil(episodes / matches) episodes and
   nothing else.  Taking the first `episodes` to finish overall would favour
-  short episodes, and at the scoring levels a short episode is a goal.
+  short episodes, and a short episode is usually a goal.
 
   The result does not depend on timing: each match's engine, frozen
-  defence and sampling noise are seeded per match, recurrent memory
-  restarts every `recurrent_horizon` of a match's own steps (never, if
-  None) and at episode ends, and everything reported (episodes, action
-  statistics, the early abort) is taken from a fixed number of each match's
-  first episodes.
+  defence, scene draws and sampling noise are seeded per match, recurrent
+  memory restarts every `recurrent_horizon` of a match's own steps (never,
+  if None) and at episode ends, and everything reported (episodes and
+  action statistics) is taken from a fixed number of each match's first
+  episodes.
   """
   if recurrent_horizon is not None and recurrent_horizon < 1:
     raise ValueError('recurrent_horizon must be positive or None')
   if getattr(vecenv, 'envs_per_worker', 1) != 1:
-    raise ValueError('async promotion needs one match per worker, so that '
+    raise ValueError('async evaluation needs one match per worker, so that '
                      'match i is reset with seed + i')
   per_env = vecenv.driver_env.num_agents
   matches = vecenv.num_agents // per_env
   quota = -(-episodes // matches)
-  abort_quota = (None if early_abort is None else
-                 min(quota, -(-early_abort[0] // matches)))
   vecenv.async_reset(seed)
   hidden = policy.hidden_size
   agent_h = torch.zeros(vecenv.num_agents, hidden, device=device)
@@ -348,27 +266,15 @@ def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
   episode_logits = [[] for _ in range(matches)]
   current_actions = np.zeros((matches, len(ACTION_NAMES)), dtype=np.int64)
   current_logits = [[] for _ in range(matches)]
-  limit = quota
-  aborted = False
   was_training = policy.training
   policy.eval()
   try:
     while any(len(rows) < quota for rows in taken):
-      if abort_quota is not None and all(
-          len(rows) >= abort_quota for rows in taken):
-        first = [row for rows in taken for row in rows[:abort_quota]]
-        rate = sum(float(row['curriculum_success'])
-                   for row in first) / len(first)
-        if rate < early_abort[1]:
-          aborted = True
-          limit = abort_quota
-          break
-        abort_quota = None
       observations, _, terminals, _, infos, agent_ids, _ = vecenv.recv()
       agent_ids = np.asarray(agent_ids)
       match_ids = agent_ids[::per_env] // per_env
       for info in infos:
-        if 'curriculum_success' not in info:
+        if 'success' not in info:
           continue
         # reset(seed) gives match i the seed `seed + i`.
         match = int(info['env_seed']) - int(seed)
@@ -396,13 +302,10 @@ def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
         logits, _ = policy.forward_eval(observation_tensor, state)
         agent_h[index] = state['lstm_h']
         agent_c[index] = state['lstm_c']
-        if greedy:
-          actions = logits.argmax(dim=-1)
-        else:
-          noise = torch.as_tensor(_match_gumbel_noise(
-              seed, match_ids, match_steps[match_ids], per_env,
-              logits.shape[-1]), device=device)
-          actions = (logits.float() + noise).argmax(dim=-1)
+        noise = torch.as_tensor(_match_gumbel_noise(
+            seed, match_ids, match_steps[match_ids], per_env,
+            logits.shape[-1]), device=device)
+        actions = (logits.float() + noise).argmax(dim=-1)
       match_steps[match_ids] += 1
       active_rows = active.view(len(match_ids), per_env).cpu().numpy()
       match_actions = actions.view(len(match_ids), per_env).cpu().numpy()
@@ -417,18 +320,17 @@ def evaluate_promotion_async(policy, vecenv, episodes, seed, device,
       vecenv.send(actions.cpu().numpy())
   finally:
     policy.train(was_training)
-  rows = [row for match in range(matches) for row in taken[match][:limit]]
+  rows = [row for match in range(matches) for row in taken[match][:quota]]
   action_counts = torch.as_tensor(sum(
       (counts for match in range(matches)
-       for counts in episode_actions[match][:limit]),
+       for counts in episode_actions[match][:quota]),
       np.zeros(len(ACTION_NAMES), dtype=np.int64)))
   active_logits_rows = [
       step for match in range(matches)
-      for episode in episode_logits[match][:limit] for step in episode]
+      for episode in episode_logits[match][:quota] for step in episode]
   decisions = max(1, int(action_counts.sum()))
-  return _promotion_metrics(rows, action_counts, decisions,
-                            active_logits_rows, recurrent_horizon, greedy,
-                            aborted)
+  return _evaluation_metrics(rows, action_counts, decisions,
+                             active_logits_rows, recurrent_horizon)
 
 
 class GraphedActor:
@@ -490,9 +392,9 @@ class GraphedActor:
 
 
 class FootballPuffeRL(pufferl.PuffeRL):
-  """PPO restricted to the agent rows the curriculum actually controls."""
+  """PPO restricted to the agent rows the learner actually played."""
 
-  # The ADR randomizer that records probe results (set by main with --adr).
+  # The ADR randomizer that records probe results (set by main).
   # A class default, so trainers built without __init__ (tests) have it too.
   adr = None
 
@@ -547,7 +449,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
                                     device=config['device'])
     self.last_active_steps = 0
     self.last_active_log_time = time.time()
-    self.promotion_metrics = {}
+    self.evaluation_metrics = {}
     # Diagnostics are only computed on epochs that are logged, so this also
     # sets how often the trainer pays for them.
     self.log_interval_seconds = float(log_interval_seconds)
@@ -979,15 +881,6 @@ class FootballPuffeRL(pufferl.PuffeRL):
       return self._evaluate_async()
     return super().evaluate()
 
-  def record_promotion(self, level, metrics, advanced):
-    """Keep the latest gate result, also keyed by its level, for the next log."""
-    self.promotion_metrics = {
-        'promotion_level': float(level),
-        'promotion_advanced': float(advanced),
-        **metrics,
-        **level_entry_metrics(level, metrics),
-    }
-
   def train(self):
     profile = self.profile
     epoch = self.epoch
@@ -1020,7 +913,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
     num_minibatches = config['update_epochs']
 
     # Statistics come only from training rollouts, never from the held-out
-    # promotion evaluation, so evaluation stays a clean measurement.
+    # evaluation, so evaluation stays a clean measurement.
     self.uncompiled_policy.normalizer.update(self.observations[trainable])
     if log_epoch:
       losses['observation_scale_mean'] = float(
@@ -1107,7 +1000,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
         losses['action_{}_fraction'.format(name)] = action_fractions[index]
       losses['max_action_fraction'] = max(action_fractions)
       losses['shot_fraction'] = action_fractions[SHOT_ACTION]
-      losses.update(self.promotion_metrics)
+      losses.update(self.evaluation_metrics)
 
     profile.end()
     logs = None
@@ -1135,8 +1028,8 @@ def _base_config():
     sys.argv = original_argv
 
 
-def _async_batch_workers(args, num_workers, promotion=False):
-  flag = 'async_promotion' if promotion else 'async_collection'
+def _async_batch_workers(args, num_workers, evaluation=False):
+  flag = 'async_evaluation' if evaluation else 'async_collection'
   if not getattr(args, flag, False):
     return None
   if args.async_batch_workers is not None:
@@ -1154,9 +1047,11 @@ def memory_window(args):
   return None if args.carry_lstm_memory else args.bptt_horizon
 
 
-def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
-  """Worker pool for gate evaluations at the given curriculum level.
+def _make_evaluation_env(args, adr_shared, frozen_defence_path=None):
+  """Worker pool for evaluations, drawing scenes from fixed ADR ranges.
 
+  `adr_shared` holds the ranges (run_evaluation sets them to a test
+  difficulty before each evaluation); there are no probes and no shaping.
   The frozen opponent keeps its memory the way this run trains unless
   --frozen-defence-horizon says otherwise (an opponent file trained by
   another run, where 0 means whole episodes).
@@ -1167,26 +1062,15 @@ def _make_promotion_env(args, curriculum_level_value, frozen_defence_path=None):
   elif frozen_defence_horizon == 0:
     frozen_defence_horizon = None
   return make_vector_env(
-      num_envs=args.promotion_workers, num_workers=args.promotion_workers,
-      batch_size=args.promotion_workers, reserved_cpus=0,
+      num_envs=args.evaluation_workers, num_workers=args.evaluation_workers,
+      batch_size=args.evaluation_workers, reserved_cpus=0,
       async_batch_workers=_async_batch_workers(
-          args, args.promotion_workers, promotion=True),
-      seed=args.seed + 1000000, env_name=args.env_name,
-      frame_stack=args.frame_stack,
-      curriculum_levels=args.curriculum_levels,
-      curriculum_window=args.promotion_episodes + 1,  # never auto-advances
-      curriculum_success_threshold=args.curriculum_success_threshold,
-      attacker_only_levels=args.attacker_only_levels,
-      curriculum_level_value=curriculum_level_value,
-      sort_players=args.sort_players,
-      curriculum_evaluation=True,
-      observation=args.observation,
+          args, args.evaluation_workers, evaluation=True),
+      seed=args.seed + 1000000, frame_stack=args.frame_stack,
+      sort_players=args.sort_players, observation=args.observation,
       frozen_defence_path=frozen_defence_path,
       frozen_defence_horizon=frozen_defence_horizon,
-      # The gate scores on the same spawn distribution the policy trains on.
-      spawn=args.spawn,
-      # The mixed shape defines the level; loose-ball spawns are training only.
-      mixed_shape=args.mixed_shape)
+      adr_shared=adr_shared, adr_probe_fraction=0.0)
 
 
 def rearm_for_reset(vecenv):
@@ -1196,7 +1080,7 @@ def rearm_for_reset(vecenv):
   been read, but a worker that reported an episode end still has its
   semaphore at INFO.  PufferLib's async_reset flushes waiting workers by
   reading the pipe of every INFO worker a second time, which blocks forever;
-  that was the promotion deadlock.  Nothing is in flight, so there is
+  that was the evaluation deadlock.  Nothing is in flight, so there is
   nothing to flush.
   """
   # An asynchronous pool has workers in flight; PufferLib's own flush waits
@@ -1207,55 +1091,54 @@ def rearm_for_reset(vecenv):
     vecenv.ready_workers = []
 
 
-_PROMOTION_POOLS = {}
+# Persistent evaluation pools, one per defence: (pool, its ADR ranges).
+_EVALUATION_POOLS = {}
 
 
-def _promotion_pool(args, level_value, frozen_defence_path):
-  """One persistent worker pool per opponent type (frozen or self-play).
-
-  Building a pool starts 30 processes and a game engine in each, 10-20 s
-  apiece, and the gate used to build three per check.
-  """
-  key = frozen_defence_path
-  if key not in _PROMOTION_POOLS:
-    _PROMOTION_POOLS[key] = _make_promotion_env(
-        args, level_value, frozen_defence_path)
-  return _PROMOTION_POOLS[key]
-
-
-def close_promotion_pools():
-  while _PROMOTION_POOLS:
-    _, pool = _PROMOTION_POOLS.popitem()
+def close_evaluation_pools():
+  while _EVALUATION_POOLS:
+    _, (pool, _) = _EVALUATION_POOLS.popitem()
     pool.close()
 
 
-def _run_promotion(args, policy, level_value, level, device, episodes,
-                   frozen_defence_path=None, greedy=False, early_abort=None):
-  """One held-out evaluation.
+def run_evaluation(args, policy, difficulty, episodes,
+                   frozen_defence_path=None):
+  """One held-out evaluation on ADR scenes at a fixed test difficulty.
 
-  With --reuse-promotion-envs the worker pool persists across evaluations and
-  each reset(seed) reseeds the engines in place, which replays exactly the
-  episodes a freshly built pool would.  Otherwise a fresh pool is built and
-  torn down every time.
+  Every setting is drawn from its adr set_difficulty range, so the scenes
+  depend on the difficulty and the seed alone, never on the ranges training
+  has reached.  `frozen_defence_path` defends: None is the policy itself,
+  'random' uniform random actions, or a snapshot file.  With
+  --reuse-evaluation-envs one worker pool per defence persists across
+  evaluations and each reset(seed) reseeds it in place, which replays
+  exactly the episodes a freshly built pool would (building one starts a
+  game engine in every worker, 10-20 s apiece).
   """
-  reuse = getattr(args, 'reuse_promotion_envs', False)
+  reuse = getattr(args, 'reuse_evaluation_envs', False)
   if reuse:
-    promotion_env = _promotion_pool(args, level_value, frozen_defence_path)
-    rearm_for_reset(promotion_env)
+    if frozen_defence_path not in _EVALUATION_POOLS:
+      shared = adr.shared_ranges()
+      _EVALUATION_POOLS[frozen_defence_path] = (
+          _make_evaluation_env(args, shared, frozen_defence_path),
+          adr.AutomaticDomainRandomization(shared=shared))
+    pool, ranges = _EVALUATION_POOLS[frozen_defence_path]
+    rearm_for_reset(pool)
   else:
-    promotion_env = _make_promotion_env(args, level_value, frozen_defence_path)
-  evaluate = (evaluate_promotion_async
-              if getattr(promotion_env, 'is_async', False)
-              else evaluate_promotion)
+    shared = adr.shared_ranges()
+    ranges = adr.AutomaticDomainRandomization(shared=shared)
+    pool = _make_evaluation_env(args, shared, frozen_defence_path)
+  # The workers read these ranges at every episode reset.
+  ranges.set_difficulty(difficulty)
+  evaluate = (evaluate_episodes_async if getattr(pool, 'is_async', False)
+              else evaluate_episodes)
   try:
     return evaluate(
-        policy, promotion_env, episodes,
-        args.seed + 1000000 + 10000 * level, device,
-        recurrent_horizon=memory_window(args), greedy=greedy,
-        early_abort=early_abort)
+        policy, pool, episodes,
+        args.seed + 1000000 + int(round(1000 * difficulty)), args.device,
+        recurrent_horizon=memory_window(args))
   finally:
     if not reuse:
-      promotion_env.close()
+      pool.close()
 
 
 def record_adr_probes(randomizer, infos):
@@ -1269,7 +1152,7 @@ def record_adr_probes(randomizer, infos):
   for info in infos:
     if info.get('adr_probe'):
       randomizer.record(int(info['adr_parameter']), int(info['adr_edge']),
-                        info['curriculum_success'])
+                        info['success'])
       recorded += 1
   return recorded
 
@@ -1283,7 +1166,7 @@ def adr_metrics(randomizer):
   return metrics
 
 
-def refresh_adr_probe_defence(args, policy, level_value, probe_path):
+def refresh_adr_probe_defence(args, policy, probe_path):
   """Replace the ADR probe defence with the learner once it outgrows it.
 
   ADR probes judge each range edge by how often the attack scores against
@@ -1291,24 +1174,23 @@ def refresh_adr_probe_defence(args, policy, level_value, probe_path):
   (blockers, formation), and a fixed snapshot stops sensing them once the
   learner's own defence is stronger, so the ranges saturate.  This plays the
   learner's attack against the probe defence and against its own
-  (self-play) defence on the same scenes, the gate's evaluation scenes of
-  each --random-baseline-levels level; when the probe defence concedes at
-  least --adr-probe-refresh-margin more, the learner's current weights
-  overwrite `probe_path` (atomically: env workers reload it at their next
-  probe episode).
+  (self-play) defence on the same scenes, at each --evaluation-difficulties
+  difficulty; when the probe defence concedes at least
+  --adr-probe-refresh-margin more, the learner's current weights overwrite
+  `probe_path` (atomically: env workers reload it at their next probe
+  episode).
 
-  Returns metrics: both success rates, averaged over the levels, and
+  Returns metrics: both success rates, averaged over the difficulties, and
   whether the defence was replaced.
   """
-  levels = [int(x) for x in args.random_baseline_levels.split(',') if x]
   rates = {'vs_probe': [], 'vs_self': []}
-  for level in levels:
-    level_value.value = level
+  for difficulty in [float(x) for x in args.evaluation_difficulties.split(',')
+                     if x]:
     for name, defence in (('vs_probe', probe_path), ('vs_self', None)):
-      result = _run_promotion(args, policy, level_value, level, args.device,
-                              args.random_baseline_episodes,
+      result = run_evaluation(args, policy, difficulty,
+                              args.evaluation_episodes,
                               frozen_defence_path=defence)
-      rates[name].append(result['promotion_success_rate'])
+      rates[name].append(result['success_rate'])
   vs_probe, vs_self = float(np.mean(rates['vs_probe'])), float(
       np.mean(rates['vs_self']))
   replaced = vs_probe - vs_self >= args.adr_probe_refresh_margin
@@ -1318,47 +1200,22 @@ def refresh_adr_probe_defence(args, policy, level_value, probe_path):
           'adr_probe/replaced': float(replaced)}
 
 
-def random_baseline_metrics(args, policy, level_value):
-  """Score the policy against the base random policy at fixed levels.
+def random_baseline_metrics(args, policy):
+  """Score the policy against the base random policy at fixed difficulties.
 
-  Uniform random actions play the defending side on the gate's evaluation
-  scenes of each level in --random-baseline-levels.  The opponent and the
-  scenes never change, so the numbers compare across runs and over time.
+  Uniform random actions play the defending side on the evaluation scenes
+  of each --evaluation-difficulties difficulty.  The opponent and the scenes
+  never change, so the numbers compare across runs and over time.
   """
   metrics = {}
-  for level in [int(x) for x in args.random_baseline_levels.split(',') if x]:
-    level_value.value = level
-    result = _run_promotion(args, policy, level_value, level, args.device,
-                            args.random_baseline_episodes,
+  for difficulty in [float(x) for x in args.evaluation_difficulties.split(',')
+                     if x]:
+    result = run_evaluation(args, policy, difficulty,
+                            args.evaluation_episodes,
                             frozen_defence_path=RANDOM_DEFENCE)
-    metrics['vs_random/level_{}/success_rate'.format(level)] = (
-        result['promotion_success_rate'])
+    metrics['vs_random/difficulty_{}/success_rate'.format(difficulty)] = (
+        result['success_rate'])
   return metrics
-
-
-def _prefixed(prefix, metrics):
-  return {prefix + name: value for name, value in metrics.items()}
-
-
-def level_entry_metrics(level, metrics):
-  """Name a gate result by its level so each level gets its own progress line.
-
-  The gate opponent is the policy as it was on entering the level (the one
-  that cleared the level before; for level 0 the untrained policy, or the
-  --frozen-defence-init file), fixed for as long as the level trains.  The
-  score rate against it should therefore rise while a level is learning and
-  go flat when it stalls; keying by level keeps each level's line separate
-  in the logger.  The un-keyed rate is one continuous series across levels.
-  """
-  prefix = 'level_entry/level_{}/'.format(int(level))
-  return {
-      'level_entry/level': float(level),
-      'level_entry/success_rate': metrics['promotion_success_rate'],
-      prefix + 'success_rate': metrics['promotion_success_rate'],
-      prefix + 'worst_two_template_success_rate':
-          metrics['promotion_worst_two_template_success_rate'],
-      prefix + 'episodes': metrics['promotion_episodes'],
-  }
 
 
 def build_parser():
@@ -1370,67 +1227,19 @@ def build_parser():
                            'pins OMP_NUM_THREADS=1 for the env workers, '
                            'which otherwise pins this process too')
   parser.add_argument('--total-timesteps', type=int, default=1_000_000_000)
-  parser.add_argument('--env-name', default='11_vs_11_curriculum',
-                      choices=('11_vs_11_curriculum', ADVANTAGE_ENV_NAME))
-  parser.add_argument('--spawn', default='curriculum',
-                      choices=('curriculum', 'uniform'),
-                      help='curriculum: each level spawns its own scene; '
-                           'uniform: ignore levels and place the ball and '
-                           'players uniformly over the pitch, all onside '
-                           '(advantage env only)')
-  parser.add_argument('--curriculum-levels', type=int, default=None)
-  parser.add_argument('--start-level', type=int, default=0,
-                      help='begin at this curriculum level instead of 0')
-  parser.add_argument('--curriculum-window', type=int, default=20)
-  parser.add_argument('--curriculum-success-threshold', type=float, default=0.6)
-  parser.add_argument('--attacker-only-levels', type=int, default=None)
-  # Evaluation budget.  256 episodes every 25 epochs was ~40% of a ten-hour
-  # job; 512 + 128 + 128 every 100 epochs against a frozen defence (slower per
-  # episode, the defence is a network in every worker) came to ~50%.  This
-  # schedule is 256 + 64 + 64 every 100 epochs, and a hopeless gate stops at
-  # 64 episodes.
-  parser.add_argument('--promotion-interval', type=int, default=100)
-  parser.add_argument('--promotion-episodes', type=int, default=256)
-  parser.add_argument('--promotion-min-episodes', type=int, default=0,
-                      help='episodes before --promotion-early-abort-margin '
-                           'may end an evaluation; 0 derives it from '
-                           '--promotion-episodes and the template count')
-  parser.add_argument('--promotion-workers', type=int, default=30)
-  parser.add_argument('--promotion-worst-template-threshold', type=float,
-                      default=0.4)
-  parser.add_argument('--promotion-early-abort-margin', type=float,
-                      default=0.2,
-                      help='stop the gate evaluation after a quarter of its '
-                           'episodes when success is this far below the '
-                           'threshold; 0 disables')
-  parser.add_argument('--frozen-defence-gate',
-                      action=argparse.BooleanOptionalAction, default=True,
-                      help='gate promotion against a frozen snapshot of the '
-                           'policy taken on entering the level, instead of '
-                           'the live self-play opponent')
-  parser.add_argument('--frozen-defence-init', default=None,
-                      help='start the gate opponent from this policy file '
-                           'instead of the untrained policy, so every gate '
-                           'evaluation on the starting level is scored '
-                           'against the same fixed defence')
-  parser.add_argument('--greedy-promotion-episodes', type=int, default=64,
-                      help='extra argmax-action evaluation per promotion '
-                           'check (diagnostic only); 0 disables')
-  parser.add_argument('--selfplay-promotion-episodes', type=int, default=64,
-                      help='extra live self-play evaluation per promotion '
-                           'check when the gate is frozen-defence '
-                           '(diagnostic only, comparable to older runs); '
-                           '0 disables')
-  # Timed promotion was added when no run could clear level 0, so that the
-  # later levels were at least visited.  Once level 3 fell, two seeds rode the
-  # 200-epoch timer from level 4 to level 20 with success at zero.  Mastery
-  # is the goal, so every level is score-gated unless a job says otherwise.
-  parser.add_argument('--scored-promotion-levels', type=int, default=None,
-                      help='levels below this advance only on the score '
-                           'gate; default: every level')
-  parser.add_argument('--timed-promotion-epochs', type=int, default=200,
-                      help='at or above --scored-promotion-levels, also '
-                           'advance after this many epochs on a level')
+  # Evaluation every --evaluation-interval epochs: the ADR ranges, the
+  # random-defender score at each test difficulty and, with a snapshot probe
+  # defence, the refresh check.
+  parser.add_argument('--evaluation-interval', type=int, default=100)
+  parser.add_argument('--evaluation-workers', type=int, default=30)
+  parser.add_argument('--evaluation-difficulties', default='0.25,0.5,1.0',
+                      help='test difficulties (adr set_difficulty: every '
+                           'setting from its start value out to this share '
+                           'of the way to its limits) at which every check '
+                           'scores the policy against random defenders; '
+                           'empty disables')
+  parser.add_argument('--evaluation-episodes', type=int, default=64,
+                      help='episodes per difficulty and defence')
   parser.add_argument('--anneal-lr', action=argparse.BooleanOptionalAction,
                       default=False)
   parser.add_argument('--learning-rate', type=float, default=3e-4)
@@ -1462,31 +1271,6 @@ def build_parser():
                            'ball ~1), so kicking costs no potential while a '
                            'settled loose ball still pulls players to it; '
                            'still strictly potential-based; 0 disables')
-  parser.add_argument('--width-spawn-fraction', type=float, default=0.0,
-                      help='share of training episodes (never gate '
-                           'episodes) whose outfield players, except the '
-                           'goal-side blockers, keep their level x but spawn '
-                           'uniformly across the pitch width, so they must '
-                           'go and get the ball (advantage env only)')
-  parser.add_argument('--mixed-shape', action=argparse.BooleanOptionalAction,
-                      default=False,
-                      help='from level 1, put min(level, 3) attackers between '
-                           'the ball and the goal, onside and clear of the '
-                           'shooting lane; part of the level, so the gate '
-                           'plays it too (advantage env only)')
-  parser.add_argument('--loose-ball-fraction', type=float, default=0.0,
-                      help='share of training episodes (never gate episodes) '
-                           'that open as a race for a still ball: the '
-                           'nearest attacker a level-dependent fetch distance '
-                           'away, defenders farther on low levels, some '
-                           'players on the touchlines and half holding a '
-                           'direction (advantage env only)')
-  parser.add_argument('--adr', action=argparse.BooleanOptionalAction,
-                      default=False,
-                      help='automatic domain randomization (gfootball/adr.py) '
-                           'instead of the level curriculum: every episode '
-                           'samples its settings from ranges that grow and '
-                           'shrink with probe results; the level gate is off')
   parser.add_argument('--adr-probe-fraction', type=float, default=0.2,
                       help='share of episodes that probe one setting edge '
                            'against the probe defence')
@@ -1509,12 +1293,6 @@ def build_parser():
                       help='probe success at or below this shrinks the edge')
   parser.add_argument('--adr-high-threshold', type=float, default=0.6,
                       help='probe success at or above this grows the edge')
-  parser.add_argument('--random-baseline-levels', default='5,9,14',
-                      help='curriculum levels at which every check scores '
-                           'the policy against the base random policy '
-                           '(uniform random defenders); empty disables')
-  parser.add_argument('--random-baseline-episodes', type=int, default=64,
-                      help='episodes per level for the random baseline')
   parser.add_argument('--update-epochs', type=int, default=4,
                       help='optimizer steps per rollout; each step trains on '
                            'the whole rollout (the minibatch is the rollout)')
@@ -1527,9 +1305,10 @@ def build_parser():
                            'of restarting memory every --bptt-horizon steps; '
                            'needs --async-collection')
   parser.add_argument('--frozen-defence-horizon', type=int, default=None,
-                      help='steps the frozen gate opponent keeps memory '
-                           'before restarting it (0: whole episodes); by '
-                           'default the same as this run trains with')
+                      help='steps a frozen evaluation or probe opponent '
+                           'keeps memory before restarting it (0: whole '
+                           'episodes); by default the same as this run trains '
+                           'with')
   parser.add_argument('--hidden-size', type=int, default=256)
   parser.add_argument('--observation', default='simple115',
                       choices=('simple115', 'entities'),
@@ -1564,11 +1343,11 @@ def build_parser():
                       help='collect training segments from whichever '
                            'matches are ready, so engine resets never stall '
                            'other matches')
-  parser.add_argument('--async-promotion',
+  parser.add_argument('--async-evaluation',
                       action=argparse.BooleanOptionalAction, default=True,
-                      help='run promotion evaluation asynchronously too; it '
-                           'stays deterministic (per-match episode quotas '
-                           'and per-match sampling noise)')
+                      help='run evaluation asynchronously too; it stays '
+                           'deterministic (per-match episode quotas and '
+                           'per-match sampling noise)')
   parser.add_argument('--gpu-filler', action=argparse.BooleanOptionalAction,
                       default=True,
                       help='keep reported GPU utilization up with small '
@@ -1599,11 +1378,6 @@ def build_parser():
                       default=True,
                       help='replay the acting forward and sampling as one '
                            'CUDA graph during async collection')
-  parser.add_argument('--diagnostic-promotion-every', type=int, default=4,
-                      help='run the greedy and self-play diagnostic '
-                           'evaluations on every Nth promotion check, and on '
-                           'any check that passes the gate; they never decide '
-                           'promotion')
   parser.add_argument('--async-batch-workers', type=int, default=None,
                       help='workers per policy batch with --async-collection '
                            '(default: a third of the workers)')
@@ -1613,13 +1387,13 @@ def build_parser():
   parser.add_argument('--compile-mode', default='max-autotune-no-cudagraphs')
   parser.add_argument('--log-interval-seconds', type=float, default=0.25,
                       help='log and compute diagnostics at most this often')
-  parser.add_argument('--reuse-promotion-envs',
+  parser.add_argument('--reuse-evaluation-envs',
                       action=argparse.BooleanOptionalAction, default=True,
-                      help='keep the promotion worker pools alive between '
-                           'checks instead of rebuilding three per check')
+                      help='keep the evaluation worker pools alive between '
+                           'checks instead of rebuilding them every check')
   parser.add_argument('--benchmark-epochs', type=int, default=0,
                       help='time this many training epochs after a warmup, '
-                           'print BENCHMARK json and exit; skips promotion')
+                           'print BENCHMARK json and exit; skips evaluation')
   return parser
 
 
@@ -1687,7 +1461,7 @@ def build_config(args, num_agents):
 
 
 def benchmark(trainer, epochs, warmup=5):
-  """Steady-state rollout and update time per epoch, promotion excluded."""
+  """Steady-state rollout and update time per epoch, evaluation excluded."""
   def synchronize():
     # Only the trainer's stream: the GPU filler has its own.
     if trainer.config['device'] == 'cuda':
@@ -1729,16 +1503,6 @@ def benchmark(trainer, epochs, warmup=5):
 
 def main():
   args = build_parser().parse_args()
-  advantage_schedule = args.env_name == ADVANTAGE_ENV_NAME
-  if args.curriculum_levels is None:
-    args.curriculum_levels = (
-        ADVANTAGE_LEVELS if advantage_schedule else TOTAL_LEVELS)
-  if args.attacker_only_levels is None:
-    # The advantage schedule has every player active from level 0, so there
-    # is no attacker-only prefix to configure.
-    args.attacker_only_levels = 0 if advantage_schedule else ATTACKER_ONLY_LEVELS
-  if args.scored_promotion_levels is None:
-    args.scored_promotion_levels = args.curriculum_levels
   if args.device == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA training requested but no GPU is visible')
   os.makedirs(args.data_dir, exist_ok=True)
@@ -1747,51 +1511,33 @@ def main():
 
   # ADR ranges live in shared memory: env workers sample from them, the
   # trainer moves them from probe results.
-  adr_shared = None
+  adr_shared = adr.shared_ranges()
   adr_probe_defence = RANDOM_DEFENCE
-  if args.adr:
-    if args.env_name != ADVANTAGE_ENV_NAME:
-      raise ValueError('--adr needs --env-name ' + ADVANTAGE_ENV_NAME)
-    adr_shared = adr.shared_ranges()
-    if args.adr_probe_defence != RANDOM_DEFENCE:
-      # Refreshes are checked on the ADR log epochs only.
-      if args.adr_probe_refresh_interval % args.promotion_interval:
-        raise ValueError('--adr-probe-refresh-interval must be a multiple '
-                         'of --promotion-interval')
-      # A copy, so a refresh replaces it without touching the original.
-      adr_probe_defence = os.path.join(args.data_dir, 'adr_probe_defence.pt')
-      shutil.copyfile(args.adr_probe_defence, adr_probe_defence)
+  if args.adr_probe_defence != RANDOM_DEFENCE:
+    # Refreshes are checked on the evaluation epochs only.
+    if args.adr_probe_refresh_interval % args.evaluation_interval:
+      raise ValueError('--adr-probe-refresh-interval must be a multiple '
+                       'of --evaluation-interval')
+    # A copy, so a refresh replaces it without touching the original.
+    adr_probe_defence = os.path.join(args.data_dir, 'adr_probe_defence.pt')
+    shutil.copyfile(args.adr_probe_defence, adr_probe_defence)
   num_envs = args.num_workers * args.envs_per_worker
   env = make_vector_env(
       num_envs=num_envs, num_workers=args.num_workers, batch_size=num_envs,
       async_batch_workers=_async_batch_workers(args, args.num_workers),
-      reserved_cpus=0, seed=args.seed,
-      env_name=args.env_name, frame_stack=args.frame_stack,
-      curriculum_levels=args.curriculum_levels,
-      curriculum_window=args.curriculum_window,
-      curriculum_success_threshold=args.curriculum_success_threshold,
-      attacker_only_levels=args.attacker_only_levels,
-      sort_players=args.sort_players,
-      centralized_curriculum=True,
-      observation=args.observation,
-      # Shaping is a training signal only.  Promotion is judged on goals, so
-      # the evaluation envs are built without it.
+      reserved_cpus=0, seed=args.seed, frame_stack=args.frame_stack,
+      sort_players=args.sort_players, observation=args.observation,
+      # Shaping is a training signal only.  Evaluation is judged on goals,
+      # so the evaluation envs are built without it.
       ball_potential_scale=args.ball_potential,
       player_potential_scale=args.player_potential,
       player_potential_fade_speed=args.player_potential_fade_speed,
       potential_gamma=args.gamma,
-      spawn=args.spawn,
-      # A training distribution only: the gate keeps the level's own scenes.
-      width_spawn_fraction=args.width_spawn_fraction,
-      mixed_shape=args.mixed_shape,
-      loose_ball_fraction=args.loose_ball_fraction,
       adr_shared=adr_shared,
-      adr_probe_fraction=args.adr_probe_fraction if args.adr else 0.0,
+      adr_probe_fraction=args.adr_probe_fraction,
       adr_probe_defence=adr_probe_defence,
       # A snapshot probe defence replays the memory this run trains with.
       frozen_defence_horizon=memory_window(args))
-  if not 0 <= args.start_level < args.curriculum_levels:
-    raise ValueError('start-level must be inside the curriculum')
   # The launcher exports OMP_NUM_THREADS=1 so the env workers do not each
   # spawn a thread per core and thrash.  PyTorch reads that at import, which
   # also pins the update and the evaluation forward to a single core, and
@@ -1799,55 +1545,33 @@ def main():
   # (they pin themselves to one thread) so only this process widens.
   if args.torch_threads > 0:
     torch.set_num_threads(args.torch_threads)
-  env.curriculum_level_value.value = args.start_level
   config = build_config(args, env.num_agents)
   print(json.dumps({
       'config': config,
-      'curriculum_levels': args.curriculum_levels,
-      'curriculum_success_threshold': args.curriculum_success_threshold,
-      'curriculum_window': args.curriculum_window,
-      'attacker_only_levels': args.attacker_only_levels,
       'frame_stack': args.frame_stack,
       'hidden_size': args.hidden_size,
       'observation': args.observation,
       'network': args.network,
-      'env_name': args.env_name,
       'num_workers': args.num_workers,
       'envs_per_worker': args.envs_per_worker,
       'compile': args.compile,
       'sort_players': args.sort_players,
-      'start_level': args.start_level,
-      'promotion_interval': args.promotion_interval,
-      'promotion_episodes': args.promotion_episodes,
-      'promotion_min_episodes': promotion_min_episodes(args),
-      'promotion_workers': args.promotion_workers,
-      'promotion_worst_template_threshold': (
-          args.promotion_worst_template_threshold),
-      'promotion_early_abort_margin': args.promotion_early_abort_margin,
+      'evaluation_interval': args.evaluation_interval,
+      'evaluation_workers': args.evaluation_workers,
+      'evaluation_difficulties': args.evaluation_difficulties,
+      'evaluation_episodes': args.evaluation_episodes,
       'ball_potential': args.ball_potential,
       'player_potential': args.player_potential,
       'player_potential_fade_speed': args.player_potential_fade_speed,
-      'spawn': args.spawn,
-      'width_spawn_fraction': args.width_spawn_fraction,
-      'mixed_shape': args.mixed_shape,
-      'loose_ball_fraction': args.loose_ball_fraction,
-      'adr': args.adr,
       'adr_probe_fraction': args.adr_probe_fraction,
       'adr_buffer_size': args.adr_buffer_size,
       'adr_thresholds': [args.adr_low_threshold, args.adr_high_threshold],
       'adr_probe_defence': args.adr_probe_defence,
       'adr_probe_refresh_interval': args.adr_probe_refresh_interval,
       'adr_probe_refresh_margin': args.adr_probe_refresh_margin,
-      'random_baseline_levels': args.random_baseline_levels,
-      'frozen_defence_gate': args.frozen_defence_gate,
-      'greedy_promotion_episodes': args.greedy_promotion_episodes,
-      'selfplay_promotion_episodes': args.selfplay_promotion_episodes,
-      'envs_per_worker': args.envs_per_worker,
       'async_collection': args.async_collection,
       'overlap_collection': args.overlap_collection,
-      'diagnostic_promotion_every': args.diagnostic_promotion_every,
-      'compile': args.compile,
-      'reuse_promotion_envs': args.reuse_promotion_envs,
+      'reuse_evaluation_envs': args.reuse_evaluation_envs,
       'carry_lstm_memory': args.carry_lstm_memory,
       'frozen_defence_horizon': args.frozen_defence_horizon,
   }, sort_keys=True), flush=True)
@@ -1868,17 +1592,14 @@ def main():
       graph_actor=args.graph_actor,
       graph_update=args.graph_update,
       carry_memory=args.carry_lstm_memory)
-  if args.adr:
-    # Probe results arrive in episode infos, which only the asynchronous
-    # collector (the default) hands to the trainer as episodes finish.
-    if not trainer.async_collection:
-      raise ValueError('--adr needs --async-collection')
-    trainer.adr = adr.AutomaticDomainRandomization(
-        shared=adr_shared, buffer_size=args.adr_buffer_size,
-        low_threshold=args.adr_low_threshold,
-        high_threshold=args.adr_high_threshold)
-  # The random baseline's pool reads its level from here.
-  baseline_level = RawValue('i', 0)
+  # Probe results arrive in episode infos, which only the asynchronous
+  # collector (the default) hands to the trainer as episodes finish.
+  if not trainer.async_collection:
+    raise ValueError('ADR needs --async-collection')
+  trainer.adr = adr.AutomaticDomainRandomization(
+      shared=adr_shared, buffer_size=args.adr_buffer_size,
+      low_threshold=args.adr_low_threshold,
+      high_threshold=args.adr_high_threshold)
   filler = None
   if args.gpu_filler and args.device == 'cuda':
     from gfootball.examples.gpu_filler import GpuFiller
@@ -1896,107 +1617,33 @@ def main():
     # PufferLib's Multiprocessing close can hang at interpreter exit once the
     # workers are gone; a benchmark has nothing to save.
     os._exit(0)
-  level_entry_epoch = 0
-  promotion_checks = 0
-  # The gate opponent is the policy as it was on entering the level.  Against
-  # the live self-play opponent, "attackers score 60%" was a moving target:
-  # every improvement in attack was matched by the same network's defence.
-  frozen_defence_path = None
-  if args.frozen_defence_gate:
-    frozen_defence_path = os.path.join(args.data_dir, 'frozen_defence.pt')
-    if args.frozen_defence_init:
-      shutil.copyfile(args.frozen_defence_init, frozen_defence_path)
-    else:
-      save_policy_snapshot(policy, frozen_defence_path)
-  early_abort = None
-  if args.promotion_early_abort_margin > 0:
-    early_abort = (
-        promotion_min_episodes(args),
-        args.curriculum_success_threshold - args.promotion_early_abort_margin)
   try:
     while trainer.global_step < config['total_timesteps']:
-      if args.adr and trainer.epoch % args.promotion_interval == 0:
-        # No level gate under ADR: log the ranges and the random baseline.
+      if trainer.epoch % args.evaluation_interval == 0:
         started = time.time()
         metrics = adr_metrics(trainer.adr)
-        metrics.update(random_baseline_metrics(
-            args, trainer.uncompiled_policy, baseline_level))
+        metrics.update(random_baseline_metrics(args, trainer.uncompiled_policy))
         if (adr_probe_defence != RANDOM_DEFENCE and trainer.epoch > 0 and
             args.adr_probe_refresh_interval > 0 and
             trainer.epoch % args.adr_probe_refresh_interval == 0):
           metrics.update(refresh_adr_probe_defence(
-              args, trainer.uncompiled_policy, baseline_level,
-              adr_probe_defence))
+              args, trainer.uncompiled_policy, adr_probe_defence))
           if metrics['adr_probe/replaced']:
             # Keep every probe defence the run has used.
             shutil.copyfile(adr_probe_defence, os.path.join(
                 args.data_dir,
                 'adr_probe_defence_epoch{}.pt'.format(trainer.epoch)))
-        metrics['promotion_wall_seconds'] = time.time() - started
-        trainer.promotion_metrics = metrics
+        metrics['evaluation_wall_seconds'] = time.time() - started
+        trainer.evaluation_metrics = metrics
         print('ADR {}'.format(json.dumps(
             {'epoch': trainer.epoch, 'optimizer_steps': trainer.optimizer_steps,
              **metrics}, sort_keys=True)), flush=True)
-      elif trainer.epoch % args.promotion_interval == 0:
-        level = env.curriculum_level_value.value
-        started = time.time()
-        metrics = _run_promotion(
-            args, trainer.uncompiled_policy, env.curriculum_level_value,
-            level, args.device, args.promotion_episodes,
-            frozen_defence_path=frozen_defence_path, early_abort=early_abort)
-        scored_gate = promotion_passes(
-            metrics, args.curriculum_success_threshold,
-            args.promotion_worst_template_threshold)
-        diagnostics = (
-            scored_gate or args.diagnostic_promotion_every <= 1 or
-            promotion_checks % args.diagnostic_promotion_every == 0)
-        promotion_checks += 1
-        if diagnostics and args.greedy_promotion_episodes > 0:
-          metrics.update(_prefixed('greedy_', _run_promotion(
-              args, trainer.uncompiled_policy, env.curriculum_level_value,
-              level, args.device, args.greedy_promotion_episodes,
-              frozen_defence_path=frozen_defence_path, greedy=True)))
-        if (diagnostics and frozen_defence_path and
-            args.selfplay_promotion_episodes > 0):
-          metrics.update(_prefixed('selfplay_', _run_promotion(
-              args, trainer.uncompiled_policy, env.curriculum_level_value,
-              level, args.device, args.selfplay_promotion_episodes)))
-        if diagnostics:
-          metrics.update(random_baseline_metrics(
-              args, trainer.uncompiled_policy, baseline_level))
-        metrics['promotion_wall_seconds'] = time.time() - started
-        epochs_here = trainer.epoch - level_entry_epoch
-        # The later levels are too hard to gate on mastery, so they advance on
-        # a schedule instead; a level still promotes early if it is mastered.
-        timed_gate = (level >= args.scored_promotion_levels and
-                      epochs_here >= args.timed_promotion_epochs)
-        advanced = (level < args.curriculum_levels - 1 and
-                    (scored_gate or timed_gate))
-        if advanced:
-          env.curriculum_level_value.value = level + 1
-          level_entry_epoch = trainer.epoch
-          if frozen_defence_path:
-            # The next level's opponent is the policy that just cleared this
-            # one.  Keep a per-level copy so any level can be re-evaluated.
-            save_policy_snapshot(trainer.uncompiled_policy, os.path.join(
-                args.data_dir, 'frozen_defence_level{}.pt'.format(level + 1)))
-            save_policy_snapshot(
-                trainer.uncompiled_policy, frozen_defence_path)
-        trainer.record_promotion(level, metrics, advanced)
-        print('PROMOTION {}'.format(json.dumps({
-            'level': level, 'advanced': advanced,
-            'gate': 'frozen' if frozen_defence_path else 'selfplay',
-            'reason': ('scored' if scored_gate else
-                       'timed' if timed_gate else 'none'),
-            'epochs_on_level': epochs_here,
-            'optimizer_steps': trainer.optimizer_steps, **metrics,
-        }, sort_keys=True)), flush=True)
       trainer.evaluate()
       trainer.train()
   finally:
     if filler is not None:
       filler.stop()
-    close_promotion_pools()
+    close_evaluation_pools()
     model_path = trainer.close()
     if logger is not None:
       logger.close(model_path)

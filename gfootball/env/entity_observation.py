@@ -38,7 +38,7 @@ from gfootball.env import football_action_set
 TEAM = 11
 PLAYERS = 2 * TEAM
 GAME_MODES = 7
-# Steps left is divided by this so it is O(1) at the curriculum's lengths.
+# Steps left is divided by this so it is O(1) at the scenes' lengths (300-700).
 STEPS_LEFT_SCALE = 100.0
 # Pitch units per step: players move up to ~0.015, the ball ~0.1.
 _PLAYER_VELOCITY_SCALE = 0.02
