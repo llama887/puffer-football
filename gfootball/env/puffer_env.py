@@ -257,14 +257,13 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     # frozen defence plays every episode (evaluation pools), the probe
     # defence plays ADR probe episodes.  Either way the defending rows are
     # hidden from the caller, so they are never trained.
-    defences = {
-        name: defence.Defence(
-            spec, self.single_action_space.n, self._seed,
-            memory_window=frozen_defence_horizon, sort_players=sort_players)
-        for name, spec in (('frozen', frozen_defence_path),
-                           ('probe', adr_probe_defence)) if spec is not None}
-    self._frozen_defence = defences.get('frozen')
-    self._probe_defence = defences['probe']
+    def side(spec):
+      return defence.Defence(spec, self.single_action_space.n, self._seed,
+                             memory_window=frozen_defence_horizon,
+                             sort_players=sort_players)
+    self._frozen_defence = (None if frozen_defence_path is None
+                            else side(frozen_defence_path))
+    self._probe_defence = side(adr_probe_defence)
     # The defence of the current episode (None: the caller, self-play), and
     # its actions for the next step, computed with each observation.
     self._episode_defence = self._frozen_defence
@@ -462,7 +461,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       config = self._env.unwrapped._config
       config['game_engine_random_seed'] = self._seed
       config['episode_number'] = self._initial_episode_number
-      # ADR settings and the defences are drawn here, not by the engine.
+      # ADR settings and the defences are drawn here, not by the engine;
+      # only a reseeding reset restarts the defences' streams.
       self._episode_rng = np.random.default_rng([self._seed, 0xad5])
       for side in (self._frozen_defence, self._probe_defence):
         if side is not None:

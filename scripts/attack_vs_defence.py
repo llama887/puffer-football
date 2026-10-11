@@ -50,7 +50,10 @@ from gfootball.env.puffer_policy import load_frozen_policy
 from gfootball.examples.train_puffer import ACTION_NAMES
 
 # Training resets the recurrent state every rollout window (32 steps), so
-# the policies are replayed the same way.
+# the attack restarts its memory every 32 steps of each episode and the
+# defence (gfootball/env/defence.py) every 32 of its own steps and at every
+# episode start.  Scores from before the defence module (2026-10-11) used
+# other defence seeds and windows, so they do not reproduce exactly.
 HORIZON = 32
 
 

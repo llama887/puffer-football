@@ -12,7 +12,8 @@ import numpy as np
 import torch
 
 from gfootball.env import defence
-from gfootball.env.puffer_env import normalize_egocentric
+from gfootball.env.puffer_env import (
+    normalize_egocentric, sort_players_by_distance)
 from gfootball.env.puffer_policy import FootballPolicy, save_policy_snapshot
 
 ACTIONS = 19
@@ -87,7 +88,6 @@ def test_a_simple115_snapshot_reads_simple115_in_any_match():
     frames = _frames(seed=2)
     egocentric = frames.copy()
     normalize_egocentric(egocentric)
-    from gfootball.env.puffer_env import sort_players_by_distance
     sort_players_by_distance(egocentric)
     in_entity_match = defence.Defence(path, ACTIONS, seed=4)
     in_simple_match = defence.Defence(path, ACTIONS, seed=4)
@@ -128,6 +128,41 @@ def test_same_seed_same_rows_same_actions_and_reseed_replays():
     sides[0].start_episode()
     np.testing.assert_array_equal(
         [sides[0].act(r, _frames()) for r in rows], played[0])
+
+
+def test_memory_restarts_every_window_and_at_every_episode_start():
+  """Training restarts recurrent memory every rollout segment, regardless of
+  episode ends, and the defence replays a snapshot the same way: the clock
+  runs on across episodes, and a new episode also starts from zero."""
+  with tempfile.TemporaryDirectory() as directory:
+    path = os.path.join(directory, 'defence.pt')
+    _save(path)
+    side = defence.Defence(path, ACTIONS, seed=0, memory_window=3)
+    side.start_episode()
+    rows, frames = np.zeros((11, 115), np.float32), _frames()
+    fresh = []
+    policy = side._load()
+    forward = policy.forward_eval
+
+    def recording_forward(observations, state):
+      fresh.append(state['lstm_h'] is None)
+      return forward(observations, state)
+
+    policy.forward_eval = recording_forward
+    for _ in range(4):
+      side.act(rows, frames)
+    side.start_episode()  # an episode end on the clock's step 4
+    for _ in range(4):
+      side.act(rows, frames)
+    assert fresh == [True, False, False, True,
+                     True, False, True, False], fresh
+    carried = defence.Defence(path, ACTIONS, seed=0, memory_window=None)
+    carried.start_episode()
+    fresh.clear()
+    carried._load().forward_eval = recording_forward
+    for _ in range(5):
+      carried.act(rows, frames)
+    assert fresh == [True, False, False, False, False], fresh
 
 
 if __name__ == '__main__':

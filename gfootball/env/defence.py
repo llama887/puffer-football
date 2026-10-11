@@ -11,8 +11,8 @@ whenever the file on disk has been replaced (writers replace it atomically,
 see save_policy_snapshot, so new weights always come with a new inode or
 mtime): that is how the trainer refreshes the ADR probe defence.  It reads
 the observation it was trained on: the match's own rows when their width
-matches, otherwise simple115 (a fixed simple115 opponent in an
-entity-observation match).  Its recurrent memory restarts every
+matches, otherwise simple115 from the newest frame (a fixed simple115
+opponent in an entity-observation or frame-stacked match).  Its recurrent memory restarts every
 `memory_window` of its own steps, the way training restarts memory at every
 rollout segment regardless of episode ends (None keeps it for whole
 episodes), and at every episode start.  Sampling is seeded, so the same seed
@@ -20,6 +20,7 @@ and the same observations give the same actions.
 """
 
 import os
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -35,7 +36,7 @@ class Defence:
                sort_players=True):
     if memory_window is not None and memory_window < 1:
       raise ValueError('memory_window must be positive or None')
-    self.spec = spec
+    self._spec = spec
     self._action_count = int(action_count)
     self._memory_window = memory_window
     self._sort_players = bool(sort_players)
@@ -58,10 +59,10 @@ class Defence:
     Checked once per episode, not per step, to spare the file system.
     """
     self._state = {'lstm_h': None, 'lstm_c': None, 'done': None}
-    if self.spec in (RANDOM, IDLE):
+    if self._spec in (RANDOM, IDLE):
       return
-    stat = os.stat(self.spec)
-    source = (self.spec, stat.st_ino, stat.st_mtime_ns)
+    stat = os.stat(self._spec)
+    source = (self._spec, stat.st_ino, stat.st_mtime_ns)
     if source != self._source:
       self._policy = None
       self._source = source
@@ -72,9 +73,9 @@ class Defence:
     `rows` are their rows of the match's own observation (normalized, before
     hiding); `frames` their raw simple115v2 frames, newest frame last.
     """
-    if self.spec == IDLE:
+    if self._spec == IDLE:
       return np.zeros(11, dtype=np.int64)
-    if self.spec == RANDOM:
+    if self._spec == RANDOM:
       return self._rng.integers(0, self._action_count, size=11)
     import torch
     from gfootball.env.puffer_env import (
@@ -106,12 +107,14 @@ class Defence:
     return actions.numpy()
 
   def _load(self):
-    """The snapshot, single threaded on the CPU, loaded on first use."""
+    """The snapshot, single threaded on the CPU, loaded on first use.
+
+    The sampling stream continues across a reload; only reseed restarts it.
+    """
     if self._policy is None:
       import torch
-      from types import SimpleNamespace
       from gfootball.env.puffer_policy import load_frozen_policy
       torch.set_num_threads(1)
-      self._policy = load_frozen_policy(self.spec, SimpleNamespace(
+      self._policy = load_frozen_policy(self._spec, SimpleNamespace(
           single_action_space=SimpleNamespace(n=self._action_count)))
     return self._policy
