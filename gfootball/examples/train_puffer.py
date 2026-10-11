@@ -14,7 +14,6 @@ from collections import defaultdict
 import json
 import math
 import os
-import random
 import shutil
 import time
 
@@ -116,72 +115,6 @@ def policy_diagnostics(logits):
   }
 
 
-def evaluate_episodes(policy, vecenv, episodes, seed, device,
-                      recurrent_horizon):
-  """Evaluate with the same recurrent windows as PufferLib training rollouts.
-
-  Memory restarts every `recurrent_horizon` steps, as the training rollout
-  restarts it at every segment; None keeps it for the whole episode, for a
-  policy trained with carried memory.  Episode ends always clear it.
-  """
-  if recurrent_horizon is not None and recurrent_horizon < 1:
-    raise ValueError('recurrent_horizon must be positive or None')
-  observations, _ = vecenv.reset(seed=seed)
-  generator = torch.Generator(device=device).manual_seed(seed)
-  state = {'lstm_h': None, 'lstm_c': None, 'done': None}
-  rows = []
-  action_counts = torch.zeros(len(ACTION_NAMES), dtype=torch.long)
-  # An unbiased but bounded sample of the per-step logits.  Keeping every
-  # step held ~700MB on a full-length evaluation; policy_diagnostics only
-  # needs a representative draw, so reservoir-sample a fixed number of them.
-  logits_reservoir = []
-  reservoir_capacity = 64
-  # A private RNG: drawing from `generator` would shift action sampling.
-  reservoir_rng = random.Random(seed)
-  decisions = 0
-  steps = 0
-  was_training = policy.training
-  policy.eval()
-  try:
-    while len(rows) < episodes:
-      # PuffeRL.evaluate starts every rollout window from zero memory. Keep
-      # this clock independent of episode resets, just like the collector.
-      if recurrent_horizon is not None and steps % recurrent_horizon == 0:
-        state['lstm_h'] = state['lstm_c'] = None
-      observation_tensor = torch.as_tensor(observations, device=device)
-      active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
-      with torch.no_grad():
-        logits, _ = policy.forward_eval(observation_tensor, state)
-        # `steps` is this sample's 0-based index, giving textbook reservoir
-        # sampling: every step ends up equally likely to be retained.
-        sampled_logits = logits[active].float().cpu()
-        if len(logits_reservoir) < reservoir_capacity:
-          logits_reservoir.append(sampled_logits)
-        else:
-          slot = reservoir_rng.randrange(steps + 1)
-          if slot < reservoir_capacity:
-            logits_reservoir[slot] = sampled_logits
-        actions = torch.multinomial(
-            torch.softmax(logits.float(), dim=-1), 1,
-            generator=generator).squeeze(-1)
-      active_actions = actions[active].cpu()
-      action_counts += torch.bincount(
-          active_actions, minlength=len(ACTION_NAMES))
-      decisions += active_actions.numel()
-      observations, _, terminals, _, infos = vecenv.step(
-          actions.cpu().numpy())
-      steps += 1
-      state['done'] = torch.as_tensor(
-          np.asarray(terminals), device=device)
-      for info in infos:
-        if 'success' in info and len(rows) < episodes:
-          rows.append(info)
-  finally:
-    policy.train(was_training)
-  return _evaluation_metrics(rows, action_counts, decisions,
-                             logits_reservoir, recurrent_horizon)
-
-
 def _evaluation_metrics(rows, action_counts, decisions, active_logits_rows,
                         recurrent_horizon):
   diagnostics = policy_diagnostics(torch.cat(active_logits_rows))
@@ -224,20 +157,22 @@ def _match_gumbel_noise(seed, match_ids, match_steps, rows, actions):
   return noise.reshape(len(match_ids) * rows, actions)
 
 
-def evaluate_episodes_async(policy, vecenv, episodes, seed, device,
-                            recurrent_horizon):
-  """evaluate_episodes for a pool whose matches run at their own pace.
+def evaluate_episodes(policy, vecenv, episodes, seed, device,
+                      recurrent_horizon):
+  """Play `episodes` held-out episodes on a pool whose matches run at their
+  own pace, and summarize them (_evaluation_metrics).
 
   Every match contributes its first ceil(episodes / matches) episodes and
   nothing else.  Taking the first `episodes` to finish overall would favour
   short episodes, and a short episode is usually a goal.
 
-  The result does not depend on timing: each match's engine, frozen
-  defence, scene draws and sampling noise are seeded per match, recurrent
-  memory restarts every `recurrent_horizon` of a match's own steps (never,
-  if None) and at episode ends, and everything reported (episodes and
-  action statistics) is taken from a fixed number of each match's first
-  episodes.
+  The result does not depend on timing: each match's engine, defence, scene
+  draws and sampling noise are seeded per match (reset(seed) gives match i
+  the seed seed + i, which its episode infos report as env_seed), recurrent
+  memory restarts every `recurrent_horizon` of a match's own steps, as the
+  training rollout restarts it at every segment (never, if None: a policy
+  trained with carried memory), and at episode ends, and everything reported
+  is taken from a fixed number of each match's first episodes.
   """
   if recurrent_horizon is not None and recurrent_horizon < 1:
     raise ValueError('recurrent_horizon must be positive or None')
@@ -1021,9 +956,8 @@ def _base_config():
     sys.argv = original_argv
 
 
-def _async_batch_workers(args, num_workers, evaluation=False):
-  flag = 'async_evaluation' if evaluation else 'async_collection'
-  if not getattr(args, flag, False):
+def _async_batch_workers(args, num_workers):
+  if not args.async_collection:
     return None
   if args.async_batch_workers is not None:
     return args.async_batch_workers
@@ -1040,97 +974,74 @@ def memory_window(args):
   return None if args.carry_lstm_memory else args.bptt_horizon
 
 
-def _make_evaluation_env(args, adr_shared, frozen_defence_path=None):
-  """Worker pool for evaluations, drawing scenes from fixed ADR ranges.
+class Evaluator:
+  """Scores a policy on fixed ADR test scenes against a chosen defence.
 
-  `adr_shared` holds the ranges (run_evaluation sets them to a test
-  difficulty before each evaluation); there are no probes and no shaping.
-  The frozen opponent keeps its memory the way this run trains unless
-  --frozen-defence-horizon says otherwise (an opponent file trained by
-  another run, where 0 means whole episodes).
+  A test difficulty d draws every setting from its adr set_difficulty range,
+  so the scenes depend on d and the seed alone, never on the ranges training
+  has reached, and the scores compare across runs.  The defence is None (the
+  policy itself), 'random' (uniform random actions) or a snapshot path.
+
+  One worker pool per defence is built on first use and kept until close():
+  building one starts a game engine in every worker, 10-20 s apiece.  Each
+  pool draws its scenes from its own shared ADR ranges, set to the requested
+  difficulty before every evaluation, and every evaluation reseeds the pool
+  in place, which replays exactly the episodes a fresh pool would.  Pools
+  play without shaping and without probes.  A frozen defence keeps memory
+  the way this run trains unless --frozen-defence-horizon says otherwise (a
+  snapshot trained by another run; 0 means whole episodes).
   """
-  frozen_defence_horizon = args.frozen_defence_horizon
-  if frozen_defence_horizon is None:
-    frozen_defence_horizon = memory_window(args)
-  elif frozen_defence_horizon == 0:
-    frozen_defence_horizon = None
-  return make_vector_env(
-      num_envs=args.evaluation_workers, num_workers=args.evaluation_workers,
-      batch_size=args.evaluation_workers, reserved_cpus=0,
-      async_batch_workers=_async_batch_workers(
-          args, args.evaluation_workers, evaluation=True),
-      seed=args.seed + 1000000, frame_stack=args.frame_stack,
-      sort_players=args.sort_players, observation=args.observation,
-      frozen_defence_path=frozen_defence_path,
-      frozen_defence_horizon=frozen_defence_horizon,
-      adr_shared=adr_shared, adr_probe_fraction=0.0)
 
+  def __init__(self, args, make_pool=make_vector_env):
+    self.difficulties = [
+        float(x) for x in args.evaluation_difficulties.split(',') if x]
+    self._args = args
+    self._make_pool = make_pool
+    self._pools = {}
+    self._memory_window = memory_window(args)
+    self._defence_window = args.frozen_defence_horizon
+    if self._defence_window is None:
+      self._defence_window = self._memory_window
+    elif self._defence_window == 0:
+      self._defence_window = None
 
-def rearm_for_reset(vecenv):
-  """Let a synchronous Multiprocessing vecenv be reset() again.
-
-  After a completed step() every worker is idle and its infos have already
-  been read, but a worker that reported an episode end still has its
-  semaphore at INFO.  PufferLib's async_reset flushes waiting workers by
-  reading the pipe of every INFO worker a second time, which blocks forever;
-  that was the evaluation deadlock.  Nothing is in flight, so there is
-  nothing to flush.
-  """
-  # An asynchronous pool has workers in flight; PufferLib's own flush waits
-  # for them and reads each pending INFO exactly once.
-  if hasattr(vecenv, 'waiting_workers') and not getattr(
-      vecenv, 'is_async', False):
-    vecenv.waiting_workers = []
-    vecenv.ready_workers = []
-
-
-# Persistent evaluation pools, one per defence: (pool, its ADR ranges).
-_EVALUATION_POOLS = {}
-
-
-def close_evaluation_pools():
-  while _EVALUATION_POOLS:
-    _, (pool, _) = _EVALUATION_POOLS.popitem()
-    pool.close()
-
-
-def run_evaluation(args, policy, difficulty, episodes,
-                   frozen_defence_path=None):
-  """One held-out evaluation on ADR scenes at a fixed test difficulty.
-
-  Every setting is drawn from its adr set_difficulty range, so the scenes
-  depend on the difficulty and the seed alone, never on the ranges training
-  has reached.  `frozen_defence_path` defends: None is the policy itself,
-  'random' uniform random actions, or a snapshot file.  With
-  --reuse-evaluation-envs one worker pool per defence persists across
-  evaluations and each reset(seed) reseeds it in place, which replays
-  exactly the episodes a freshly built pool would (building one starts a
-  game engine in every worker, 10-20 s apiece).
-  """
-  reuse = getattr(args, 'reuse_evaluation_envs', False)
-  if reuse:
-    if frozen_defence_path not in _EVALUATION_POOLS:
+  def score(self, policy, difficulty, defence=None):
+    """_evaluation_metrics of --evaluation-episodes episodes at `difficulty`
+    against `defence`."""
+    args = self._args
+    if defence not in self._pools:
       shared = adr.shared_ranges()
-      _EVALUATION_POOLS[frozen_defence_path] = (
-          _make_evaluation_env(args, shared, frozen_defence_path),
+      workers = args.evaluation_workers
+      self._pools[defence] = (self._make_pool(
+          num_envs=workers, num_workers=workers, batch_size=workers,
+          reserved_cpus=0, async_batch_workers=max(1, workers // 3),
+          seed=args.seed + 1000000, frame_stack=args.frame_stack,
+          sort_players=args.sort_players, observation=args.observation,
+          frozen_defence_path=defence,
+          frozen_defence_horizon=self._defence_window,
+          adr_shared=shared, adr_probe_fraction=0.0),
           adr.AutomaticDomainRandomization(shared=shared))
-    pool, ranges = _EVALUATION_POOLS[frozen_defence_path]
-    rearm_for_reset(pool)
-  else:
-    shared = adr.shared_ranges()
-    ranges = adr.AutomaticDomainRandomization(shared=shared)
-    pool = _make_evaluation_env(args, shared, frozen_defence_path)
-  # The workers read these ranges at every episode reset.
-  ranges.set_difficulty(difficulty)
-  evaluate = (evaluate_episodes_async if getattr(pool, 'is_async', False)
-              else evaluate_episodes)
-  try:
-    return evaluate(
-        policy, pool, episodes,
+    pool, ranges = self._pools[defence]
+    # The workers read these ranges at every episode reset.
+    ranges.set_difficulty(difficulty)
+    return evaluate_episodes(
+        policy, pool, args.evaluation_episodes,
         args.seed + 1000000 + int(round(1000 * difficulty)), args.device,
-        recurrent_horizon=memory_window(args))
-  finally:
-    if not reuse:
+        recurrent_horizon=self._memory_window)
+
+  def baseline(self, policy):
+    """Goal rate against the base random policy at every test difficulty.
+
+    The opponent and the scenes never change, so the numbers compare across
+    runs and over time.
+    """
+    return {'vs_random/difficulty_{}/success_rate'.format(difficulty):
+            self.score(policy, difficulty, RANDOM_DEFENCE)['success_rate']
+            for difficulty in self.difficulties}
+
+  def close(self):
+    while self._pools:
+      _, (pool, _) = self._pools.popitem()
       pool.close()
 
 
@@ -1159,7 +1070,7 @@ def adr_metrics(randomizer):
   return metrics
 
 
-def refresh_adr_probe_defence(args, policy, probe_path):
+def refresh_adr_probe_defence(args, evaluator, policy, probe_path):
   """Replace the ADR probe defence with the learner once it outgrows it.
 
   ADR probes judge each range edge by how often the attack scores against
@@ -1167,8 +1078,8 @@ def refresh_adr_probe_defence(args, policy, probe_path):
   (blockers, formation), and a fixed snapshot stops sensing them once the
   learner's own defence is stronger, so the ranges saturate.  This plays the
   learner's attack against the probe defence and against its own
-  (self-play) defence on the same scenes, at each --evaluation-difficulties
-  difficulty; when the probe defence concedes at least
+  (self-play) defence on the same scenes, at each of the evaluator's test
+  difficulties; when the probe defence concedes at least
   --adr-probe-refresh-margin more, the learner's current weights overwrite
   `probe_path` (atomically: env workers reload it at their next probe
   episode).
@@ -1177,13 +1088,10 @@ def refresh_adr_probe_defence(args, policy, probe_path):
   whether the defence was replaced.
   """
   rates = {'vs_probe': [], 'vs_self': []}
-  for difficulty in [float(x) for x in args.evaluation_difficulties.split(',')
-                     if x]:
+  for difficulty in evaluator.difficulties:
     for name, defence in (('vs_probe', probe_path), ('vs_self', None)):
-      result = run_evaluation(args, policy, difficulty,
-                              args.evaluation_episodes,
-                              frozen_defence_path=defence)
-      rates[name].append(result['success_rate'])
+      rates[name].append(
+          evaluator.score(policy, difficulty, defence)['success_rate'])
   vs_probe, vs_self = float(np.mean(rates['vs_probe'])), float(
       np.mean(rates['vs_self']))
   replaced = vs_probe - vs_self >= args.adr_probe_refresh_margin
@@ -1191,24 +1099,6 @@ def refresh_adr_probe_defence(args, policy, probe_path):
     save_policy_snapshot(policy, probe_path)
   return {'adr_probe/vs_probe': vs_probe, 'adr_probe/vs_self': vs_self,
           'adr_probe/replaced': float(replaced)}
-
-
-def random_baseline_metrics(args, policy):
-  """Score the policy against the base random policy at fixed difficulties.
-
-  Uniform random actions play the defending side on the evaluation scenes
-  of each --evaluation-difficulties difficulty.  The opponent and the scenes
-  never change, so the numbers compare across runs and over time.
-  """
-  metrics = {}
-  for difficulty in [float(x) for x in args.evaluation_difficulties.split(',')
-                     if x]:
-    result = run_evaluation(args, policy, difficulty,
-                            args.evaluation_episodes,
-                            frozen_defence_path=RANDOM_DEFENCE)
-    metrics['vs_random/difficulty_{}/success_rate'.format(difficulty)] = (
-        result['success_rate'])
-  return metrics
 
 
 def build_parser():
@@ -1336,11 +1226,6 @@ def build_parser():
                       help='collect training segments from whichever '
                            'matches are ready, so engine resets never stall '
                            'other matches')
-  parser.add_argument('--async-evaluation',
-                      action=argparse.BooleanOptionalAction, default=True,
-                      help='run evaluation asynchronously too; it stays '
-                           'deterministic (per-match episode quotas and '
-                           'per-match sampling noise)')
   parser.add_argument('--gpu-filler', action=argparse.BooleanOptionalAction,
                       default=True,
                       help='keep reported GPU utilization up with small '
@@ -1371,10 +1256,6 @@ def build_parser():
   parser.add_argument('--compile-mode', default='max-autotune-no-cudagraphs')
   parser.add_argument('--log-interval-seconds', type=float, default=0.25,
                       help='log and compute diagnostics at most this often')
-  parser.add_argument('--reuse-evaluation-envs',
-                      action=argparse.BooleanOptionalAction, default=True,
-                      help='keep the evaluation worker pools alive between '
-                           'checks instead of rebuilding them every check')
   parser.add_argument('--benchmark-epochs', type=int, default=0,
                       help='time this many training epochs after a warmup, '
                            'print BENCHMARK json and exit; skips evaluation')
@@ -1555,7 +1436,6 @@ def main():
       'adr_probe_refresh_margin': args.adr_probe_refresh_margin,
       'async_collection': args.async_collection,
       'overlap_collection': args.overlap_collection,
-      'reuse_evaluation_envs': args.reuse_evaluation_envs,
       'carry_lstm_memory': args.carry_lstm_memory,
       'frozen_defence_horizon': args.frozen_defence_horizon,
   }, sort_keys=True), flush=True)
@@ -1584,6 +1464,7 @@ def main():
       shared=adr_shared, buffer_size=args.adr_buffer_size,
       low_threshold=args.adr_low_threshold,
       high_threshold=args.adr_high_threshold)
+  evaluator = Evaluator(args)
   filler = None
   if args.gpu_filler and args.device == 'cuda':
     from gfootball.examples.gpu_filler import GpuFiller
@@ -1605,12 +1486,12 @@ def main():
       if trainer.epoch % args.evaluation_interval == 0:
         started = time.time()
         metrics = adr_metrics(trainer.adr)
-        metrics.update(random_baseline_metrics(args, trainer.uncompiled_policy))
+        metrics.update(evaluator.baseline(trainer.uncompiled_policy))
         if (adr_probe_defence != RANDOM_DEFENCE and trainer.epoch > 0 and
             args.adr_probe_refresh_interval > 0 and
             trainer.epoch % args.adr_probe_refresh_interval == 0):
           metrics.update(refresh_adr_probe_defence(
-              args, trainer.uncompiled_policy, adr_probe_defence))
+              args, evaluator, trainer.uncompiled_policy, adr_probe_defence))
           if metrics['adr_probe/replaced']:
             # Keep every probe defence the run has used.
             shutil.copyfile(adr_probe_defence, os.path.join(
@@ -1626,7 +1507,7 @@ def main():
   finally:
     if filler is not None:
       filler.stop()
-    close_evaluation_pools()
+    evaluator.close()
     model_path = trainer.close()
     if logger is not None:
       logger.close(model_path)

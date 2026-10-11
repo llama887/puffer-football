@@ -149,10 +149,6 @@ if [[ ${COMPILE:-0} == 1 ]]; then
   COMPILE_ARGS=(--compile --compile-mode "${COMPILE_MODE:-reduce-overhead}")
 fi
 LOG_INTERVAL_SECONDS=${LOG_INTERVAL_SECONDS:-5}
-ASYNC_EVALUATION_ARGS=(--async-evaluation)
-if [[ ${ASYNC_EVALUATION:-1} == 0 ]]; then
-  ASYNC_EVALUATION_ARGS=(--no-async-evaluation)
-fi
 # Torch warns about GPU jobs below 75% utilization, which counts the time any
 # kernel is running.  The trainer keeps it up itself (GPU_FILLER=1) with
 # single-thread spin kernels on a side stream, which occupy one SM: 91% mean
@@ -238,7 +234,6 @@ cd "$RUN_ROOT"
   "${ASYNC_COLLECTION_ARGS[@]}" \
   "${OVERLAP_ARGS[@]}" \
   "${GRAPH_ARGS[@]}" \
-  "${ASYNC_EVALUATION_ARGS[@]}" \
   "${GPU_FILLER_ARGS[@]}" \
   "${COMPILE_ARGS[@]}" \
   --log-interval-seconds "$LOG_INTERVAL_SECONDS" \
