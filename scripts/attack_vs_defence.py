@@ -52,32 +52,25 @@ from gfootball.examples.train_puffer import ACTION_NAMES
 HORIZON = 32
 
 
-def adr_ranges(log_path):
-  """{setting: (low, high)}: valid limits, or a training log's last ranges."""
-  ranges = {p.name: (p.minimum, p.maximum) for p in adr.PARAMETERS}
-  if log_path:
-    with open(log_path) as log:
-      lines = [line for line in log if line.startswith('ADR {')]
-    last = json.loads(lines[-1][4:])
-    ranges = {name: (last['adr/{}/low'.format(name)],
-                     last['adr/{}/high'.format(name)]) for name in ranges}
-  return ranges
+def scene_ranges(scene, log_path):
+  """The ADR ranges a --scene draws its episodes from.
 
-
-def scene_values(scene, ranges, rng):
-  """ADR settings for one episode."""
+  A test difficulty's ranges, the start values (points), or for full and
+  pin scenes every setting's valid limits, or with --adr-log the ranges of
+  that training log's last `ADR {json}` line.
+  """
+  randomizer = adr.AutomaticDomainRandomization()
   kind = scene.split(':')
   if kind[1] == 'difficulty':
-    randomizer = adr.AutomaticDomainRandomization()
     randomizer.set_difficulty(float(kind[2]))
-    return randomizer.sample(rng)
-  if kind[1] == 'start':
-    return {p.name: float(p.start) for p in adr.PARAMETERS}
-  values = {name: float(rng.uniform(low, high)) if high > low else float(low)
-            for name, (low, high) in ranges.items()}
-  if kind[1] == 'pin':
-    values[kind[2]] = float(ranges[kind[2]][int(kind[3])])
-  return values
+  elif kind[1] != 'start':
+    if log_path:
+      with open(log_path) as log:
+        lines = [line for line in log if line.startswith('ADR {')]
+      randomizer.load_metrics(json.loads(lines[-1][4:]))
+    else:
+      randomizer.set_difficulty(1.0)
+  return randomizer
 
 
 def main():
@@ -91,7 +84,8 @@ def main():
   parser.add_argument('--video-dir', default=None)
   parser.add_argument('--output', required=True)
   args = parser.parse_args()
-  ranges = adr_ranges(args.adr_log)
+  ranges = scene_ranges(args.scene, args.adr_log)
+  pinned = args.scene.split(':')[2:] if ':pin:' in args.scene else None
   video = args.video_dir is not None
   options = {
       'action_set': 'default', 'game_engine_random_seed': args.seed,
@@ -122,16 +116,20 @@ def main():
   episodes = []
   try:
     for _ in range(args.episodes):
-      values = scene_values(args.scene, ranges, scene_rng)
+      values = ranges.sample(scene_rng)
+      if pinned:
+        # Exactly like an ADR probe: one setting at one edge of its range.
+        name, edge = pinned[0], int(pinned[1])
+        values[name] = float(
+            ranges.ranges()[adr.PARAMETER_INDEX[name]][edge])
       env.unwrapped._config['adr_values'] = values
       raw = env.reset()
       sticky.fill(0)
-      config = env.unwrapped._config
-      held = np.asarray(config._values.get('held_directions', [0] * 22),
-                        np.int64)
+      scene = adr.read_scene(env.unwrapped._config)
+      held = scene.held_directions
       attacking_side.start_episode()
       defending_side.start_episode()
-      attacking_left = config.ScenarioConfig().ball_position[0] > 0
+      attacking_left = scene.attacking_left
       attack = slice(0, 11) if attacking_left else slice(11, 22)
       defend = slice(11, 22) if attacking_left else slice(0, 11)
       flip = 1.0 if attacking_left else -1.0

@@ -372,18 +372,16 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._episode_defence.start_episode()
     observations = self._from_engine(self._env.reset())
     self._sticky.fill(0)
-    raw_config = self._env.unwrapped._config
-    ball_x = raw_config.ScenarioConfig().ball_position[0]
-    self._attacking_left = ball_x > 0
-    self._episode_loose_ball = bool(raw_config._values.get('loose_ball', False))
+    scene = adr.read_scene(self._env.unwrapped._config)
+    self._attacking_left = scene.attacking_left
+    self._episode_loose_ball = scene.loose_ball
     self._set_active_players()
     # A scene with held players (ADR held_share) presses their directions on
     # the first step.  Every row is hidden for that step, so the trainer
     # (which skips all-zero rows) never trains on actions the policy did not
     # choose.
-    held = np.asarray(raw_config._values.get('held_directions', ()),
-                      dtype=np.int64)
-    self._warmup_actions = held if held.size and held.any() else None
+    held = scene.held_directions
+    self._warmup_actions = held if held.any() else None
     if self._warmup_actions is not None:
       self._active_mask.fill(False)
     if self._ball_potential_scale or self._player_potential_scale:

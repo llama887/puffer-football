@@ -26,8 +26,16 @@ import multiprocessing
 import numpy as np
 
 LOWER, UPPER = 0, 1
-# The gfootball scenario that builds a scene from a set of ADR values.
+# The gfootball scenario that builds a scene from a set of ADR values.  It
+# reads them from the config value 'adr_values' and writes what it built
+# for the episode into HELD_DIRECTIONS and LOOSE_BALL (see read_scene).
 SCENARIO = '11_vs_11_adr'
+HELD_DIRECTIONS = 'held_directions'
+LOOSE_BALL = 'loose_ball'
+
+# What the scenario built for an episode (read_scene).
+Scene = collections.namedtuple(
+    'Scene', ('attacking_left', 'held_directions', 'loose_ball'))
 
 ADRParameter = collections.namedtuple(
     'ADRParameter', ('name', 'minimum', 'maximum', 'start', 'step'))
@@ -134,13 +142,10 @@ class AutomaticDomainRandomization:
     One setting, chosen uniformly, is pinned to its lower or upper edge
     (also chosen uniformly); the rest are sampled as for training.
     """
-    ranges = self.ranges()
-    values = {parameter.name: float(rng.uniform(low, high)) if high > low
-              else float(low)
-              for parameter, (low, high) in zip(PARAMETERS, ranges)}
+    values = self.sample(rng)
     index = int(rng.integers(len(PARAMETERS)))
     edge = int(rng.integers(2))
-    values[PARAMETERS[index].name] = float(ranges[index][edge])
+    values[PARAMETERS[index].name] = float(self._ranges[index][edge])
     return values, index, edge
 
   def record(self, index, edge, success):
@@ -177,3 +182,31 @@ class AutomaticDomainRandomization:
     widths = np.maximum(self._ranges[:, 1] - self._ranges[:, 0],
                         _ENTROPY_FLOOR)
     return float(np.mean(np.log(widths)))
+
+  def metrics(self):
+    """Both edges of every range and the entropy, as the trainer logs them
+    (`adr/<setting>/low`, `adr/<setting>/high`, `adr/entropy`)."""
+    metrics = {'adr/entropy': self.entropy()}
+    for parameter, (low, high) in zip(PARAMETERS, self._ranges):
+      metrics['adr/{}/low'.format(parameter.name)] = float(low)
+      metrics['adr/{}/high'.format(parameter.name)] = float(high)
+    return metrics
+
+  def load_metrics(self, metrics):
+    """Set every range from logged metrics (a training log's ADR line)."""
+    for parameter in PARAMETERS:
+      self.set_range(parameter.name,
+                     metrics['adr/{}/low'.format(parameter.name)],
+                     metrics['adr/{}/high'.format(parameter.name)])
+
+
+def read_scene(config):
+  """What the scenario built for the episode just reset into `config`: which
+  side attacks, the direction each agent holds on the first step (0: none)
+  and whether the opening is a race for a still ball."""
+  values = config._values
+  return Scene(
+      attacking_left=config.ScenarioConfig().ball_position[0] > 0,
+      held_directions=np.asarray(values.get(HELD_DIRECTIONS, [0] * 22),
+                                 dtype=np.int64),
+      loose_ball=bool(values.get(LOOSE_BALL, False)))

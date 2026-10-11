@@ -1073,15 +1073,6 @@ def record_adr_probes(randomizer, infos):
   return recorded
 
 
-def adr_metrics(randomizer):
-  """Both edges of every ADR range and the ADR entropy, for the logs."""
-  metrics = {'adr/entropy': randomizer.entropy()}
-  for parameter, (low, high) in zip(adr.PARAMETERS, randomizer.ranges()):
-    metrics['adr/{}/low'.format(parameter.name)] = float(low)
-    metrics['adr/{}/high'.format(parameter.name)] = float(high)
-  return metrics
-
-
 def refresh_adr_probe_defence(args, evaluator, policy, probe_path):
   """Replace the ADR probe defence with the learner once it outgrows it.
 
@@ -1491,7 +1482,7 @@ def main():
     while trainer.global_step < config['total_timesteps']:
       if trainer.epoch % args.evaluation_interval == 0:
         started = time.time()
-        metrics = adr_metrics(trainer.adr)
+        metrics = trainer.adr.metrics()
         metrics.update(evaluator.baseline(trainer.uncompiled_policy))
         if (adr_probe_defence != RANDOM_DEFENCE and trainer.epoch > 0 and
             args.adr_probe_refresh_interval > 0 and

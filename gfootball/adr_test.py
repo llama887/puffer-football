@@ -156,6 +156,20 @@ def test_difficulty_spans_a_fixed_share_of_the_way_to_the_limits():
     raise AssertionError('difficulty {} accepted'.format(bad))
 
 
+def test_logged_metrics_restore_the_ranges():
+  """The ADR log line (metrics) is the one format for ranges: training
+  writes it, scoring scripts load a run's ranges back from it."""
+  trainer = _fresh()
+  trainer.set_range('blockers', 0.4, 3.2)
+  trainer.set_range('ball_lateral', -0.06, 0.04)
+  logged = trainer.metrics()
+  assert logged['adr/blockers/low'] == 0.4
+  assert logged['adr/entropy'] == trainer.entropy()
+  reader = _fresh()
+  reader.load_metrics(logged)
+  np.testing.assert_array_equal(reader.ranges(), trainer.ranges())
+
+
 def _middle_half(name):
   parameter = adr.PARAMETERS[adr.PARAMETER_INDEX[name]]
   span = parameter.maximum - parameter.minimum

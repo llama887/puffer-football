@@ -10,9 +10,9 @@ defence holds its formation, both blended toward real match formations by
 between the ball and the goal, the race for the ball (`fetch_distance`,
 `defender_head_start`) and `held_share` of the outfield players holding a
 direction.  Offside is on once the formation is a real match shape, with
-every attacker placed onside.  The config value 'held_directions' lists the
-held directions per agent; puffer_env presses them on the first step,
-outside training.
+every attacker placed onside.  The config value adr.HELD_DIRECTIONS lists
+the held directions per agent (adr.read_scene); puffer_env presses them on
+the first step, outside training.
 
 Every episode ends as soon as the ball goes out of play.  With the magnet off
 the engine never designates a set-piece taker, so a goal kick, corner or
@@ -368,8 +368,8 @@ def build_scenario(builder):
       held[(0 if row[0] == Team.e_Left else 11) + row[1]] = rng.choice(
           _DIRECTION_ACTIONS)
   racing = float(settings['fetch_distance']) > 0.035
-  values['loose_ball'] = racing
-  values['held_directions'] = held
+  values[adr.LOOSE_BALL] = racing
+  values[adr.HELD_DIRECTIONS] = held
   spaced = _separate([tuple(p) for p in positions])
   if offsides or (ahead and not racing):
     # In a race only offside matters (the race already placed everyone).
