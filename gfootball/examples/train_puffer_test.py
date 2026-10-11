@@ -11,7 +11,8 @@ import torch
 from gfootball.env.puffer_policy import (
     hidden_size_from_state_dict, save_policy_snapshot, upgrade_state_dict)
 from gfootball.examples.train_puffer import (
-    ACTION_NAMES, SHOT_ACTION, FootballPolicy, FootballPuffeRL, GraphedActor,
+    ACTION_NAMES, SHOT_ACTION, FootballPolicy, GraphedActor, PpoUpdate,
+    SegmentCollector,
     Evaluator, build_config, build_parser, evaluate_episodes,
     explained_variance, generalized_advantages, normalize_advantages,
     policy_diagnostics)
@@ -240,7 +241,7 @@ def test_policy_diagnostics_distinguish_uniform_and_collapsed_policies():
 
 
 def test_config_satisfies_pufferlib_batching_constraints():
-  args = build_parser().parse_args(['--device', 'cpu', '--no-async-collection'])
+  args = build_parser().parse_args(['--device', 'cpu'])
   num_agents = 660
   config = build_config(args, num_agents)
   horizon = config['bptt_horizon']
@@ -253,8 +254,8 @@ def test_config_satisfies_pufferlib_batching_constraints():
   assert config['minibatch_size'] <= config['max_minibatch_size']
   # PufferLib requires at least one buffer row per agent.
   assert segments >= num_agents
-  # One segment per agent per epoch keeps rollout and BPTT state aligned.
-  assert segments == num_agents
+  # Whole segments per agent keep rollout and BPTT state aligned.
+  assert segments % num_agents == 0
 
 
 class _RecordingPools:
@@ -511,31 +512,27 @@ def test_every_update_epoch_is_one_step_over_the_whole_rollout():
   """
   torch.manual_seed(0)
   segments, horizon = 12, 8
-  trainer = FootballPuffeRL.__new__(FootballPuffeRL)
-  trainer.config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5,
-                        ent_coef=0.001, max_grad_norm=0.5, device='cpu',
-                        update_epochs=3)
-  trainer.observations = torch.randn(segments, horizon, 115)
-  trainer.terminals = (torch.rand(segments, horizon) < 0.1).float()
-  trainer.actions = torch.randint(0, 19, (segments, horizon))
-  trainer.logprobs = -3 * torch.rand(segments, horizon)
-  trainer.uncompiled_policy = trainer.policy = FootballPolicy(
-      _env(), hidden_size=16)
-  trainer.optimizer = torch.optim.Adam(trainer.policy.parameters(), lr=3e-4)
-  trainer.optimizer_steps = 0
-  trainer.graph_update = False
-  trainer._epoch_values = None
+  config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5,
+                ent_coef=0.001, max_grad_norm=0.5, device='cpu',
+                update_epochs=3)
+  rollout = SimpleNamespace(
+      observations=torch.randn(segments, horizon, 115),
+      terminals=(torch.rand(segments, horizon) < 0.1).float(),
+      actions=torch.randint(0, 19, (segments, horizon)),
+      logprobs=-3 * torch.rand(segments, horizon))
+  policy = FootballPolicy(_env(), hidden_size=16)
+  ppo = PpoUpdate(policy, torch.optim.Adam(policy.parameters(), lr=3e-4),
+                  rollout, config)
   trainable = torch.rand(segments, horizon) < 0.7
   trainable[4] = False
   segment_index = trainable.any(dim=1).nonzero().flatten()
-  trainer._stage_epoch(*(torch.randn(segments, horizon) for _ in range(3)),
-                       trainable)
 
-  trainer._update(segment_index)
+  totals = ppo.update(segment_index,
+                      *(torch.randn(segments, horizon) for _ in range(3)),
+                      trainable)
 
-  transitions = trainer._totals[
-      FootballPuffeRL.LOSS_NAMES.index('minibatch_transitions')]
-  assert trainer.optimizer_steps == 3
+  transitions = totals[PpoUpdate.LOSS_NAMES.index('minibatch_transitions')]
+  assert ppo.optimizer_steps == 3
   assert transitions == 3 * trainable.sum()
   assert '--minibatch-segments' not in build_parser().format_help()
 
@@ -633,7 +630,6 @@ def test_masked_losses_equal_the_indexed_losses():
 
 def test_async_collection_sizes_the_rollout_buffer():
   args = build_parser().parse_args(['--device', 'cpu'])
-  assert args.async_collection
   assert args.overlap_collection
   config = build_config(args, 660)
   # Room for the epoch being trained, one segment in progress per match,
@@ -723,44 +719,42 @@ def test_graphed_update_matches_the_eager_update():
     for carry_memory in (False, True):
       results = []
       for graph in (False, True):
-        trainer = FootballPuffeRL.__new__(FootballPuffeRL)
-        trainer.config = config
-        trainer.observations = observations.clone()
-        trainer.actions = actions.clone()
-        trainer.logprobs = logprobs.clone()
-        trainer.uncompiled_policy = trainer.policy = copy.deepcopy(base)
+        rollout = SimpleNamespace(
+            observations=observations.clone(), actions=actions.clone(),
+            logprobs=logprobs.clone(),
+            terminals=torch.zeros(segments, horizon, device=device))
+        segment_h = torch.zeros(segments, 16, device=device)
+        segment_c = torch.zeros(segments, 16, device=device)
+
+        def starting_memory(index):
+          # What SegmentCollector.starting_memory gives with carried memory.
+          if not carry_memory:
+            return {}
+          return {'done': rollout.terminals[index],
+                  'lstm_h': segment_h[index], 'lstm_c': segment_c[index]}
+
+        policy = copy.deepcopy(base)
         rate = (torch.tensor(schedule[0], device=device) if graph
                 else schedule[0])
-        trainer.optimizer = torch.optim.Adam(
-            trainer.policy.parameters(), lr=rate, eps=1e-5,
-            capturable=graph)
-        trainer.optimizer_steps = 0
-        trainer.graph_update = graph
-        trainer._update_graph = trainer._update_pool = None
-        trainer._update_capacity = None
-        trainer.update_captures = 0
-        trainer._epoch_values = None
-        trainer.carry_memory = carry_memory
-        trainer.segment_h = torch.zeros(segments, 16, device=device)
-        trainer.segment_c = torch.zeros(segments, 16, device=device)
-        trainer.terminals = torch.zeros(segments, horizon, device=device)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=rate, eps=1e-5,
+                                     capturable=graph)
+        ppo = PpoUpdate(policy, optimizer, rollout, config, graph=graph,
+                        starting_memory=starting_memory)
         totals = []
         for terminals, memory, learning_rate in zip(layouts, memories,
                                                     schedule):
-          trainer.terminals.copy_(terminals)
-          trainer.segment_h.copy_(memory[0])
-          trainer.segment_c.copy_(memory[1])
-          set_learning_rate(trainer.optimizer, learning_rate)
-          trainer._stage_epoch(*epoch, trainable)
+          rollout.terminals.copy_(terminals)
+          segment_h.copy_(memory[0])
+          segment_c.copy_(memory[1])
+          set_learning_rate(optimizer, learning_rate)
           before = torch.cat([p.detach().flatten().clone()
-                              for p in trainer.policy.parameters()])
-          trainer._update(segment_index)
-          totals.append(trainer._totals.clone())
+                              for p in policy.parameters()])
+          totals.append(ppo.update(segment_index, *epoch, trainable).clone())
         final = torch.cat([p.detach().flatten()
-                           for p in trainer.policy.parameters()])
+                           for p in policy.parameters()])
         results.append((final, before, torch.stack(totals),
-                        trainer.optimizer_steps))
-        captures = trainer.update_captures
+                        ppo.optimizer_steps))
+        captures = ppo.captures
       (eager, _, eager_totals, eager_steps), (
           graphed, graphed_before, graph_totals, graph_steps) = results
       assert eager_steps == graph_steps == 9
@@ -952,6 +946,7 @@ class _OneMatchPool:
     self.observations = observations
     self.done = done
     self.step = 0
+    self.num_agents = 2
     self.driver_env = SimpleNamespace(num_agents=2)
 
   def recv(self):
@@ -964,37 +959,21 @@ class _OneMatchPool:
     self.step += 1
 
 
-def _collecting_trainer(pool, policy, horizon, carry_memory):
-  """An async-collecting trainer over `pool` with room for three segments."""
-  import contextlib
-  from collections import defaultdict
+def _collector_and_update(pool, policy, horizon, carry_memory):
+  """A collector over `pool` with room for three segments, and its update."""
   segments = 6
-  trainer = FootballPuffeRL.__new__(FootballPuffeRL)
-  trainer.config = dict(
-      bptt_horizon=horizon, device='cpu', clip_coef=0.2, vf_clip_coef=0.2,
-      vf_coef=0.5, ent_coef=0.0, max_grad_norm=0.5, update_epochs=1)
-  trainer.vecenv = pool
-  trainer.total_agents = 2
-  trainer.segments = segments
-  trainer.uncompiled_policy = trainer.policy = policy
-  trainer.overlap_collection = False
-  trainer.carry_memory = carry_memory
-  trainer._init_async_collection()
-  trainer.graph_actor = False
-  trainer.graphed_actor = None
-  trainer.graph_update = False
-  trainer.amp_context = contextlib.nullcontext()
-  trainer.profile = lambda *args, **kwargs: None
-  trainer.epoch = trainer.global_step = 0
-  trainer.stats = defaultdict(list)
-  trainer.observations = torch.zeros(segments, horizon, 115)
-  trainer.actions = torch.zeros(segments, horizon, dtype=torch.long)
-  for name in ('logprobs', 'rewards', 'terminals', 'values'):
-    setattr(trainer, name, torch.zeros(segments, horizon))
-  trainer.optimizer = torch.optim.Adam(policy.parameters(), lr=0.0)
-  trainer.optimizer_steps = 0
-  trainer._epoch_values = None
-  return trainer
+  rollout = SimpleNamespace(
+      observations=torch.zeros(segments, horizon, 115),
+      actions=torch.zeros(segments, horizon, dtype=torch.long),
+      **{name: torch.zeros(segments, horizon)
+         for name in ('logprobs', 'rewards', 'terminals', 'values')})
+  collector = SegmentCollector(pool, policy, rollout, horizon, 'cpu',
+                               carry_memory=carry_memory)
+  config = dict(clip_coef=0.2, vf_clip_coef=0.2, vf_coef=0.5, ent_coef=0.0,
+                max_grad_norm=0.5, update_epochs=1)
+  ppo = PpoUpdate(policy, torch.optim.Adam(policy.parameters(), lr=0.0),
+                  rollout, config, starting_memory=collector.starting_memory)
+  return collector, ppo, rollout
 
 
 def test_collector_memory_is_what_training_replays():
@@ -1015,13 +994,13 @@ def test_collector_memory_is_what_training_replays():
   for carry_memory in (False, True):
     torch.manual_seed(1)
     policy = FootballPolicy(_env(), hidden_size=16)
-    trainer = _collecting_trainer(_OneMatchPool(observations, done), policy,
-                                  horizon, carry_memory)
+    collector, ppo, rollout = _collector_and_update(
+        _OneMatchPool(observations, done), policy, horizon, carry_memory)
     for _ in range(steps):
-      trainer._collect_batch()
+      collector._collect_batch()
 
     state = {'lstm_h': None, 'lstm_c': None, 'done': None}
-    blocks = list(trainer.complete_blocks)
+    blocks = list(collector.complete_blocks)
     assert len(blocks) == 2
     for step in range(steps):
       if step % horizon == 0 and not carry_memory:
@@ -1032,17 +1011,16 @@ def test_collector_memory_is_what_training_replays():
       rows = blocks[step // horizon] * 2 + torch.arange(2)
       column = step % horizon
       expected = torch.log_softmax(logits, dim=-1).gather(
-          1, trainer.actions[rows, column].view(-1, 1)).squeeze(1)
-      assert torch.allclose(trainer.logprobs[rows, column], expected,
+          1, rollout.actions[rows, column].view(-1, 1)).squeeze(1)
+      assert torch.allclose(rollout.logprobs[rows, column], expected,
                             atol=1e-5), (carry_memory, step)
 
     # The epoch trains the newest segment, which starts mid-episode.
-    trainer._claim_training_blocks()
-    trainable = trainer.row_training[:, None].expand(-1, horizon).clone()
-    trainer._stage_epoch(trainer.values, torch.randn(6, horizon),
-                         torch.randn(6, horizon), trainable)
-    trainer._update(trainer.training_rows)
-    totals = dict(zip(FootballPuffeRL.LOSS_NAMES, trainer._totals.tolist()))
+    rows = collector.claim_training_rows()
+    trainable = collector.row_training[:, None].expand(-1, horizon).clone()
+    totals = ppo.update(rows, rollout.values, torch.randn(6, horizon),
+                        torch.randn(6, horizon), trainable)
+    totals = dict(zip(PpoUpdate.LOSS_NAMES, totals.tolist()))
     assert totals['approx_kl'] < 1e-10, (carry_memory, totals)
     assert math.isclose(totals['importance'], 1.0, abs_tol=1e-6)
 

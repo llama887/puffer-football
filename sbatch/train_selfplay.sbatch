@@ -124,10 +124,6 @@ FRAME_STACK=${FRAME_STACK:-1}
 # environments stepping while the update runs on the GPU, acting with a copy
 # of the policy synced after every update (at most one update stale; the
 # stored log-prob keeps PPO's ratio exact).
-ASYNC_COLLECTION_ARGS=(--async-collection)
-if [[ ${ASYNC_COLLECTION:-1} == 0 ]]; then
-  ASYNC_COLLECTION_ARGS=(--no-async-collection)
-fi
 OVERLAP_ARGS=(--overlap-collection)
 if [[ ${OVERLAP_COLLECTION:-1} == 0 ]]; then
   OVERLAP_ARGS=(--no-overlap-collection)
@@ -231,7 +227,6 @@ cd "$RUN_ROOT"
   --device cuda \
   --num-workers "$NUM_WORKERS" \
   --envs-per-worker "$ENVS_PER_WORKER" \
-  "${ASYNC_COLLECTION_ARGS[@]}" \
   "${OVERLAP_ARGS[@]}" \
   "${GRAPH_ARGS[@]}" \
   "${GPU_FILLER_ARGS[@]}" \

@@ -281,97 +281,54 @@ class GraphedActor:
     return self.outputs
 
 
-class FootballPuffeRL(pufferl.PuffeRL):
-  """PPO restricted to the agent rows the learner actually played."""
+class SegmentCollector:
+  """Collects `horizon`-step segments from matches that run at their own pace.
 
-  # The ADR randomizer that records probe results (set by main).
-  # A class default, so trainers built without __init__ (tests) have it too.
-  adr = None
+  PuffeRL's collector steps every env exactly `horizon` times per epoch in a
+  fixed order, so one env in an engine reset holds up the rest.  Here each
+  match fills its own `horizon`-step segment (one row per agent) as fast as
+  it runs, into blocks of the rollout buffers with room for several segments
+  per match.  An epoch trains on exactly one segment per match's worth of
+  completed blocks; segments in progress, and any completed beyond that,
+  carry over.  By default recurrent memory starts from zero at every segment
+  and every episode end, exactly as in PuffeRL's rollout.  With carry_memory
+  it clears only at episode ends: each segment continues its match's memory,
+  and the memory it started from is kept per buffer row for training
+  (starting_memory).  Either way BPTT replays what the policy saw.
 
-  # Loss statistics accumulated on the GPU inside the minibatch loop and read
-  # back once, when the epoch is logged.
-  LOSS_NAMES = ('policy_loss', 'value_loss', 'entropy', 'gradient_norm',
-                'old_approx_kl', 'approx_kl', 'clipfrac', 'importance',
-                'minibatch_transitions')
-  # Recurrent memory runs across rollout segments (see
-  # _init_async_collection); off, it restarts at every segment.
-  carry_memory = False
+  With overlap, collection continues while the update runs on the GPU: a
+  copy of the policy acts on its own CUDA stream and is synced after every
+  update (sync_acting_policy), so an action is at most one update stale.  Its
+  log-prob is stored with the transition, so PPO's importance ratio stays
+  exact.  With graph_actor the acting forward replays as one CUDA graph.
 
-  def __init__(self, config, vecenv, policy, logger=None,
-               log_interval_seconds=0.25, overlap_collection=False,
-               graph_actor=False, graph_update=False, carry_memory=False):
-    super().__init__(config, vecenv, policy, logger=logger)
+  `rollout` holds the buffers (observations, actions, logprobs, rewards,
+  terminals, values; one row per agent segment); `on_batch(infos, steps)`
+  receives every batch's episode infos and its agent steps; `profile(name)`
+  times the phases.
+  """
+
+  def __init__(self, vecenv, policy, rollout, horizon, device,
+               carry_memory=False, overlap=False, graph_actor=False,
+               amp_context=None, on_batch=None, profile=None):
+    self.vecenv = vecenv
+    self.policy = policy
+    self.rollout = rollout
+    self.horizon = int(horizon)
+    self.device = device
     self.carry_memory = bool(carry_memory)
-    if self.carry_memory and not getattr(vecenv, 'is_async', False):
-      raise ValueError('carried memory needs --async-collection; PuffeRL\'s '
-                       'own rollout restarts memory at every segment')
-    # PufferLib's epoch-based scheduler is unused: train() sets the rate from
-    # training progress (see cosine_learning_rate).
-    self.async_collection = bool(getattr(vecenv, 'is_async', False))
-    self.overlap_collection = bool(
-        overlap_collection and self.async_collection and
-        torch.device(config['device']).type == 'cuda')
-    self.graph_actor = bool(
-        graph_actor and self.async_collection and
-        torch.device(config['device']).type == 'cuda')
-    self.graphed_actor = None
-    self._epoch_values = None
-    # A captured update replays Adam as recorded, so Adam keeps its step
-    # count on the GPU (capturable) and the learning rate lives in a GPU
-    # tensor that set_learning_rate fills in place.
-    self.graph_update = bool(
-        graph_update and torch.device(config['device']).type == 'cuda')
-    self._update_graph = None
-    self._update_pool = None
-    self._update_capacity = None
-    self.update_captures = 0
-    if self.graph_update:
-      self.optimizer = torch.optim.Adam(
-          self.uncompiled_policy.parameters(),
-          lr=torch.tensor(float(config['learning_rate']),
-                          device=config['device']),
-          betas=(config['adam_beta1'], config['adam_beta2']),
-          eps=config['adam_eps'], capturable=True)
-    if self.async_collection:
-      self._init_async_collection()
-    self.optimizer_steps = 0
-    self.active_steps = torch.zeros((), dtype=torch.long,
-                                    device=config['device'])
-    self.last_active_steps = 0
-    self.last_active_log_time = time.time()
-    self.evaluation_metrics = {}
-    # Diagnostics are only computed on epochs that are logged, so this also
-    # sets how often the trainer pays for them.
-    self.log_interval_seconds = float(log_interval_seconds)
-
-  def _init_async_collection(self):
-    """Buffers for collecting segments from envs that run at their own pace.
-
-    PuffeRL's collector steps every env exactly `horizon` times per epoch in
-    a fixed order, so one env in an engine reset holds up the rest.  Here
-    each match fills its own `horizon`-step segment (22 agent rows) as fast
-    as it runs, into blocks of a buffer with room for several segments per
-    match.  An epoch trains on exactly one segment per match's worth of
-    completed blocks; segments in progress, and any completed beyond that,
-    carry over.  By default recurrent memory starts from zero at every
-    segment and every episode end, exactly as in PuffeRL's rollout.  With
-    carry_memory it clears only at episode ends: each segment continues its
-    match's memory, and the memory it started from is kept per buffer row
-    (segment_h, segment_c) for training.  Either way BPTT replays what the
-    policy saw.
-
-    With overlap on, collection continues while the update runs on the GPU:
-    a copy of the policy acts on its own CUDA stream and is synced after
-    every update, so an action is at most one update stale.  Its log-prob is
-    stored with the transition, so PPO's importance ratio stays exact.
-    """
-    config = self.config
-    device = config['device']
-    self.agents_per_env = self.vecenv.driver_env.num_agents
-    self.num_matches = self.total_agents // self.agents_per_env
-    self.num_blocks = self.segments // self.agents_per_env
+    self.overlap = bool(overlap)
+    self.graph_actor = bool(graph_actor)
+    self._amp_context = amp_context or contextlib.nullcontext
+    self._on_batch = on_batch or (lambda infos, steps: None)
+    self._profile = profile or (lambda name: None)
+    self.agents_per_env = vecenv.driver_env.num_agents
+    total_agents = vecenv.num_agents
+    segments = rollout.observations.shape[0]
+    self.num_matches = total_agents // self.agents_per_env
+    self.num_blocks = segments // self.agents_per_env
     self.blocks_per_epoch = self.num_matches
-    needed = (3 if self.overlap_collection else 2) * self.num_matches
+    needed = (3 if self.overlap else 2) * self.num_matches
     if self.num_blocks < needed:
       raise ValueError('async collection needs {} segment blocks, the buffer '
                        'has {}'.format(needed, self.num_blocks))
@@ -380,23 +337,26 @@ class FootballPuffeRL(pufferl.PuffeRL):
     self.training_blocks = []
     self.match_block = np.full(self.num_matches, -1, dtype=np.int64)
     self.match_step = np.zeros(self.num_matches, dtype=np.int64)
-    hidden = self.uncompiled_policy.hidden_size
-    self.agent_h = torch.zeros(self.total_agents, hidden, device=device)
-    self.agent_c = torch.zeros(self.total_agents, hidden, device=device)
+    hidden = policy.hidden_size
+    self.agent_h = torch.zeros(total_agents, hidden, device=device)
+    self.agent_c = torch.zeros(total_agents, hidden, device=device)
     if self.carry_memory:
       # Per buffer row: the actor's memory when that row's segment began.
-      self.segment_h = torch.zeros(self.segments, hidden, device=device)
-      self.segment_c = torch.zeros(self.segments, hidden, device=device)
-    self.row_training = torch.zeros(self.segments, dtype=torch.bool,
+      self.segment_h = torch.zeros(segments, hidden, device=device)
+      self.segment_c = torch.zeros(segments, hidden, device=device)
+    # Per buffer row: whether it belongs to the epoch being trained.
+    self.row_training = torch.zeros(segments, dtype=torch.bool,
                                     device=device)
+    self.training_rows = None
     self.agent_offsets = np.arange(self.agents_per_env)
     self.discarded_steps = 0
     self.dropped_segments = 0
-    self.acting_policy = self.uncompiled_policy
+    self.graphed_actor = None
+    self.acting_policy = policy
     self.acting_stream = None
-    if self.overlap_collection:
+    if self.overlap:
       import copy
-      self.acting_policy = copy.deepcopy(self.uncompiled_policy)
+      self.acting_policy = copy.deepcopy(policy)
       for parameter in self.acting_policy.parameters():
         parameter.requires_grad_(False)
       if torch.device(device).type == 'cuda':
@@ -404,9 +364,46 @@ class FootballPuffeRL(pufferl.PuffeRL):
         self.acting_stream = torch.cuda.Stream(device=device,
                                                priority=highest)
 
-  def _sync_acting_policy(self):
+  def collect_epoch(self):
+    """Recycle the rows last trained on; collect one epoch of segments."""
+    self.free_blocks.extend(self.training_blocks)
+    self.training_blocks = []
+    while len(self.complete_blocks) < self.blocks_per_epoch:
+      self._collect_batch()
+
+  def collect_while(self, done):
+    """Serve ready workers until `done()`; the update runs on the GPU."""
+    while not done():
+      if self._workers_ready():
+        self._collect_batch()
+
+  def claim_training_rows(self):
+    """Hand exactly one epoch of the newest completed segments to PPO.
+
+    Returns their buffer rows (a fixed count) and marks them in
+    row_training.  With overlap the environments can outrun the learner:
+    older surplus segments are dropped rather than queued, so trained data
+    is never more than about one update stale.
+    """
+    per_env = self.agents_per_env
+    self.training_blocks = self.complete_blocks[-self.blocks_per_epoch:]
+    surplus = self.complete_blocks[:-self.blocks_per_epoch]
+    self.dropped_segments += len(surplus)
+    self.free_blocks.extend(surplus)
+    self.complete_blocks = []
+    rows = (np.asarray(self.training_blocks)[:, None] * per_env +
+            self.agent_offsets).ravel()
+    self.training_rows = torch.as_tensor(rows, device=self.row_training.device)
+    self.row_training.zero_()
+    self.row_training[self.training_rows] = True
+    if self.acting_stream is not None:
+      # Everything the actor wrote must land before PPO reads it.
+      torch.cuda.current_stream().wait_stream(self.acting_stream)
+    return self.training_rows
+
+  def sync_acting_policy(self):
     """Copy the trained weights (and normalizer statistics) to the actor."""
-    if self.acting_policy is self.uncompiled_policy:
+    if self.acting_policy is self.policy:
       return
     main = torch.cuda.current_stream() if self.acting_stream else None
     if main is not None:
@@ -414,10 +411,24 @@ class FootballPuffeRL(pufferl.PuffeRL):
       main.wait_stream(self.acting_stream)
     with torch.no_grad():
       for target, source in zip(self.acting_policy.state_dict().values(),
-                                self.uncompiled_policy.state_dict().values()):
+                                self.policy.state_dict().values()):
         target.copy_(source)
     if main is not None:
       self.acting_stream.wait_stream(main)
+
+  def starting_memory(self, index):
+    """The window-forward state that starts buffer rows `index` as collected.
+
+    Empty when memory restarts at every segment (the window forward starts
+    from zero by itself).  With carry_memory, the memory each row's segment
+    started from plus the done flags that clear it where the segment opens
+    on a new episode.  Shapes are fixed by `index`, so a captured update can
+    read it.
+    """
+    if not self.carry_memory:
+      return {}
+    return {'done': self.rollout.terminals[index],
+            'lstm_h': self.segment_h[index], 'lstm_c': self.segment_c[index]}
 
   def _workers_ready(self):
     """True if recv() would return a batch without waiting."""
@@ -433,17 +444,16 @@ class FootballPuffeRL(pufferl.PuffeRL):
 
   def _collect_batch(self):
     """Receive one batch of matches, act for them and store the step."""
-    profile = self.profile
-    epoch = self.epoch
-    config = self.config
-    device = config['device']
-    horizon = config['bptt_horizon']
+    profile = self._profile
+    device = self.device
+    horizon = self.horizon
     per_env = self.agents_per_env
+    rollout = self.rollout
 
-    profile('env', epoch)
+    profile('env')
     o, r, d, t, info, agent_ids, mask = self.vecenv.recv()
 
-    profile('eval_misc', epoch)
+    profile('eval_misc')
     agent_ids = np.asarray(agent_ids)
     matches = agent_ids[::per_env] // per_env
     starting = matches[self.match_block[matches] < 0]
@@ -456,7 +466,6 @@ class FootballPuffeRL(pufferl.PuffeRL):
     fresh_matches = np.asarray(fresh_matches, dtype=np.int64)
     recording = self.match_block[matches] >= 0
     self.discarded_steps += int((~recording).sum())
-    self.global_step += int(mask.sum())
 
     stream = (torch.cuda.stream(self.acting_stream)
               if self.acting_stream is not None else contextlib.nullcontext())
@@ -479,13 +488,13 @@ class FootballPuffeRL(pufferl.PuffeRL):
           self.agent_h[fresh] = 0
           self.agent_c[fresh] = 0
 
-      profile('eval_copy', epoch)
+      profile('eval_copy')
       o_device = torch.as_tensor(o).to(device)
       r = torch.as_tensor(r).to(device)
       d = torch.as_tensor(d).to(device)
 
-      profile('eval_forward', epoch)
-      with torch.no_grad(), self.amp_context:
+      profile('eval_forward')
+      with torch.no_grad(), self._amp_context():
         hidden = self.agent_h[agent_index]
         cell = self.agent_c[agent_index]
         if self.graph_actor and self.graphed_actor is None:
@@ -505,7 +514,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
         # refund of potential-based shaping (up to 2 * ball scale), so the
         # shaping stopped telescoping and changed what is optimal.
 
-      profile('eval_copy', epoch)
+      profile('eval_copy')
       with torch.no_grad():
         self.agent_h[agent_index] = new_hidden
         self.agent_c[agent_index] = new_cell
@@ -520,15 +529,17 @@ class FootballPuffeRL(pufferl.PuffeRL):
           steps = torch.as_tensor(np.repeat(
               self.match_step[matches[recording]], per_env), device=device)
           # Indexed writes, unlike PuffeRL's slice writes, do not cast.
-          self.observations[rows, steps] = o_device[keep_rows].to(
-              self.observations.dtype)
-          self.actions[rows, steps] = action[keep_rows].to(self.actions.dtype)
-          self.logprobs[rows, steps] = logprob[keep_rows].to(
-              self.logprobs.dtype)
-          self.rewards[rows, steps] = r[keep_rows].to(self.rewards.dtype)
-          self.terminals[rows, steps] = d[keep_rows].to(self.terminals.dtype)
-          self.values[rows, steps] = value.flatten()[keep_rows].to(
-              self.values.dtype)
+          rollout.observations[rows, steps] = o_device[keep_rows].to(
+              rollout.observations.dtype)
+          rollout.actions[rows, steps] = action[keep_rows].to(
+              rollout.actions.dtype)
+          rollout.logprobs[rows, steps] = logprob[keep_rows].to(
+              rollout.logprobs.dtype)
+          rollout.rewards[rows, steps] = r[keep_rows].to(rollout.rewards.dtype)
+          rollout.terminals[rows, steps] = d[keep_rows].to(
+              rollout.terminals.dtype)
+          rollout.values[rows, steps] = value.flatten()[keep_rows].to(
+              rollout.values.dtype)
         action = action.cpu().numpy()
 
     recorded = matches[recording]
@@ -537,98 +548,116 @@ class FootballPuffeRL(pufferl.PuffeRL):
       self.complete_blocks.append(int(self.match_block[match]))
       self.match_block[match] = -1
 
-    profile('eval_misc', epoch)
-    if self.adr is not None:
-      record_adr_probes(self.adr, info)
-    for i in info:
-      for k, v in pufferlib.unroll_nested_dict(i):
-        if isinstance(v, np.ndarray):
-          v = v.tolist()
-        elif isinstance(v, (list, tuple)):
-          self.stats[k].extend(v)
-        else:
-          self.stats[k].append(v)
+    profile('eval_misc')
+    self._on_batch(info, int(mask.sum()))
 
-    profile('env', epoch)
+    profile('env')
     self.vecenv.send(action)
 
-  def _evaluate_async(self):
-    profile = self.profile
-    epoch = self.epoch
-    profile('eval', epoch)
-    profile('eval_misc', epoch, nest=True)
-    # Last epoch's training blocks were trained on; recycle their rows.
-    self.free_blocks.extend(self.training_blocks)
-    self.training_blocks = []
-    while len(self.complete_blocks) < self.blocks_per_epoch:
-      self._collect_batch()
-    profile.end()
-    return self.stats
 
-  def _claim_training_blocks(self):
-    """Hand exactly one epoch of the newest completed segments to PPO.
+class PpoUpdate:
+  """PPO steps over the trainable rows of a rollout, eager or as a CUDA graph.
 
-    With overlap the environments can outrun the learner.  Older surplus
-    segments are dropped rather than queued, so trained data is never more
-    than about one update stale.
-    """
-    per_env = self.agents_per_env
-    self.training_blocks = self.complete_blocks[-self.blocks_per_epoch:]
-    surplus = self.complete_blocks[:-self.blocks_per_epoch]
-    self.dropped_segments += len(surplus)
-    self.free_blocks.extend(surplus)
-    self.complete_blocks = []
-    rows = (np.asarray(self.training_blocks)[:, None] * per_env +
-            self.agent_offsets).ravel()
-    self.training_rows = torch.as_tensor(rows, device=self.row_training.device)
-    self.row_training.zero_()
-    self.row_training[self.training_rows] = True
-    if self.acting_stream is not None:
-      # Everything the actor wrote must land before PPO reads it.
-      torch.cuda.current_stream().wait_stream(self.acting_stream)
+  update() stages the epoch's values, advantages, returns and trainable mask
+  and takes update_epochs steps, each over the whole rollout (~1000 segments
+  at 46 matches, ~0.6 GB of activations), so update_epochs is exactly the
+  number of optimizer steps per rollout.  Rows and steps that are not
+  trainable are masked out of every loss.  `starting_memory(index)` gives
+  the state each row's segment started from (empty when memory restarts at
+  every segment).
 
-  def _collect_while(self, done):
-    """Serve ready workers until `done()`; the update runs on the GPU."""
-    while not done():
-      if self._workers_ready():
-        self._collect_batch()
+  With graph, the step is a captured CUDA graph replayed update_epochs
+  times.  The main thread also serves the environments while the update
+  runs; launching every kernel from Python kept it busy ~40 ms per epoch
+  (collection fell from ~280k to ~140k steps/s), and capturing a new graph
+  each rollout still cost ~30 ms.  So the graph reads its rows and episode
+  layout from fixed buffers, and the layout has a fixed capacity per step
+  (episode_pieces pads it exactly): each rollout copies its layout in and
+  replays.  The graph is captured again only when a rollout needs more
+  slots than the capacity, or leaves over half of it unused.  Capturing does
+  not execute, so the very first step runs eagerly to create Adam's state
+  first.  The optimizer must then be capturable, with its learning rate in
+  a GPU tensor (set_learning_rate fills it in place).
+  """
 
-  def _stage_epoch(self, rollout_values, advantages, returns, trainable):
-    if getattr(self, '_epoch_values', None) is None:
-      self._epoch_values = torch.zeros_like(rollout_values)
-      self._epoch_advantages = torch.zeros_like(rollout_values)
-      self._epoch_returns = torch.zeros_like(rollout_values)
-      self._epoch_weight = torch.zeros_like(rollout_values)
-      self._totals = torch.zeros(len(self.LOSS_NAMES),
-                                 device=rollout_values.device)
-    self._epoch_values.copy_(rollout_values)
+  # Loss statistics accumulated on the GPU inside the step and read back
+  # once, when the epoch is logged.
+  LOSS_NAMES = ('policy_loss', 'value_loss', 'entropy', 'gradient_norm',
+                'old_approx_kl', 'approx_kl', 'clipfrac', 'importance',
+                'minibatch_transitions')
+
+  def __init__(self, policy, optimizer, rollout, config, graph=False,
+               starting_memory=None, capture_policy=None):
+    self.policy = policy
+    self.optimizer = optimizer
+    self.rollout = rollout
+    self.config = config
+    self.graph = bool(graph)
+    self._starting_memory = starting_memory or (lambda index: {})
+    # The graph captures the uncompiled module (torch.compile adds nothing
+    # inside a CUDA graph and does not capture cleanly).
+    self._capture_policy = capture_policy or policy
+    self.optimizer_steps = 0
+    self.captures = 0
+    self.totals = None
+    self._epoch_values = None
+    self._update_graph = None
+    self._update_pool = None
+    self._update_capacity = None
+
+  def update(self, rows, values, advantages, returns, trainable):
+    """Train on buffer rows `rows`; returns the loss totals (LOSS_NAMES)."""
+    self._stage(values, advantages, returns, trainable)
+    done = self.rollout.terminals[rows]
+    epochs = self.config['update_epochs']
+    if not self.graph:
+      pieces = episode_pieces(done)
+      for _ in range(epochs):
+        self._step(self.policy, rows, pieces)
+      return self.totals
+    needed = episode_batch_sizes(done)
+    capacity = self._update_capacity
+    if (self._update_graph is None or
+        rows.numel() != self._update_rows.numel() or
+        bool((needed > capacity).any()) or
+        2 * int(needed.sum()) < int(capacity.sum())):
+      capacity = (torch.ceil(needed * 1.25 / 64) * 64).long().clamp_min(64)
+      self._capture(rows, episode_pieces(done, capacity))
+      first = self._warmup_steps
+    else:
+      order, inverse, _ = episode_pieces(done, capacity)
+      self._update_rows.copy_(rows)
+      self._update_order.copy_(order)
+      self._update_inverse.copy_(inverse)
+      first = 0
+    for _ in range(first, epochs):
+      self._update_graph.replay()
+      self.optimizer_steps += 1
+    return self.totals
+
+  def _stage(self, values, advantages, returns, trainable):
+    """Copy the epoch into fixed buffers, which a captured step reads."""
+    if self._epoch_values is None:
+      self._epoch_values = torch.zeros_like(values)
+      self._epoch_advantages = torch.zeros_like(values)
+      self._epoch_returns = torch.zeros_like(values)
+      self._epoch_weight = torch.zeros_like(values)
+      self.totals = torch.zeros(len(self.LOSS_NAMES), device=values.device)
+    self._epoch_values.copy_(values)
     self._epoch_advantages.copy_(advantages)
     self._epoch_returns.copy_(returns)
     self._epoch_weight.copy_(trainable)
-    self._totals.zero_()
+    self.totals.zero_()
 
-  def _starting_memory(self, index):
-    """The window-forward state that starts buffer rows `index` as collected.
-
-    Empty when memory restarts at every segment (the window forward starts
-    from zero by itself).  With carry_memory, the memory each row's segment
-    started from plus the done flags that clear it where the segment opens
-    on a new episode.  Shapes are fixed by `index`, so a captured update can
-    read it.
-    """
-    if not self.carry_memory:
-      return {}
-    return {'done': self.terminals[index], 'lstm_h': self.segment_h[index],
-            'lstm_c': self.segment_c[index]}
-
-  def _minibatch_step(self, policy, index, pieces):
+  def _step(self, policy, index, pieces):
     """One PPO gradient step on the segments in `index`.
 
     Forward (BPTT over whole segments, using the precomputed episode_pieces
     layout of those segments), masked PPO losses, backward, gradient clip,
-    Adam.  _update calls it once per update epoch with the whole rollout.
+    Adam.
     """
     config = self.config
+    rollout = self.rollout
     clip = config['clip_coef']
     mask = self._epoch_weight[index]
     count = mask.sum()
@@ -638,15 +667,15 @@ class FootballPuffeRL(pufferl.PuffeRL):
       return (values * mask).sum() / denominator
 
     logits, new_values = policy(
-        self.observations[index],
+        rollout.observations[index],
         {'episode_pieces': pieces, **self._starting_memory(index)})
     _, new_logprobs, entropy = pufferlib.pytorch.sample_logits(
-        logits, action=self.actions[index])
+        logits, action=rollout.actions[index])
     new_logprobs = new_logprobs.view(mask.shape)
     entropy = entropy.view(mask.shape)
     old_values = self._epoch_values[index]
     mb_returns = self._epoch_returns[index]
-    log_ratio = new_logprobs - self.logprobs[index]
+    log_ratio = new_logprobs - rollout.logprobs[index]
     ratio = log_ratio.exp()
 
     mb_advantages = self._epoch_advantages[index].float()
@@ -674,7 +703,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
     self.optimizer_steps += 1
 
     with torch.no_grad():
-      self._totals += torch.stack((
+      self.totals += torch.stack((
           policy_loss, value_loss, entropy_loss, gradient_norm,
           masked_mean(-log_ratio),
           masked_mean((ratio - 1) - log_ratio),
@@ -682,77 +711,30 @@ class FootballPuffeRL(pufferl.PuffeRL):
           masked_mean(ratio),
           count)).detach()
 
-  def _update(self, rows):
-    """Train on this rollout: `update_epochs` steps over all its segments.
-
-    `rows` are the rollout's buffer rows (a fixed number per epoch); rows
-    and steps that are not trainable are masked out of every loss.  The
-    minibatch is the whole rollout (~1000 segments at 46 matches, ~0.6 GB
-    of activations), so update_epochs is exactly the number of optimizer
-    steps per rollout.
-
-    With graph_update, the step is a captured CUDA graph replayed
-    update_epochs times.  The main thread also serves the environments while
-    the update runs; launching every kernel from Python kept it busy ~40 ms
-    per epoch (collection fell from ~280k to ~140k steps/s), and capturing
-    a new graph each rollout still cost ~30 ms.  So the graph reads its rows
-    and episode layout from fixed buffers, and the layout has a fixed
-    capacity per step (episode_pieces pads it exactly): each rollout copies
-    its layout in and replays.  The graph is captured again only when a
-    rollout needs more slots than the capacity, or leaves over half of it
-    unused.  Capturing does not execute, so the very first step runs
-    eagerly to create Adam's state first.
-    """
-    done = self.terminals[rows]
-    epochs = self.config['update_epochs']
-    if not self.graph_update:
-      pieces = episode_pieces(done)
-      for _ in range(epochs):
-        self._minibatch_step(self.policy, rows, pieces)
-      return
-    needed = episode_batch_sizes(done)
-    capacity = self._update_capacity
-    if (self._update_graph is None or
-        rows.numel() != self._update_rows.numel() or
-        bool((needed > capacity).any()) or
-        2 * int(needed.sum()) < int(capacity.sum())):
-      capacity = (torch.ceil(needed * 1.25 / 64) * 64).long().clamp_min(64)
-      self._capture_update(rows, episode_pieces(done, capacity))
-      first = self._update_warmup_steps
-    else:
-      order, inverse, _ = episode_pieces(done, capacity)
-      self._update_rows.copy_(rows)
-      self._update_order.copy_(order)
-      self._update_inverse.copy_(inverse)
-      first = 0
-    for _ in range(first, epochs):
-      self._update_graph.replay()
-      self.optimizer_steps += 1
-
-  def _capture_update(self, rows, pieces):
+  def _capture(self, rows, pieces):
     """Capture one PPO step reading the fixed update buffers.
 
     The very first capture is preceded by one real, eager step (on a side
     stream) so Adam's state and the cuBLAS/cuDNN workspaces exist; that
-    step counts as the rollout's first (_update_warmup_steps).  Later
-    captures reuse the same memory pool.
+    step counts as the rollout's first (_warmup_steps).  Later captures
+    reuse the same memory pool.
     """
-    policy = self.uncompiled_policy
+    policy = self._capture_policy
     order, inverse, capacity = pieces
     self._update_rows = rows.clone()
     self._update_order = order.clone()
     self._update_inverse = inverse.clone()
     self._update_capacity = capacity
     static = (self._update_order, self._update_inverse, capacity)
-    self._update_warmup_steps = 0
+    self._warmup_steps = 0
     if self._update_pool is None:
       side = torch.cuda.Stream()
       side.wait_stream(torch.cuda.current_stream())
       with torch.cuda.stream(side):
-        self._minibatch_step(policy, self._update_rows, static)
+        self._step(policy, self._update_rows, static)
       torch.cuda.current_stream().wait_stream(side)
       self._update_pool = torch.cuda.graph_pool_handle()
-      self._update_warmup_steps = 1
+      self._warmup_steps = 1
     # Gradients are allocated inside the graph's pool during capture.
     self.optimizer.zero_grad(set_to_none=True)
     self._update_graph = None
@@ -761,15 +743,85 @@ class FootballPuffeRL(pufferl.PuffeRL):
     # thread_local: the GPU filler thread keeps launching its own kernels.
     with torch.cuda.graph(graph, pool=self._update_pool,
                           capture_error_mode='thread_local'):
-      self._minibatch_step(policy, self._update_rows, static)
+      self._step(policy, self._update_rows, static)
     self.optimizer_steps = steps
     self._update_graph = graph
-    self.update_captures += 1
+    self.captures += 1
+
+
+class FootballPuffeRL(pufferl.PuffeRL):
+  """PPO self-play: a SegmentCollector feeds a PpoUpdate.
+
+  PuffeRL owns the rollout buffers, the optimizer, logging and checkpoints;
+  the collector fills the buffers from matches running at their own pace
+  (the vecenv must be asynchronous), and the update trains on the rows the
+  learner actually played.
+  """
+
+  def __init__(self, config, vecenv, policy, logger=None,
+               log_interval_seconds=0.25, overlap_collection=False,
+               graph_actor=False, graph_update=False, carry_memory=False):
+    super().__init__(config, vecenv, policy, logger=logger)
+    if not getattr(vecenv, 'is_async', False):
+      raise ValueError('FootballPuffeRL collects asynchronously; build the '
+                       'vecenv with async_batch_workers')
+    cuda = torch.device(config['device']).type == 'cuda'
+    # PufferLib's epoch-based scheduler is unused: train() sets the rate from
+    # training progress (see cosine_learning_rate).  A captured update
+    # replays Adam as recorded, so Adam keeps its step count on the GPU
+    # (capturable) and the learning rate lives in a GPU tensor that
+    # set_learning_rate fills in place.
+    graph_update = bool(graph_update and cuda)
+    if graph_update:
+      self.optimizer = torch.optim.Adam(
+          self.uncompiled_policy.parameters(),
+          lr=torch.tensor(float(config['learning_rate']),
+                          device=config['device']),
+          betas=(config['adam_beta1'], config['adam_beta2']),
+          eps=config['adam_eps'], capturable=True)
+    # The ADR randomizer that records probe results (set by main).
+    self.adr = None
+    self.collector = SegmentCollector(
+        vecenv, self.uncompiled_policy, self, config['bptt_horizon'],
+        config['device'], carry_memory=carry_memory,
+        overlap=overlap_collection and cuda,
+        graph_actor=graph_actor and cuda, amp_context=lambda: self.amp_context,
+        on_batch=self._record_batch,
+        profile=lambda name: self.profile(name, self.epoch))
+    self.ppo = PpoUpdate(
+        self.policy, self.optimizer, self, config, graph=graph_update,
+        starting_memory=self.collector.starting_memory,
+        capture_policy=self.uncompiled_policy)
+    self.active_steps = torch.zeros((), dtype=torch.long,
+                                    device=config['device'])
+    self.last_active_steps = 0
+    self.last_active_log_time = time.time()
+    self.evaluation_metrics = {}
+    # Diagnostics are only computed on epochs that are logged, so this also
+    # sets how often the trainer pays for them.
+    self.log_interval_seconds = float(log_interval_seconds)
+
+  def _record_batch(self, infos, steps):
+    """Count a collected batch's agent steps; log its finished episodes."""
+    self.global_step += steps
+    if self.adr is not None:
+      record_adr_probes(self.adr, infos)
+    for i in infos:
+      for k, v in pufferlib.unroll_nested_dict(i):
+        if isinstance(v, np.ndarray):
+          v = v.tolist()
+        elif isinstance(v, (list, tuple)):
+          self.stats[k].extend(v)
+        else:
+          self.stats[k].append(v)
 
   def evaluate(self):
-    if self.async_collection:
-      return self._evaluate_async()
-    return super().evaluate()
+    profile = self.profile
+    profile('eval', self.epoch)
+    profile('eval_misc', self.epoch, nest=True)
+    self.collector.collect_epoch()
+    profile.end()
+    return self.stats
 
   def train(self):
     profile = self.profile
@@ -777,25 +829,22 @@ class FootballPuffeRL(pufferl.PuffeRL):
     profile('train', epoch)
     profile('train_misc', epoch, nest=True)
     config = self.config
-    device = config['device']
+    collector = self.collector
     done_training = (
         self.global_step >= config['total_timesteps'])
     log_epoch = (done_training or self.global_step == 0 or
                  time.time() > self.last_log_time + self.log_interval_seconds)
     losses = {}
-    if self.async_collection:
-      # Before any buffer read: waits for the actor's stream.
-      self._claim_training_blocks()
+    # Before any buffer read: waits for the actor's stream.
+    rows = collector.claim_training_rows()
 
     rollout_values = self.values.clone()
     advantages, returns, valid = generalized_advantages(
         rollout_values, self.rewards, self.terminals,
         config['gamma'], config['gae_lambda'])
     active = self.observations.flatten(2).abs().sum(dim=-1) > 0
-    trainable = active & valid
-    if self.async_collection:
-      # Only this epoch's completed segments; the rest carry over.
-      trainable &= self.row_training[:, None]
+    # Only this epoch's completed segments; the rest carry over.
+    trainable = active & valid & collector.row_training[:, None]
     segment_index = trainable.any(dim=1).nonzero().flatten()
     num_segments = int(segment_index.numel())
     if num_segments == 0:
@@ -811,32 +860,29 @@ class FootballPuffeRL(pufferl.PuffeRL):
       losses['pre_update_explained_variance'] = explained_variance(
           rollout_values[trainable], returns[trainable])
 
-    # Every loss is a masked mean over the (segment, step) grid, which is the
-    # same number as indexing out the trainable rows first, without the
-    # data-dependent shapes that force a GPU sync on every step.
-    self._stage_epoch(rollout_values, advantages, returns, trainable)
     if config['anneal_lr']:
       set_learning_rate(self.optimizer, cosine_learning_rate(
           config['learning_rate'], self.global_step,
           config['total_timesteps']))
-    # Always the epoch's whole set of rows (a fixed count, so a captured
-    # update keeps its shapes); untrainable steps are masked in the loss.
-    self._update(self.training_rows if self.async_collection else
-                 torch.arange(self.segments, device=device))
-    totals = self._totals
+    # Every loss is a masked mean over the (segment, step) grid of the
+    # epoch's whole set of rows (a fixed count, so a captured update keeps
+    # its shapes), the same number as indexing out the trainable rows first
+    # without the data-dependent shapes that force a GPU sync on every step.
+    totals = self.ppo.update(rows, rollout_values, advantages, returns,
+                             trainable)
 
-    if self.overlap_collection:
+    if collector.overlap:
       # The update is queued on the GPU; keep the envs busy until it is done.
       finished = torch.cuda.Event()
       finished.record()
-      self._collect_while(finished.query)
-      self._sync_acting_policy()
+      collector.collect_while(finished.query)
+      collector.sync_acting_policy()
 
     profile('train_misc', epoch)
     self.active_steps += trainable.sum()
 
     if log_epoch:
-      for name, value in zip(self.LOSS_NAMES,
+      for name, value in zip(PpoUpdate.LOSS_NAMES,
                              (totals / num_minibatches).tolist()):
         losses[name] = value
       active_steps = int(self.active_steps.item())
@@ -848,8 +894,8 @@ class FootballPuffeRL(pufferl.PuffeRL):
           advantages[trainable].std(unbiased=False),
           active.float().mean())).tolist()
       losses.update({
-          'optimizer_steps': float(self.optimizer_steps),
-          'update_captures': float(self.update_captures),
+          'optimizer_steps': float(self.ppo.optimizer_steps),
+          'update_captures': float(self.ppo.captures),
           'ppo_minibatches': float(num_minibatches),
           'active_agent_fraction': reward_signs[4],
           'active_transitions': float(trainable.sum().item()),
@@ -873,7 +919,8 @@ class FootballPuffeRL(pufferl.PuffeRL):
         sample_mask = trainable[index]
         post_logits, post_values = self.policy(
             self.observations[index],
-            {'done': self.terminals[index], **self._starting_memory(index)})
+            {'done': self.terminals[index],
+             **collector.starting_memory(index)})
         post_logits = post_logits.view(*sample_mask.shape, -1)[sample_mask]
         for name, value in policy_diagnostics(post_logits).items():
           losses[name] = value.item()
@@ -919,8 +966,6 @@ def _base_config():
 
 
 def _async_batch_workers(args, num_workers):
-  if not args.async_collection:
-    return None
   if args.async_batch_workers is not None:
     return args.async_batch_workers
   return max(1, num_workers // 3)
@@ -1155,8 +1200,8 @@ def build_parser():
                       help='keep recurrent memory across rollout segments '
                            '(cleared only at episode ends) and train each '
                            'segment from the memory it started with, instead '
-                           'of restarting memory every --bptt-horizon steps; '
-                           'needs --async-collection')
+                           'of restarting memory every --bptt-horizon '
+                           'steps')
   parser.add_argument('--frozen-defence-horizon', type=int, default=None,
                       help='steps a frozen evaluation or probe opponent '
                            'keeps memory before restarting it (0: whole '
@@ -1191,11 +1236,6 @@ def build_parser():
   # Throughput.  None of these change what PPO computes.
   parser.add_argument('--envs-per-worker', type=int, default=1,
                       help='matches stepped by each worker process')
-  parser.add_argument('--async-collection',
-                      action=argparse.BooleanOptionalAction, default=True,
-                      help='collect training segments from whichever '
-                           'matches are ready, so engine resets never stall '
-                           'other matches')
   parser.add_argument('--gpu-filler', action=argparse.BooleanOptionalAction,
                       default=True,
                       help='keep reported GPU utilization up with small '
@@ -1206,7 +1246,7 @@ def build_parser():
                       action=argparse.BooleanOptionalAction, default=True,
                       help='keep collecting while the PPO update runs on the '
                            'GPU, acting with a copy of the policy synced after '
-                           'every update (needs --async-collection)')
+                           'every update')
   parser.add_argument('--graph-update', action=argparse.BooleanOptionalAction,
                       default=True,
                       help='capture one whole-rollout PPO step (forward, '
@@ -1218,8 +1258,9 @@ def build_parser():
                       help='replay the acting forward and sampling as one '
                            'CUDA graph during async collection')
   parser.add_argument('--async-batch-workers', type=int, default=None,
-                      help='workers per policy batch with --async-collection '
-                           '(default: a third of the workers)')
+                      help='workers per collected batch (default: a third '
+                           'of the workers); matches run at their own pace, '
+                           'so engine resets never stall the others')
   parser.add_argument('--compile', action=argparse.BooleanOptionalAction,
                       default=False,
                       help='torch.compile the BPTT forward pass')
@@ -1233,9 +1274,11 @@ def build_parser():
 
 
 def _buffer_segments_per_agent(args):
-  """Rollout rows per agent: 1 in lockstep, more when matches run ahead."""
-  if not getattr(args, 'async_collection', False):
-    return 1
+  """Rollout rows per agent: matches run ahead of the epoch being trained.
+
+  Room for the epoch being trained and one segment in progress per match,
+  plus, with overlap, the segments completed while the update runs.
+  """
   return 3 if getattr(args, 'overlap_collection', False) else 2
 
 
@@ -1256,8 +1299,6 @@ def build_config(args, num_agents):
       'adam_beta2': 0.999,
       'adam_eps': 1e-5,
       'anneal_lr': args.anneal_lr,
-      # Async collection keeps room for two segments per agent so matches
-      # that run ahead keep writing while slow ones finish theirs.
       'batch_size': num_agents * horizon * _buffer_segments_per_agent(args),
       'bptt_horizon': horizon,
       'checkpoint_interval': 200,
@@ -1318,10 +1359,9 @@ def benchmark(trainer, epochs, warmup=5):
     rollout += middle - started
     update += time.perf_counter() - middle
   steps = trainer.global_step - steps
-  trained = epochs * (
-      trainer.blocks_per_epoch * trainer.agents_per_env
-      if trainer.async_collection else trainer.segments
-  ) * trainer.config['bptt_horizon']
+  collector = trainer.collector
+  trained = (epochs * collector.blocks_per_epoch * collector.agents_per_env *
+             trainer.config['bptt_horizon'])
   return {
       'trained_samples': trained,
       'trained_sps': trained / (rollout + update),
@@ -1332,7 +1372,7 @@ def benchmark(trainer, epochs, warmup=5):
       'sps': steps / (rollout + update),
       'rollout_sps': steps / rollout,
       'update_fraction': update / (rollout + update),
-      'optimizer_steps': trainer.optimizer_steps,
+      'optimizer_steps': trainer.ppo.optimizer_steps,
   }
 
 
@@ -1404,7 +1444,6 @@ def main():
       'adr_probe_defence': args.adr_probe_defence,
       'adr_probe_refresh_interval': args.adr_probe_refresh_interval,
       'adr_probe_refresh_margin': args.adr_probe_refresh_margin,
-      'async_collection': args.async_collection,
       'overlap_collection': args.overlap_collection,
       'carry_lstm_memory': args.carry_lstm_memory,
       'frozen_defence_horizon': args.frozen_defence_horizon,
@@ -1426,10 +1465,7 @@ def main():
       graph_actor=args.graph_actor,
       graph_update=args.graph_update,
       carry_memory=args.carry_lstm_memory)
-  # Probe results arrive in episode infos, which only the asynchronous
-  # collector (the default) hands to the trainer as episodes finish.
-  if not trainer.async_collection:
-    raise ValueError('ADR needs --async-collection')
+  # Probe results arrive in the episode infos the collector hands over.
   trainer.adr = adr.AutomaticDomainRandomization(
       shared=adr_shared, buffer_size=args.adr_buffer_size,
       low_threshold=args.adr_low_threshold,
@@ -1470,7 +1506,8 @@ def main():
         metrics['evaluation_wall_seconds'] = time.time() - started
         trainer.evaluation_metrics = metrics
         print('ADR {}'.format(json.dumps(
-            {'epoch': trainer.epoch, 'optimizer_steps': trainer.optimizer_steps,
+            {'epoch': trainer.epoch,
+             'optimizer_steps': trainer.ppo.optimizer_steps,
              **metrics}, sort_keys=True)), flush=True)
       trainer.evaluate()
       trainer.train()
