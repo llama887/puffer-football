@@ -166,6 +166,30 @@ def test_memory_restarts_every_window_and_at_every_episode_start():
     assert fresh == [True, False, False, False, False], fresh
 
 
+def test_defence_noise_is_independent_of_an_evaluated_policy_with_its_seed():
+  """An evaluation pool's match 0 gets the evaluation seed, so its defence
+  and the evaluated policy's PolicyPlayer share (seed, match 0, step): their
+  sampling noise must still differ, or the two sides' actions correlate."""
+  from gfootball.env.puffer_policy import PolicyPlayer
+  with tempfile.TemporaryDirectory() as directory:
+    path = os.path.join(directory, 'uniform.pt')
+    torch.manual_seed(0)
+    policy = FootballPolicy(_spaces(115), hidden_size=16)
+    with torch.no_grad():
+      policy.actor.weight.zero_()
+      policy.actor.bias.zero_()
+    save_policy_snapshot(policy, path)
+    # Uniform logits: each action is the argmax of the noise alone.
+    side = defence.Defence(path, ACTIONS, seed=11)
+    side.start_episode()
+    evaluated = PolicyPlayer(policy, 2, 11, None, seed=11)
+    rows = np.full((11, 115), 0.1, np.float32)
+    same = [np.array_equal(side.act(rows, _frames()),
+                           evaluated.act(rows, [0])[0].numpy())
+            for _ in range(5)]
+    assert not any(same), same
+
+
 if __name__ == '__main__':
   for test_name, test in sorted(globals().items()):
     if test_name.startswith('test_'):

@@ -422,16 +422,20 @@ class PolicyPlayer:
   start).  Sampling: argmax(logits + Gumbel noise) with the noise keyed on
   (seed, match, that match's step), so a match gets the same actions
   whichever other matches share its batch and in whatever order they report.
+  Players that may meet the same (seed, match, step), like an evaluated
+  policy and its pool's frozen defence, take different `stream` tags so
+  their noise stays independent.
   """
 
   def __init__(self, policy, matches, rows, memory_window, seed,
-               device='cpu'):
+               device='cpu', stream=0):
     if memory_window is not None and memory_window < 1:
       raise ValueError('memory_window must be positive or None')
     self.policy = policy
     self._rows = int(rows)
     self._memory_window = memory_window
     self._device = device
+    self._stream = int(stream)
     self._hidden = torch.zeros(int(matches) * self._rows, policy.hidden_size,
                                device=device)
     self._cell = torch.zeros_like(self._hidden)
@@ -476,9 +480,10 @@ class PolicyPlayer:
       noise = np.empty((len(match_ids), self._rows, logits.shape[-1]),
                        dtype=np.float32)
       for position, match in enumerate(match_ids):
-        uniform = np.random.default_rng(
-            (self._seed, int(match), int(self._steps[match]))).random(
-                noise.shape[1:])
+        key = (self._seed, int(match), int(self._steps[match]))
+        if self._stream:
+          key += (self._stream,)
+        uniform = np.random.default_rng(key).random(noise.shape[1:])
         noise[position] = -np.log(-np.log(
             np.clip(uniform, 1e-12, 1 - 1e-12)))
       actions = (logits.float() + torch.as_tensor(

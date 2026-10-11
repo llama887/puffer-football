@@ -30,10 +30,15 @@ import numpy as np
 RANDOM = 'random'
 IDLE = 'idle'
 _SIMPLE115 = 115
+# The PolicyPlayer noise stream of a snapshot side: an evaluation pool's
+# match 0 has the evaluation seed, so its defence and the evaluated policy
+# would otherwise draw the same noise.
+_NOISE_STREAM = 0xdef
 
 
 class Defence:
-  """One match's defending side: `act` maps its rows to 11 actions."""
+  """One side of one match played by a fixed policy (or random or idle
+  actions): `act` maps that side's 11 rows to 11 actions."""
 
   def __init__(self, spec, action_count, seed, memory_window=None,
                sort_players=True):
@@ -71,7 +76,7 @@ class Defence:
       self._player.clear(0)
 
   def act(self, rows, frames):
-    """Actions for the 11 defending agents.
+    """Actions for the side's 11 agents.
 
     `rows` are their rows of the match's own observation (normalized, before
     hiding); `frames` their raw simple115v2 frames, newest frame last.
@@ -107,5 +112,5 @@ class Defence:
       policy = load_frozen_policy(self._spec, SimpleNamespace(
           single_action_space=SimpleNamespace(n=self._action_count)))
       self._player = PolicyPlayer(policy, 1, 11, self._memory_window,
-                                  self._seed)
+                                  self._seed, stream=_NOISE_STREAM)
     return self._player
