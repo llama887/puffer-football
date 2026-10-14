@@ -61,7 +61,8 @@ GAMMA=${GAMMA:-0.995}
 GAE_LAMBDA=${GAE_LAMBDA:-0.927}
 # Potential-based shaping on ball progress toward the attacked goal
 # (Ng, Harada & Russell 1999): F = gamma*Phi(s') - Phi(s) with
-# Phi = BALL_POTENTIAL * ball x toward the attacked goal (in [-1, 1]); the
+# Phi = BALL_POTENTIAL * (1 - ball distance to the attacked goal centre),
+# i.e. ball x on the centre line and less off it; the
 # other team gets exactly the negative, so shaping is zero-sum.  Leaves the
 # optimal policy unchanged; 0 disables.  Uses GAMMA above as the discount,
 # which it must: a different discount leaves a real reward proportional

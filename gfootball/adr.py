@@ -10,12 +10,14 @@ edge outward one step and one at or below `low_threshold` moves it inward.
 Ranges therefore grow where the policy copes and shrink where it does not,
 each setting on its own.
 
-The ranges all start as single points, the start scene (a carrier at the
-ball 0.1 from the goal line, one blocker), and are clamped to each setting's
-valid limits.  They live in a shared-memory array (`shared_ranges`): the
-trainer's randomizer records probe results and moves edges, and every env
-worker's randomizer, built on the same array, samples from the current
-ranges with no message passing.  The scenario (SCENARIO) turns a sampled set
+The ranges all start at the start scene (a carrier at the ball 0.1 from the
+goal line, one blocker): single points, except ball_lateral, which starts
+wider than the goal posts so the carrier has to angle in from the first
+episode.  An edge moves outward no further than the setting's valid limits
+and inward no further than its start range.  The ranges live in a
+shared-memory array (`shared_ranges`): the trainer's randomizer records
+probe results and moves edges, and every env worker's randomizer, built on
+the same array, samples from the current ranges with no message passing.  The scenario (SCENARIO) turns a sampled set
 of values into a scene.  Evaluation scenes use fixed ranges instead
 (`set_difficulty`), the same for every run.
 """
@@ -38,15 +40,30 @@ LOOSE_BALL = 'loose_ball'
 Scene = collections.namedtuple(
     'Scene', ('attacking_left', 'held_directions', 'loose_ball'))
 
-ADRParameter = collections.namedtuple(
-    'ADRParameter', ('name', 'minimum', 'maximum', 'start', 'step'))
+
+class ADRParameter(collections.namedtuple(
+    'ADRParameter',
+    ('name', 'minimum', 'maximum', 'start', 'step', 'start_spread'),
+    defaults=(0.0,))):
+  """One randomized setting: valid limits, start value, step per edge move.
+
+  `start_spread` widens the start from a point to start +- start_spread.
+  """
+
+  @property
+  def start_range(self):
+    """(low, high) every run starts from; edges never shrink inside it."""
+    return (self.start - self.start_spread, self.start + self.start_spread)
+
 
 # Valid limits, the starting value and the step per edge move.
 PARAMETERS = (
     # Distance from the attacked goal line to the ball.
     ADRParameter('ball_distance', 0.05, 1.0, 0.10, 0.045),
-    # Ball y across the pitch.
-    ADRParameter('ball_lateral', -0.36, 0.36, 0.0, 0.02),
+    # Ball y across the pitch.  Starts at +-0.08, beyond the posts (|y|
+    # 0.044): from a point at 0, policies learned only a straight shot and
+    # the edge never got past the posts (2026-10-14 lateral analysis).
+    ADRParameter('ball_lateral', -0.36, 0.36, 0.0, 0.02, start_spread=0.08),
     # Goal-side blockers; fractional values add one more by chance.
     ADRParameter('blockers', 0.0, 5.0, 1.0, 0.2),
     # Distance from the still ball to the nearest attacker (0.03: the
@@ -75,11 +92,12 @@ def _uniform_values(ranges, rng):
 
 
 def shared_ranges():
-  """A shared-memory array holding every range, initialised to the starts."""
+  """A shared-memory array holding every range, initialised to the start
+  ranges."""
   array = multiprocessing.RawArray('d', 2 * len(PARAMETERS))
   view = np.frombuffer(array, dtype=np.float64).reshape(len(PARAMETERS), 2)
   for i, parameter in enumerate(PARAMETERS):
-    view[i] = parameter.start
+    view[i] = parameter.start_range
   return array
 
 
@@ -125,7 +143,7 @@ class AutomaticDomainRandomization:
   def set_difficulty(self, difficulty):
     """Fix every range at a test difficulty, for evaluation scenes.
 
-    Difficulty d spans each setting from its start value out to d of the way
+    Difficulty d spans each setting from its start range out to d of the way
     to each valid limit: 0 is the start scene, 1 every limit.  Unlike the
     ranges training reaches, these depend on d alone, so a score at a given
     d compares across runs and over time.
@@ -133,9 +151,10 @@ class AutomaticDomainRandomization:
     if not 0 <= difficulty <= 1:
       raise ValueError('difficulty must be in [0, 1]')
     for i, parameter in enumerate(PARAMETERS):
+      start_low, start_high = parameter.start_range
       self._ranges[i] = (
-          parameter.start - difficulty * (parameter.start - parameter.minimum),
-          parameter.start + difficulty * (parameter.maximum - parameter.start))
+          start_low - difficulty * (start_low - parameter.minimum),
+          start_high + difficulty * (parameter.maximum - start_high))
 
   def sample(self, rng):
     """Values for a training episode: each setting uniform in its range."""
@@ -168,7 +187,9 @@ class AutomaticDomainRandomization:
   def record(self, index, edge, success):
     """Add one probe result at a setting's edge; move the edge when due.
 
-    Returns True when this result triggered a move.
+    An edge moves outward no further than the setting's limit and inward no
+    further than its start range, so every run keeps practising the start
+    scene.  Returns True when this result triggered a move.
     """
     buffer = self._buffers[index][edge]
     buffer.append(float(success))
@@ -183,13 +204,16 @@ class AutomaticDomainRandomization:
     else:
       return False
     parameter = PARAMETERS[index]
+    start_low, start_high = parameter.start_range
     low, high = self._ranges[index]
+    # Moving in stops at the start range; an edge already inside it (set by
+    # hand or loaded from an older run) stays put rather than jump out.
     if edge == UPPER:
       high = (min(parameter.maximum, high + parameter.step) if outward
-              else max(low, high - parameter.step))
+              else max(low, min(high, start_high), high - parameter.step))
     else:
       low = (max(parameter.minimum, low - parameter.step) if outward
-             else min(high, low + parameter.step))
+             else min(high, max(low, start_low), low + parameter.step))
     moved = (low, high) != tuple(self._ranges[index])
     self._ranges[index] = (low, high)
     return moved

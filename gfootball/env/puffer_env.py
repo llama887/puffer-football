@@ -31,6 +31,8 @@ _BALL_STEP_SCALE = np.array([
     45.0 / 10.0,
 ], dtype=np.float32)
 _GOAL_HEIGHT = 2.5
+# simple115v2 y times this is in x units: x is metres / 54.4, y metres / 83.6.
+_Y_TO_X_DISTANCE = 83.6 / 54.4
 
 
 def _soft_scale(values, scale):
@@ -96,20 +98,32 @@ def sort_players_by_distance(observations):
   return observations
 
 
-def ball_potential(advance, scale):
+def ball_potential(advance, lateral, scale):
   """Potential of a state for the side attacking the goal at advance +1.
 
-  Ng, Harada and Russell (1999) shape with an estimate of V*; here it is how
-  far the ball has been carried toward the attacked goal line, in the [-1, 1]
-  pitch coordinate: +scale on that line, -scale on the far one.  The other
-  team's potential is this at -advance, i.e. exactly its negative, so the
+  Ng, Harada and Russell (1999) shape with an estimate of V*; here it is
+  scale * (1 - the ball's distance to the centre of the attacked goal), the
+  ball at (advance, lateral) in the [-1, 1] x [-0.42, 0.42] pitch frame and
+  y counted in x-distance units (83.6 / 54.4) so the distance is physical.
+  On the centre line this is scale * advance, the x-only potential it
+  replaces: +scale in the goal mouth, -scale on the far goal line.  Off the
+  centre line it is lower, so carrying the ball in from the wing is paid
+  for; the x-only form paid a straight run outside the posts exactly as
+  much as one between them, right up to the goal kick, and policies trained
+  with it never learned to angle in (2026-10-14 lateral analysis).
+
+  It reads only the ball's position, so it is a function of the state and
+  potential_shaping keeps the optimal policies unchanged.  The defending
+  team's potential is this negated (FootballPufferEnv._potentials), so the
   two teams' shaping cancels on every step, terminal correction included,
   and the shaped game stays zero-sum like the score.  An earlier form,
   -scale * (1 - advance), differed per team only by a constant but summed to
   -2 * scale, which paid both teams together 2 * scale * (1 - gamma) per
   step and 2 * scale at every episode end.
   """
-  return float(scale) * float(advance)
+  distance = np.hypot(1.0 - float(advance),
+                      float(lateral) * _Y_TO_X_DISTANCE)
+  return float(scale) * float(1.0 - distance)
 
 
 def potential_shaping(previous, current, gamma, terminal):
@@ -145,7 +159,7 @@ def closest_player_potential(positions, ball_position, scale):
   if not len(present):
     return 0.0
   delta = present - np.asarray(ball_position)[:2]
-  distance = np.hypot(delta[:, 0], delta[:, 1] * (83.6 / 54.4))
+  distance = np.hypot(delta[:, 0], delta[:, 1] * _Y_TO_X_DISTANCE)
   return -float(scale) * float(distance.min())
 
 
@@ -314,7 +328,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     Row zero is the left team's absolute view: left teammates occupy 0:22,
     right teammates 44:66, and the ball 88:90. Both teams approach that same
     ball; the episode's designated attacker only changes the return order.
-    Adding fixed state potentials preserves their telescoping
+    The ball term is ball_potential (distance to the attacked goal centre)
+    for the attack and exactly its negative for the defence, so it is
+    zero-sum.  Adding fixed state potentials preserves their telescoping
     property; both terms use the same discount and terminal correction.
     The player terms are weighted by settled_ball_weight of the observed
     ball speed (91:93), which is also part of the state.
@@ -322,16 +338,16 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     frame = np.asarray(raw_observations, dtype=np.float32).reshape(
         22, -1)[0, -115:]
     advance = self._ball_advance(raw_observations, self._attacking_left)
+    ball = ball_potential(advance, frame[89], self._ball_potential_scale)
     weight = settled_ball_weight(
-        np.hypot(frame[91], frame[92] * (83.6 / 54.4)),
+        np.hypot(frame[91], frame[92] * _Y_TO_X_DISTANCE),
         self._player_potential_fade_speed)
     left = weight * closest_player_potential(
         frame[:22], frame[88:90], self._player_potential_scale)
     right = weight * closest_player_potential(
         frame[44:66], frame[88:90], self._player_potential_scale)
     attack, defence = (left, right) if self._attacking_left else (right, left)
-    return (ball_potential(advance, self._ball_potential_scale) + attack,
-            ball_potential(-advance, self._ball_potential_scale) + defence)
+    return ball + attack, -ball + defence
 
   def _make_env(self):
     return football_env.create_environment(

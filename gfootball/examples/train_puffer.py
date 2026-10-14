@@ -1185,7 +1185,8 @@ def build_parser():
   parser.add_argument('--ball-potential', type=float, default=0.0,
                       help='potential-based shaping scale k: each side is '
                            'rewarded gamma*Phi(s\')-Phi(s) with Phi = k * '
-                           '(ball x toward the goal it attacks, in [-1, 1]); '
+                           '(1 - ball distance to the centre of the goal it '
+                           'attacks), ball x on the centre line; '
                            'the other team gets exactly the negative, so '
                            'shaping is zero-sum and leaves the optimal '
                            'policy unchanged (Ng, Harada & Russell 1999); '

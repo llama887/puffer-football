@@ -9,21 +9,47 @@ import numpy as np
 
 from gfootball import adr
 
+# The goal posts' |y| in the pitch frame.
+POST_Y = 0.044
+
 
 def _fresh(**kwargs):
   return adr.AutomaticDomainRandomization(**kwargs)
 
 
-def test_ranges_start_as_points_at_the_start_scene():
-  """Every range starts as the single start value, inside its limits."""
+def test_ranges_start_at_the_start_scene():
+  """Every range starts as its start range, inside its limits: a single
+  point for every setting except ball_lateral."""
   randomizer = _fresh()
   ranges = randomizer.ranges()
   assert ranges.shape == (len(adr.PARAMETERS), 2)
   for (low, high), parameter in zip(ranges, adr.PARAMETERS):
-    assert low == high == parameter.start
-    assert parameter.minimum <= parameter.start <= parameter.maximum
+    assert (low, high) == parameter.start_range
+    assert parameter.minimum <= low <= parameter.start <= high
+    assert high <= parameter.maximum
+    if parameter.name != 'ball_lateral':
+      assert low == high == parameter.start
   values = randomizer.sample(np.random.default_rng(0))
-  assert values == {p.name: p.start for p in adr.PARAMETERS}
+  assert {name: value for name, value in values.items()
+          if name != 'ball_lateral'} == {
+              p.name: p.start for p in adr.PARAMETERS
+              if p.name != 'ball_lateral'}
+
+
+def test_ball_lateral_starts_wider_than_the_posts():
+  """From the first episode the ball starts beside the goal mouth as well as
+  in it, so a straight shot is not enough and the carrier has to angle in a
+  little.  Started at a point, ADR policies learned only to go straight and
+  the edge never got past the posts (2026-10-14 lateral analysis)."""
+  low, high = _fresh().ranges()[adr.PARAMETER_INDEX['ball_lateral']]
+  assert low < -POST_Y and high > POST_Y
+  assert high - POST_Y >= 0.02 and -POST_Y - low >= 0.02
+  assert high <= 0.12 and low >= -0.12  # wide, but not far out on the wing
+  rng = np.random.default_rng(3)
+  draws = np.array([_fresh().sample(rng)['ball_lateral']
+                    for _ in range(2000)])
+  outside = np.mean(np.abs(draws) > POST_Y)
+  assert 0.25 < outside < 0.75, outside
 
 
 def test_training_samples_are_uniform_over_every_current_range():
@@ -97,12 +123,39 @@ def test_edges_respect_the_limits_and_never_cross():
       randomizer.record(index, adr.LOWER, 1)
     np.testing.assert_allclose(randomizer.ranges()[index],
                                [parameter.minimum, parameter.maximum])
-  point = _fresh(buffer_size=1)
+  start = _fresh(buffer_size=1)
   for index, parameter in enumerate(adr.PARAMETERS):
-    point.record(index, adr.UPPER, 0)
-    point.record(index, adr.LOWER, 0)
-    low, high = point.ranges()[index]
-    assert low == high == parameter.start
+    start.record(index, adr.UPPER, 0)
+    start.record(index, adr.LOWER, 0)
+    assert tuple(start.ranges()[index]) == parameter.start_range
+
+
+def test_edges_never_shrink_inside_the_start_range():
+  """Failing edges come back in, but no further than the start range: every
+  run keeps practising the start scene, and ball_lateral keeps the balls
+  beside the posts even while the policy cannot score from there yet."""
+  randomizer = _fresh(buffer_size=1)
+  index = adr.PARAMETER_INDEX['ball_lateral']
+  parameter = adr.PARAMETERS[index]
+  for _ in range(3):
+    randomizer.record(index, adr.UPPER, 1)
+    randomizer.record(index, adr.LOWER, 1)
+  low, high = randomizer.ranges()[index]
+  np.testing.assert_allclose(
+      [low, high], [parameter.start_range[0] - 3 * parameter.step,
+                    parameter.start_range[1] + 3 * parameter.step])
+  for _ in range(10):
+    randomizer.record(index, adr.UPPER, 0)
+    randomizer.record(index, adr.LOWER, 0)
+  np.testing.assert_allclose(randomizer.ranges()[index],
+                             parameter.start_range)
+  # A range set (or loaded from an older run) clear of the start range
+  # never jumps outward to it on a failure; it just stops moving in.
+  randomizer.set_range('ball_distance', 0.3, 0.5)
+  distance = adr.PARAMETER_INDEX['ball_distance']
+  for _ in range(3):
+    randomizer.record(distance, adr.LOWER, 0)
+  np.testing.assert_allclose(randomizer.ranges()[distance], [0.3, 0.5])
 
 
 def test_workers_share_the_ranges_through_shared_memory():
@@ -132,13 +185,13 @@ def test_entropy_rises_as_ranges_widen():
 
 
 def test_difficulty_spans_a_fixed_share_of_the_way_to_the_limits():
-  """A test difficulty d fixes every range from its start value out to d of
+  """A test difficulty d fixes every range from its start range out to d of
   the way to each valid limit: 0 is the start scene, 1 every limit.  The
   same d always gives the same ranges, so scores compare across runs."""
   randomizer = _fresh()
   randomizer.set_difficulty(0.0)
   for (low, high), parameter in zip(randomizer.ranges(), adr.PARAMETERS):
-    assert low == high == parameter.start
+    assert (low, high) == parameter.start_range
   randomizer.set_difficulty(1.0)
   for (low, high), parameter in zip(randomizer.ranges(), adr.PARAMETERS):
     assert (low, high) == (parameter.minimum, parameter.maximum)
@@ -146,8 +199,10 @@ def test_difficulty_spans_a_fixed_share_of_the_way_to_the_limits():
   for (low, high), parameter in zip(randomizer.ranges(), adr.PARAMETERS):
     np.testing.assert_allclose(
         [low, high],
-        [parameter.start - 0.25 * (parameter.start - parameter.minimum),
-         parameter.start + 0.25 * (parameter.maximum - parameter.start)])
+        [parameter.start_range[0] -
+         0.25 * (parameter.start_range[0] - parameter.minimum),
+         parameter.start_range[1] +
+         0.25 * (parameter.maximum - parameter.start_range[1])])
   for bad in (-0.1, 1.5):
     try:
       randomizer.set_difficulty(bad)

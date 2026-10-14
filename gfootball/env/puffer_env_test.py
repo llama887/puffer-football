@@ -614,10 +614,10 @@ class PufferEnvTest(absltest.TestCase):
     This is the return identity required for policy invariance.
     """
     gamma, scale = 0.9, 2.0
-    self.assertEqual(puffer_env.ball_potential(1.0, scale), 2.0)
-    self.assertEqual(puffer_env.ball_potential(-1.0, scale), -2.0)
-    for advances in ([0.9, 0.95, 1.0], [0.9, 0.5, 0.2, 0.7], [0.3]):
-      potentials = [puffer_env.ball_potential(a, scale) for a in advances]
+    for path in ([(0.9, 0.1), (0.95, 0.05), (1.0, 0.0)],
+                 [(0.9, -0.2), (0.5, 0.0), (0.2, 0.3), (0.7, -0.1)],
+                 [(0.3, 0.1)]):
+      potentials = [puffer_env.ball_potential(a, y, scale) for a, y in path]
       total = 0.0
       for index in range(1, len(potentials)):
         total += gamma ** (index - 1) * puffer_env.potential_shaping(
@@ -628,23 +628,61 @@ class PufferEnvTest(absltest.TestCase):
       self.assertAlmostEqual(total, -potentials[0])
     # Progress toward the goal is paid for as it happens ...
     self.assertGreater(puffer_env.potential_shaping(
-        puffer_env.ball_potential(0.9, 1.0),
-        puffer_env.ball_potential(0.95, 1.0), 1.0, False), 0)
+        puffer_env.ball_potential(0.9, 0.0, 1.0),
+        puffer_env.ball_potential(0.95, 0.0, 1.0), 1.0, False), 0)
     # ... and moving away costs the same amount back.
     self.assertLess(puffer_env.potential_shaping(
-        puffer_env.ball_potential(0.95, 1.0),
-        puffer_env.ball_potential(0.9, 1.0), 1.0, False), 0)
+        puffer_env.ball_potential(0.95, 0.0, 1.0),
+        puffer_env.ball_potential(0.9, 0.0, 1.0), 1.0, False), 0)
+
+  def test_ball_potential_rises_toward_the_attacked_goal_centre(self):
+    """Phi = scale * (1 - distance from the ball to the attacked goal centre).
+
+    On the centre line it is the old x-only potential (scale * advance), so
+    straight attacks are shaped exactly as before.  Off the centre line it is
+    lower, so carrying the ball in from the wing pays and a straight run that
+    stays wide of the posts earns less than one between them.  y counts in
+    x-distance units (83.6 / 54.4), like the player potential.
+    """
+    for advance in (-1.0, -0.3, 0.0, 0.9, 1.0):
+      self.assertAlmostEqual(
+          puffer_env.ball_potential(advance, 0.0, 2.0), 2.0 * advance)
+    self.assertAlmostEqual(
+        puffer_env.ball_potential(0.9, 0.1, 1.0),
+        1.0 - np.hypot(0.1, 0.1 * 83.6 / 54.4), places=6)
+    self.assertEqual(puffer_env.ball_potential(0.6, 0.2, 1.0),
+                     puffer_env.ball_potential(0.6, -0.2, 1.0))
+    # Moving in along the goal line toward the centre is paid for ...
+    self.assertGreater(puffer_env.potential_shaping(
+        puffer_env.ball_potential(0.95, 0.1, 1.0),
+        puffer_env.ball_potential(0.95, 0.05, 1.0), 1.0, False), 0)
+    # ... and a straight run outside the posts reaches less than one inside.
+    self.assertLess(puffer_env.ball_potential(1.0, 0.06, 1.0),
+                    puffer_env.ball_potential(1.0, 0.0, 1.0))
 
   def test_ball_shaping_is_zero_sum_between_the_teams(self):
     """Each team's ball potential is the other's negative.
 
     The score is zero-sum across the 22 players, so the shaping must be too:
     on every step, including the terminal correction and across an episode
-    reset, all 22 rewards sum to zero.
+    reset, all 22 rewards sum to zero.  The defence's potential is the
+    attack's negated, wherever the ball is and whichever side attacks.
     """
-    for advance in (-1.0, -0.3, 0.0, 0.9, 1.0):
-      self.assertEqual(puffer_env.ball_potential(advance, 2.0) +
-                       puffer_env.ball_potential(-advance, 2.0), 0.0)
+    env = object.__new__(puffer_env.FootballPufferEnv)
+    env._ball_potential_scale = 2.0
+    env._player_potential_scale = 0.0
+    env._player_potential_fade_speed = 0.0
+    raw = np.zeros((22, 115), dtype=np.float32)
+    for attacking_left in (True, False):
+      env._attacking_left = attacking_left
+      for ball in ((-1.0, 0.0), (-0.3, 0.2), (0.0, -0.1), (0.9, 0.06)):
+        raw[0, 88:90] = ball
+        attack, defence = env._potentials(raw)
+        self.assertAlmostEqual(attack + defence, 0.0, places=6)
+        advance = ball[0] if attacking_left else -ball[0]
+        self.assertAlmostEqual(
+            attack, puffer_env.ball_potential(advance, ball[1], 2.0),
+            places=6)
     env = puffer_env.FootballPufferEnv(
         frame_stack=1, seed=7,
         ball_potential_scale=1.0,
@@ -727,7 +765,8 @@ class PufferEnvTest(absltest.TestCase):
     raw[0, :2] = (0.4, 0.1)
     raw[0, 44:46] = (0.9, 0.1)
     raw[0, 88:90] = (0.6, 0.1)
-    ball = (0.5 * 0.6, -0.5 * 0.6)
+    attack_ball = 0.5 * (1.0 - np.hypot(0.4, 0.1 * 83.6 / 54.4))
+    ball = (attack_ball, -attack_ball)
     np.testing.assert_allclose(
         env._potentials(raw), (ball[0] - 0.2, ball[1] - 0.3), atol=1e-6)
     raw[0, 91] = 1.0  # struck along the pitch: the player term vanishes

@@ -302,10 +302,13 @@ meanwhile, so no kick is provably a no-op from the observation.
 #### Reward shaping
 
 `BALL_POTENTIAL=k` adds potential-based reward shaping on the ball's progress:
-every step pays `gamma * Phi(s') - Phi(s)` with `Phi = k * x`, where `x` is
-the ball's position toward the goal that side attacks (in [-1, 1]), and
-`Phi = 0` in the absorbing state.  The other team gets exactly `-Phi`, so
-shaping is zero-sum like the score, and by Ng, Harada and Russell (1999,
+every step pays `gamma * Phi(s') - Phi(s)` with `Phi = k * (1 - d)`, where `d`
+is the ball's distance to the centre of the goal that side attacks (x in
+[-1, 1], y converted to the same physical units), and `Phi = 0` in the
+absorbing state.  On the centre line this is `k * x`; off it, carrying the
+ball in from the wing pays, where an x-only potential paid a straight run
+wide of the posts as much as one between them.  The other team gets exactly
+`-Phi`, so shaping is zero-sum like the score, and by Ng, Harada and Russell (1999,
 Theorem 1) it leaves the optimal policy unchanged.  The trainer's `--gamma`
 is used for the whole potential difference; it must match PPO's discount for
 that guarantee.  Rewards are stored unclipped: clipping to [-1, 1] would cut
@@ -328,7 +331,10 @@ speed reaches `v` (ball-direction units: a dribbled ball stays under about
 
 Training scenes come from automatic domain randomization (OpenAI, "Solving
 Rubik's Cube with a Robot Hand", 2019, Section 5; `gfootball/adr.py`).  Eight
-scene settings each get a range that starts at a single start value: ball
+scene settings each get a range that starts at the start scene, a single
+value for every setting except the ball's lateral position, which starts at
++-0.08, wider than the posts (+-0.044), so the carrier has to angle in from
+the first episode.  The settings are ball
 distance from the goal line, ball lateral position, goal-side blockers, fetch
 distance to a still ball, the defence's head start in the race for it,
 attackers ahead of the ball, how far the formations are from packed around
@@ -343,7 +349,8 @@ corner or throw-in would otherwise freeze the match until the timeout.
 one edge of its range, and the attack plays against the probe defence, whose
 rows are hidden from training.  After `ADR_BUFFER_SIZE` (64) probes at an
 edge, a success rate of at least `ADR_HIGH_THRESHOLD` (0.6) moves that edge
-outward one step and at most `ADR_LOW_THRESHOLD` (0.3) moves it inward.
+outward one step and at most `ADR_LOW_THRESHOLD` (0.3) moves it inward, but
+never inside the start range.
 
 The probe defence matters.  With `ADR_PROBE_DEFENCE=random` (uniform random
 defenders, which score the same as defenders standing still), the October 4
@@ -400,7 +407,10 @@ Results of the October runs, against the fixed defender on the old level
 The level curriculum these were compared with has been removed; the commit
 before the removal is tagged `pre-adr-only`.  The ADR policies only score
 with the ball starting between the posts, and the ball's lateral range never
-grew past about 0.06 (2026-10-09 analysis, outside this repo).
+grew past about 0.06 (2026-10-09 analysis, outside this repo): they had
+learned only to go straight, and gave the moves toward the goal centre a
+probability of 1e-9 to 1e-3 (2026-10-14).  Hence the goal-centre ball
+potential and the wider lateral start.
 
 #### Scoring runs against a fixed defence
 
