@@ -309,7 +309,15 @@ def build_scenario(builder):
   settings = values.get(adr.VALUES) or {
       parameter.name: parameter.start for parameter in adr.PARAMETERS}
   rng = random.Random('{}:{}:adr'.format(seed, episode))
-  attack_right = ((seed + episode) // _DIRECTION_PERIOD) % 2 == 0
+  attacking_team = values.get(adr.ATTACKING_TEAM)
+  if attacking_team is None:
+    attack_right = ((seed + episode) // _DIRECTION_PERIOD) % 2 == 0
+  elif attacking_team in ('left', 'right'):
+    # The left team attacks the goal on the right.
+    attack_right = attacking_team == 'left'
+  else:
+    raise ValueError('{} must be left or right, got {!r}'.format(
+        adr.ATTACKING_TEAM, attacking_team))
   builder._config['reverse_team_processing'] = not attack_right
   direction = 1.0 if attack_right else -1.0
   distance = float(settings['ball_distance'])

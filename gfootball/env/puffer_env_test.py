@@ -451,6 +451,78 @@ class PufferEnvTest(absltest.TestCase):
       finally:
         env.close()
 
+  def test_adr_bot_probes_attack_from_the_left_against_the_built_in_ai(self):
+    """With adr_probe_defence 'bot' a probe is played in a second engine
+    whose right team has no agents, so the engine's own AI defends at the
+    shared bot difficulty (players handed to the AI with builtin_ai do not
+    defend with the magnet off).  Agents control the left team there, so
+    the left team always attacks.  The bot's rows are hidden and get no
+    reward, the bot really defends (its nearest player closes on the ball;
+    handed over with builtin_ai they walked away from it), and a new
+    difficulty applies from the next episode."""
+    shared = adr.shared_ranges()
+    bot = adr.shared_bot_difficulty()
+    for observation in ('entities', 'simple115'):
+      env = puffer_env.FootballPufferEnv(
+          frame_stack=1, seed=11, observation=observation, adr_shared=shared,
+          adr_probe_fraction=1.0, adr_probe_defence='bot', bot_difficulty=bot)
+      try:
+        bot.value = 0.05
+        observations, _ = env.reset()
+        self.assertEqual(env._defending_rows(), slice(11, 22))
+        self.assertFalse(np.any(observations[11:]))
+        self.assertTrue(np.all(np.any(observations[:11], axis=1)))
+        self.assertAlmostEqual(
+            env._engine.unwrapped._config[adr.BOT_DIFFICULTY], 0.05)
+        bot.value = 0.35
+        nearest, infos = [], []
+        for _ in range(800):
+          observations, rewards, _, _, infos = env.step(
+              np.zeros(22, dtype=np.int32))
+          self.assertFalse(np.any(rewards[11:]))
+          if infos:
+            break
+          self.assertFalse(np.any(observations[11:]))
+          if observation == 'entities':
+            view = env._raw_views[0]
+            nearest.append(np.linalg.norm(
+                np.asarray(view['right_team'])[1:] -
+                np.asarray(view['ball'][:2]), axis=1).min())
+        self.assertTrue(infos, 'episode must end')
+        self.assertEqual(infos[0]['adr_probe'], 1.0)
+        self.assertEqual(infos[0]['attacking_left'], 1.0)
+        if observation == 'entities':
+          self.assertLess(min(nearest), 0.5 * nearest[0],
+                          'the bot must close on the ball')
+        self.assertAlmostEqual(
+            env._engine.unwrapped._config[adr.BOT_DIFFICULTY], 0.35)
+      finally:
+        env.close()
+
+  def test_bot_defence_plays_every_episode_and_its_engine_starts_lazily(self):
+    """frozen_defence_path 'bot' (an evaluation pool) plays every episode
+    against the bot; a training env whose probes are bot probes builds the
+    second engine only when its first probe comes, so an env with no
+    probes never pays for it."""
+    env = puffer_env.FootballPufferEnv(
+        frame_stack=1, seed=5, observation='entities',
+        frozen_defence_path='bot', adr_probe_fraction=0.0)
+    try:
+      for _ in range(2):
+        observations, _ = env.reset()
+        self.assertEqual(env._defending_rows(), slice(11, 22))
+        self.assertFalse(np.any(observations[11:]))
+    finally:
+      env.close()
+    env = puffer_env.FootballPufferEnv(
+        frame_stack=1, seed=5, observation='entities',
+        adr_probe_fraction=0.0, adr_probe_defence='bot')
+    try:
+      env.reset()
+      self.assertIsNone(env._bot_env)
+    finally:
+      env.close()
+
   def test_adr_probe_defence_snapshot_plays_probes_and_reloads_when_replaced(
       self):
     """With adr_probe_defence set to a snapshot, probe episodes are defended
@@ -610,6 +682,25 @@ class PufferEnvTest(absltest.TestCase):
                                0.05, places=6)
         self.assertAlmostEqual(cfg.ScenarioConfig().right_team_difficulty,
                                0.05, places=6)
+
+  def test_attacking_team_can_be_fixed_to_the_left(self):
+    """The attacking side normally alternates every few episodes; the
+    config value ATTACKING_TEAM 'left' makes the left team attack every
+    episode (the bot engine, where agents control only the left team)."""
+    sides = set()
+    for seed in range(3):
+      cfg = _scene_config(seed=seed)
+      for _ in range(17):
+        cfg.NewScenario()
+        sides.add(cfg.ScenarioConfig().ball_position[0] > 0)
+    self.assertEqual(sides, {True, False})
+    for seed in range(3):
+      cfg = _scene_config(seed=seed)
+      cfg._values[adr.ATTACKING_TEAM] = 'left'
+      for _ in range(17):
+        cfg.NewScenario()
+        self.assertGreater(cfg.ScenarioConfig().ball_position[0], 0)
+        self.assertFalse(cfg._values['reverse_team_processing'])
 
   def test_second_blocker_mirrors_the_first_and_the_third_fills_the_middle(self):
     """Two blockers must leave the shot line open; only the third closes it."""

@@ -250,6 +250,72 @@ def test_a_pinned_probe_reads_one_snapshot_of_the_ranges():
   assert values['blockers'] == 2.0, values['blockers']
 
 
+def test_clearing_probe_results_starts_every_edge_afresh():
+  """Results recorded against an old probe defence are dropped, so the next
+  edge move is decided only by results against the new one."""
+  randomizer = _fresh(buffer_size=4)
+  index = adr.PARAMETER_INDEX['blockers']
+  for _ in range(3):
+    randomizer.record(index, adr.UPPER, 1)
+  randomizer.clear_probe_results()
+  assert not randomizer.record(index, adr.UPPER, 1)
+  assert randomizer.ranges()[index][1] == adr.PARAMETERS[index].start
+
+
+def test_bot_ladder_starts_easy_and_shares_its_difficulty():
+  """The ladder starts at the easy bot (0.05) and writes the current
+  difficulty to shared memory, which every env worker reads."""
+  shared = adr.shared_bot_difficulty()
+  ladder = adr.BotLadder(shared=shared)
+  assert ladder.difficulty == adr.BOT_LADDER[0] == 0.05
+  assert shared.value == 0.05
+  assert list(adr.BOT_LADDER) == sorted(adr.BOT_LADDER)
+  assert adr.BOT_LADDER[-1] <= 1.0
+
+
+def test_bot_ladder_steps_up_after_consecutive_toothless_checks():
+  """Bite = 1 - goals vs bot / goals vs idle defenders on the same scenes.
+  Two checks in a row with bite below 0.2 mean the bot barely costs the
+  attack anything, so the ladder moves to the next bot and restarts its
+  count; a biting check in between restarts the count."""
+  shared = adr.shared_bot_difficulty()
+  ladder = adr.BotLadder(shared=shared)
+  metrics = ladder.check(vs_bot=0.45, vs_idle=0.5)  # bite 0.1
+  assert np.isclose(metrics['bot/bite'], 0.1)
+  assert metrics['bot/raised'] == 0.0 and metrics['bot/toothless_checks'] == 1
+  ladder.check(vs_bot=0.2, vs_idle=0.5)  # bite 0.6: count restarts
+  ladder.check(vs_bot=0.45, vs_idle=0.5)
+  assert ladder.difficulty == 0.05
+  metrics = ladder.check(vs_bot=0.48, vs_idle=0.5)
+  assert metrics['bot/raised'] == 1.0
+  assert ladder.difficulty == adr.BOT_LADDER[1] == shared.value
+  assert metrics['bot/difficulty'] == adr.BOT_LADDER[1]
+  assert metrics['bot/toothless_checks'] == 0
+  assert ladder.check(vs_bot=0.45, vs_idle=0.5)['bot/raised'] == 0.0
+
+
+def test_bot_ladder_skips_checks_too_noisy_to_judge():
+  """With few goals even against idle defenders the bite ratio is noise:
+  such a check neither counts toward stepping up nor restarts the count."""
+  ladder = adr.BotLadder(shared=adr.shared_bot_difficulty())
+  ladder.check(vs_bot=0.45, vs_idle=0.5)
+  metrics = ladder.check(vs_bot=0.05, vs_idle=0.1)
+  assert np.isnan(metrics['bot/bite'])
+  assert metrics['bot/toothless_checks'] == 1
+  assert ladder.check(vs_bot=0.45, vs_idle=0.5)['bot/raised'] == 1.0
+  # No goals at all against idle defenders: nothing to divide by.
+  lenient = adr.BotLadder(shared=adr.shared_bot_difficulty(),
+                          minimum_idle_rate=0.0)
+  assert np.isnan(lenient.check(vs_bot=0.0, vs_idle=0.0)['bot/bite'])
+
+
+def test_bot_ladder_stops_at_the_hardest_bot():
+  ladder = adr.BotLadder(shared=adr.shared_bot_difficulty())
+  for _ in range(4 * len(adr.BOT_LADDER)):
+    ladder.check(vs_bot=0.5, vs_idle=0.5)
+  assert ladder.difficulty == adr.BOT_LADDER[-1]
+
+
 def _middle_half(name):
   parameter = adr.PARAMETERS[adr.PARAMETER_INDEX[name]]
   span = parameter.maximum - parameter.minimum

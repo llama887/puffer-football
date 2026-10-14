@@ -403,16 +403,14 @@ def test_adr_probe_defence_is_replaced_only_when_clearly_weaker_than_self_play()
 
 
 def test_adr_probe_defence_starts_from_the_learner_or_a_file():
-  """By default ('self') the probe defence starts as the learner's own
-  starting weights, so a run needs no probe file and the refresh grows the
-  defence from there; a given file is copied instead, and random or idle
-  write nothing (they are never refreshed)."""
+  """'self' starts the probe defence as the learner's own starting weights,
+  so a run needs no probe file and the refresh grows the defence from
+  there; a given file is copied instead, and the bot, random or idle write
+  nothing (they are never refreshed)."""
   import os
   import tempfile
   from gfootball.env.puffer_policy import load_frozen_policy
   from gfootball.examples import train_puffer
-  defaults = build_parser().parse_args([])
-  assert defaults.adr_probe_defence == 'self'
   torch.manual_seed(0)
   learner = FootballPolicy(_env(), hidden_size=16).eval()
   other = FootballPolicy(_env(), hidden_size=16).eval()
@@ -429,10 +427,118 @@ def test_adr_probe_defence_starts_from_the_learner_or_a_file():
         assert torch.allclose(restored.forward_eval(observations, {})[0],
                               expected.forward_eval(observations, {})[0])
       os.remove(path)
-    for spec in ('random', 'idle'):
+    for spec in ('bot', 'random', 'idle'):
       args = build_parser().parse_args(['--adr-probe-defence', spec])
       train_puffer.start_adr_probe_defence(args, learner, path)
       assert not os.path.exists(path)
+
+
+def test_bot_probes_and_the_bot_check_are_the_default():
+  """The built-in bot defends the ADR probes by default; the bot check runs
+  every 1000 epochs on 128 episodes, raising the bot after two checks in a
+  row with bite below 0.2 (checks with fewer than 0.15 goals against idle
+  defenders are skipped)."""
+  defaults = build_parser().parse_args([])
+  assert defaults.adr_probe_defence == 'bot'
+  assert defaults.bot_check_interval == 1000
+  assert defaults.bot_check_episodes == 128
+  assert defaults.bot_saturation_bite == 0.2
+  assert defaults.bot_toothless_checks == 2
+  assert defaults.bot_minimum_idle_rate == 0.15
+
+
+def test_bot_check_interval_is_checked_up_front():
+  """The bot check runs on evaluation epochs, so its interval must be a
+  multiple of --evaluation-interval; refused before training starts."""
+  from gfootball import adr
+  from gfootball.examples.train_puffer import BotCheck
+  args = build_parser().parse_args(['--evaluation-interval', '100',
+                                    '--bot-check-interval', '250'])
+  try:
+    BotCheck(args, evaluator=None, shared=adr.shared_bot_difficulty())
+  except ValueError:
+    pass
+  else:
+    raise AssertionError('interval 250 with evaluations every 100 accepted')
+  args = build_parser().parse_args(['--evaluation-interval', '100'])
+  check = BotCheck(args, evaluator=None, shared=adr.shared_bot_difficulty())
+  assert [check.due(epoch) for epoch in (0, 100, 1000, 2000)] == [
+      False, False, True, True]
+
+
+def test_bot_check_raises_the_bot_once_it_stops_biting():
+  """The check scores the attack against the bot and against idle defenders
+  on the run's current ADR ranges, the same scenes for both; after two
+  checks with bite below 0.2 the bot gets harder, and the probe tallies
+  gathered against the old bot are dropped."""
+  from gfootball import adr
+  from gfootball.examples.train_puffer import BotCheck
+  args = build_parser().parse_args([])
+  seen = []
+  rates = {'bot': 0.45, 'idle': 0.5}
+
+  class FakeEvaluator:
+    def score_ranges(self, policy, ranges, defence, episodes):
+      seen.append((np.array(ranges), defence, episodes))
+      return {'success_rate': rates[defence]}
+
+  shared = adr.shared_bot_difficulty()
+  check = BotCheck(args, FakeEvaluator(), shared)
+  randomizer = adr.AutomaticDomainRandomization(buffer_size=4)
+  randomizer.set_range('blockers', 1.0, 3.0)
+  index = adr.PARAMETER_INDEX['blockers']
+  for _ in range(3):
+    randomizer.record(index, adr.UPPER, 1)
+  first = check.run(None, randomizer)
+  assert first['bot/raised'] == 0.0 and math.isclose(first['bot/bite'], 0.1)
+  second = check.run(None, randomizer)
+  assert second['bot/raised'] == 1.0
+  assert shared.value == adr.BOT_LADDER[1]
+  # The three results against the easy bot were dropped.
+  assert not randomizer.record(index, adr.UPPER, 1)
+  assert sorted(defence for _, defence, _ in seen) == [
+      'bot', 'bot', 'idle', 'idle']
+  for ranges, _, episodes in seen:
+    np.testing.assert_array_equal(ranges, randomizer.ranges())
+    assert episodes == args.bot_check_episodes
+
+
+def test_evaluation_pools_attack_from_the_left_and_read_the_bot_difficulty():
+  """Every evaluation pool fixes the left team as the attack, so each
+  defence, the bot included (its engine only lets the left team attack),
+  is scored on the same scenes; bot pools read the run's shared bot
+  difficulty; score_ranges plays exactly the ranges it is given, with one
+  seed whatever the defence."""
+  from gfootball import adr
+  from gfootball.examples import train_puffer
+  args = build_parser().parse_args(['--evaluation-difficulties', '0.5'])
+  bot = adr.shared_bot_difficulty()
+  pools = _RecordingPools()
+  evaluator = Evaluator(args, make_pool=pools, bot_difficulty=bot)
+  seen = []
+
+  def fake_evaluate(policy, pool, episodes, seed, device, recurrent_horizon):
+    played = adr.AutomaticDomainRandomization(
+        shared=pool.kwargs['adr_shared']).ranges()
+    seen.append((pool.kwargs['frozen_defence_path'], played, seed, episodes))
+    return {'success_rate': 0.5}
+
+  wanted = adr.AutomaticDomainRandomization()
+  wanted.set_range('blockers', 2.0, 4.0)
+  with patch.object(train_puffer, 'evaluate_episodes', fake_evaluate):
+    evaluator.score_ranges(None, wanted.ranges(), 'bot', 128)
+    evaluator.score_ranges(None, wanted.ranges(), 'idle', 128)
+    metrics = evaluator.versus(None, 'bot', 'vs_bot')
+  assert metrics == {'vs_bot/difficulty_0.5/success_rate': 0.5}
+  for kwargs in pools.built:
+    assert kwargs['attacking_team'] == 'left'
+    assert kwargs['bot_difficulty'] is bot
+  (bot_name, bot_ranges, bot_seed, bot_episodes), (
+      idle_name, idle_ranges, idle_seed, _) = seen[:2]
+  assert (bot_name, idle_name) == ('bot', 'idle')
+  np.testing.assert_array_equal(bot_ranges, wanted.ranges())
+  np.testing.assert_array_equal(idle_ranges, wanted.ranges())
+  assert bot_seed == idle_seed and bot_episodes == 128
 
 
 def test_evaluation_needs_two_workers():

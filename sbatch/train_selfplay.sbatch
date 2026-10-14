@@ -77,17 +77,27 @@ PLAYER_POTENTIAL=${PLAYER_POTENTIAL:-0}
 PLAYER_POTENTIAL_FADE_SPEED=${PLAYER_POTENTIAL_FADE_SPEED:-0}
 # ADR (gfootball/adr.py): every episode draws its settings from ranges that
 # grow and shrink with probe episodes.  ADR_PROBE_DEFENCE defends the probes:
-# 'self' (the learner's starting weights) or a policy file, which the learner
-# replaces once it scores ADR_PROBE_REFRESH_MARGIN more against it than
-# against its own defence (checked every ADR_PROBE_REFRESH_INTERVAL epochs),
-# or 'random' (uniform random defenders, never replaced).
+# 'bot' (the default: the engine's built-in AI, starting easy; every
+# BOT_CHECK_INTERVAL epochs the attack plays the bot and idle defenders on
+# the current ranges, and once the bot's bite, 1 - goals vs bot / goals vs
+# idle, stays below BOT_SATURATION_BITE for BOT_TOOTHLESS_CHECKS checks the
+# bot gets harder), 'self' (the learner's starting weights) or a policy
+# file, which the learner replaces once it scores ADR_PROBE_REFRESH_MARGIN
+# more against it than against its own defence (checked every
+# ADR_PROBE_REFRESH_INTERVAL epochs), or 'random' (uniform random defenders,
+# never replaced).
 ADR_ARGS=(--adr-probe-fraction "${ADR_PROBE_FRACTION:-0.2}"
           --adr-buffer-size "${ADR_BUFFER_SIZE:-64}"
           --adr-low-threshold "${ADR_LOW_THRESHOLD:-0.3}"
           --adr-high-threshold "${ADR_HIGH_THRESHOLD:-0.6}"
-          --adr-probe-defence "${ADR_PROBE_DEFENCE:-self}"
+          --adr-probe-defence "${ADR_PROBE_DEFENCE:-bot}"
           --adr-probe-refresh-interval "${ADR_PROBE_REFRESH_INTERVAL:-1000}"
-          --adr-probe-refresh-margin "${ADR_PROBE_REFRESH_MARGIN:-0.1}")
+          --adr-probe-refresh-margin "${ADR_PROBE_REFRESH_MARGIN:-0.1}"
+          --bot-check-interval "${BOT_CHECK_INTERVAL:-1000}"
+          --bot-check-episodes "${BOT_CHECK_EPISODES:-128}"
+          --bot-saturation-bite "${BOT_SATURATION_BITE:-0.2}"
+          --bot-toothless-checks "${BOT_TOOTHLESS_CHECKS:-2}"
+          --bot-minimum-idle-rate "${BOT_MINIMUM_IDLE_RATE:-0.15}")
 # Every EVALUATION_INTERVAL epochs the policy is scored against uniform random
 # defenders on fixed ADR scenes at each test difficulty (every setting from
 # its start value out to that share of the way to its limits); empty

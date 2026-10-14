@@ -357,8 +357,27 @@ defenders, which score the same as defenders standing still), the October 4
 runs pushed every defensive setting to its limit by epoch ~12k of 154k:
 against random defenders, five blockers cost the attack nothing (0.61 with 0
 or 5) and real formations even look easier.  Against a trained defence the
-same edges separate (formation 0.55 vs 0.34, head start 0.56 vs 0.25).  So
-the default, `ADR_PROBE_DEFENCE=self`, grows the probe defence with the run:
+same edges separate (formation 0.55 vs 0.34, head start 0.56 vs 0.25).
+
+The default, `ADR_PROBE_DEFENCE=bot`, has the engine's built-in AI defend the
+probes, starting at the easy bot (difficulty 0.05; `adr.BOT_LADDER` climbs
+0.05, 0.2, ..., 0.95).  The engine's AI only defends for a team with no
+agents (players handed to it with the `builtin_ai` action walk to the
+halfway line when the magnet is off), so each env worker plays probes in a
+second engine where agents control the left team only and the left team
+always attacks.  A bot that no longer costs the attack goals is a bad check,
+so every `BOT_CHECK_INTERVAL` epochs (1000, a multiple of
+`EVALUATION_INTERVAL`) the learner attacks the bot and idle defenders on
+the ranges the run has reached, `BOT_CHECK_EPISODES` (128) each on the same
+scenes.  The bot's bite is `1 - goals vs bot / goals vs idle`; after
+`BOT_TOOTHLESS_CHECKS` (2) checks in a row below `BOT_SATURATION_BITE`
+(0.2), the next bot takes over and the probe tallies gathered against the
+old one are dropped.  Checks with under `BOT_MINIMUM_IDLE_RATE` (0.15) goals
+against idle defenders are skipped as too noisy.  The bot never gets easier
+again.  Every evaluation also scores the current bot at each test
+difficulty (`vs_bot/difficulty_<d>/success_rate`, with `bot/difficulty`).
+
+`ADR_PROBE_DEFENCE=self` grows a policy probe defence with the run instead:
 the learner's starting weights are saved to
 `<run>/checkpoints/adr_probe_defence.pt` and, every
 `ADR_PROBE_REFRESH_INTERVAL` epochs (1000, a multiple of
@@ -371,7 +390,8 @@ probe.  `ADR_PROBE_DEFENCE` can also be a policy file, copied to the same
 place and refreshed the same way; `FROZEN_DEFENCE_HORIZON` sets the memory
 window such a defence trained by another run used (0: whole episodes).
 `random` and `idle` are never refreshed: they stay random and idle for the
-whole run.
+whole run.  Evaluation pools always have the left team attack, as the bot's
+engine must, so every defence is scored on the same scenes.
 
 To start the probe defence from the October 4 ADR seed-0 final
 (`defences/adr_probe_defence_init.pt`, as the October 7 runs did) instead,
@@ -389,7 +409,9 @@ entropy (mean log range width), `vs_random/difficulty_<d>/success_rate`
 against uniform random defenders at each `EVALUATION_DIFFICULTIES` test
 difficulty (0.25, 0.5, 1.0; `EVALUATION_EPISODES` episodes each), and on
 refresh epochs `adr_probe/vs_probe`, `adr_probe/vs_self` and
-`adr_probe/replaced`.  A test difficulty `d` draws every setting uniformly
+`adr_probe/replaced`; with bot probes also `vs_bot/difficulty_<d>/...` and
+`bot/difficulty`, and on bot-check epochs `bot/bite`, `bot/vs_bot`,
+`bot/vs_idle`, `bot/toothless_checks` and `bot/raised`.  A test difficulty `d` draws every setting uniformly
 from its start value out to `d` of the way to its valid limits
 (`set_difficulty` in `gfootball/adr.py`): the scenes depend on `d` and the
 seed alone, never on the ranges a run has reached, so the numbers compare

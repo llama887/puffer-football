@@ -205,6 +205,18 @@ class FootballPufferEnv(pufferlib.PufferEnv):
   from the ranges in `adr_shared`, the shared-memory array the trainer moves
   (or a fixed test difficulty, for evaluation pools).  Without `adr_shared`
   the ranges are private points at the start values: the start scene.
+
+  A defence of defence.BOT (`frozen_defence_path` for every episode,
+  `adr_probe_defence` for probes) is the engine's own AI at the difficulty
+  in `bot_difficulty` (shared memory the trainer's adr.BotLadder writes,
+  read at every bot episode's reset).  The engine's AI only defends for a
+  team with no agents (players handed to it with builtin_ai walk to the
+  halfway line when the magnet is off), so bot episodes are played in a
+  second engine, built at the first one, where agents control the left team
+  only and the left team always attacks.  The caller still sees 22 rows;
+  the bot's are hidden like any other defence's.  `attacking_team` 'left'
+  makes the left team attack in the self-play engine too (evaluation pools,
+  so every defence plays the same scenes as the bot); None alternates.
   """
 
   def __init__(self, env_name=adr.SCENARIO, buf=None, seed=0,
@@ -213,7 +225,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                potential_gamma=0.99, player_potential_scale=0.0,
                observation='simple115', player_potential_fade_speed=0.0,
                adr_shared=None, adr_probe_fraction=0.0,
-               adr_probe_defence=defence.RANDOM):
+               adr_probe_defence=defence.RANDOM, bot_difficulty=None,
+               attacking_team=None):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     # 'simple115': simple115v2 made egocentric (and sorted); 'entities': the
@@ -275,23 +288,41 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       return defence.Defence(spec, self.single_action_space.n, self._seed,
                              memory_window=frozen_defence_horizon,
                              sort_players=sort_players)
-    self._frozen_defence = (None if frozen_defence_path is None
+    if attacking_team not in (None, 'left', 'right'):
+      raise ValueError("attacking_team must be None, 'left' or 'right'")
+    self._attacking_team = attacking_team
+    # The bot plays in its own engine (see the class docstring).
+    self._frozen_bot = frozen_defence_path == defence.BOT
+    self._probe_bot = adr_probe_defence == defence.BOT
+    self._bot_difficulty = (adr.shared_bot_difficulty()
+                            if bot_difficulty is None else bot_difficulty)
+    self._frozen_defence = (None if frozen_defence_path in (None, defence.BOT)
                             else side(frozen_defence_path))
-    self._probe_defence = side(adr_probe_defence)
-    # The defence of the current episode (None: the caller, self-play), and
-    # its actions for the next step, computed with each observation.
+    self._probe_defence = (None if self._probe_bot
+                           else side(adr_probe_defence))
+    # The defence of the current episode (None: the caller, self-play, or
+    # the bot), and its actions for the next step, computed with each
+    # observation.
     self._episode_defence = self._frozen_defence
+    self._bot_episode = False
     self._defence_actions = None
     # Entity mode: the engine's raw per-agent views of the latest frame, and
     # the sticky buttons each agent holds (entity_observation.press_buttons).
     self._raw_views = None
     self._sticky = np.zeros(
         (self.num_agents, entity_observation.STICKY_ACTIONS), dtype=np.float32)
-    self._env = self._make_env()
-    # Where a freshly built engine's episode counter starts, so an in-place
-    # reseed can put it back there.
-    self._initial_episode_number = self._env.unwrapped._config[
-        'episode_number']
+    # The self-play engine (22 agents; never built if the bot plays every
+    # episode), the bot engine (built at the first bot episode) and the one
+    # playing the current episode.
+    self._env = None if self._frozen_bot else self._make_env(bot=False)
+    self._bot_env = None
+    self._engine = self._env
+    # Where each engine's episode counter started, so an in-place reseed can
+    # put it back there.
+    self._initial_episode_numbers = {}
+    if self._env is not None:
+      self._initial_episode_numbers[id(self._env)] = self._env.unwrapped._config[
+          'episode_number']
     self._episode_return = np.zeros(2, dtype=np.float32)
     self._episode_length = 0
     # Goals are far too rare to read progress from: a whole evaluation yields
@@ -349,7 +380,23 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     attack, defence = (left, right) if self._attacking_left else (right, left)
     return ball + attack, -ball + defence
 
-  def _make_env(self):
+  def _make_env(self, bot):
+    """A headless engine: self-play (22 agents) or, with `bot`, agents on
+    the left team only, the left team attacking every episode and the right
+    team left to the engine's AI."""
+    options = {
+        'action_set': 'default',
+        'fast_mode': True,
+        'game_engine_random_seed': self._seed,
+        # simple115v2 does not encode sticky actions, and producing them
+        # costs ten engine queries per controlled player per step.
+        'needs_sticky_actions': False,
+        'real_time': False,
+    }
+    if bot:
+      options[adr.ATTACKING_TEAM] = 'left'
+    elif self._attacking_team is not None:
+      options[adr.ATTACKING_TEAM] = self._attacking_team
     return football_env.create_environment(
         env_name=self._env_name,
         representation=('raw' if self._observation == 'entities'
@@ -361,17 +408,17 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         write_video=False,
         stacked=self._frame_stack == 4,
         number_of_left_players_agent_controls=11,
-        number_of_right_players_agent_controls=11,
+        number_of_right_players_agent_controls=0 if bot else 11,
         extra_players=None,
-        other_config_options={
-            'action_set': 'default',
-            'fast_mode': True,
-            'game_engine_random_seed': self._seed,
-            # simple115v2 does not encode sticky actions, and producing them
-            # costs ten engine queries per controlled player per step.
-            'needs_sticky_actions': False,
-            'real_time': False,
-        })
+        other_config_options=options)
+
+  def _bot_engine(self):
+    """The bot engine, built on first use."""
+    if self._bot_env is None:
+      self._bot_env = self._make_env(bot=True)
+      self._initial_episode_numbers[id(self._bot_env)] = (
+          self._bot_env.unwrapped._config['episode_number'])
+    return self._bot_env
 
   def _reset_match(self):
     self._adr_probe = None
@@ -381,14 +428,21 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._adr_probe = (index, edge)
     else:
       self._adr_values = self._adr.sample(self._episode_rng)
-    self._env.unwrapped._config[adr.VALUES] = self._adr_values
-    self._episode_defence = (self._probe_defence if self._adr_probe is not None
-                             else self._frozen_defence)
+    probe = self._adr_probe is not None
+    self._bot_episode = self._probe_bot if probe else self._frozen_bot
+    self._engine = self._bot_engine() if self._bot_episode else self._env
+    config = self._engine.unwrapped._config
+    config[adr.VALUES] = self._adr_values
+    if self._bot_episode:
+      config[adr.BOT_DIFFICULTY] = float(self._bot_difficulty.value)
+    self._episode_defence = (
+        None if self._bot_episode else
+        self._probe_defence if probe else self._frozen_defence)
     if self._episode_defence is not None:
       self._episode_defence.start_episode()
-    observations = self._from_engine(self._env.reset())
+    observations = self._from_engine(self._engine.reset())
     self._sticky.fill(0)
-    scene = adr.read_scene(self._env.unwrapped._config)
+    scene = adr.read_scene(config)
     self._attacking_left = scene.attacking_left
     self._episode_loose_ball = scene.loose_ball
     self._set_active_players()
@@ -409,8 +463,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
 
   def _set_active_players(self):
     self._active_mask.fill(True)
-    if self._episode_defence is not None:
-      # The defence is acted by this worker, never by the caller.
+    if self._episode_defence is not None or self._bot_episode:
+      # The defence is acted by this worker or the bot, never the caller.
       self._active_mask[self._defending_rows()] = False
 
   def _adr_info(self):
@@ -429,8 +483,14 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     Shaping, possession and ball-advance bookkeeping read simple115v2 frames
     in every mode.  In entity mode the engine returns raw per-agent views;
     they are kept for _write_observations and converted here exactly as
-    the simple115v2 wrapper would.
+    the simple115v2 wrapper would.  The bot engine returns the left team's
+    11 only; they are repeated to stand in for the bot's 11, whose rows are
+    hidden and never read (each team's rows come from its own views).
     """
+    if self._bot_episode:
+      observations = (list(observations) * 2
+                      if self._observation == 'entities' else
+                      np.concatenate([observations, observations]))
     if self._observation != 'entities':
       return observations
     self._raw_views = observations
@@ -472,9 +532,11 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       # only on (seed, episode number).  This runs even for an unchanged
       # seed, so a reused evaluation pool replays the same episodes each time.
       self._seed = int(seed)
-      config = self._env.unwrapped._config
-      config['game_engine_random_seed'] = self._seed
-      config['episode_number'] = self._initial_episode_number
+      for engine in (self._env, self._bot_env):
+        if engine is not None:
+          config = engine.unwrapped._config
+          config['game_engine_random_seed'] = self._seed
+          config['episode_number'] = self._initial_episode_numbers[id(engine)]
       # ADR settings and the defences are drawn here, not by the engine;
       # only a reseeding reset restarts the defences' streams.
       self._episode_rng = np.random.default_rng([self._seed, 0xad5])
@@ -511,7 +573,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._warmup_actions = None
     if self._observation == 'entities':
       entity_observation.press_buttons(self._sticky, actions)
-    observations, _, done, info = self._env.step(actions)
+    # The bot engine takes the left team's 11 actions only.
+    observations, _, done, info = self._engine.step(
+        actions[:11] if self._bot_episode else actions)
     observations = self._from_engine(observations)
     rewards = centralized_score_rewards(
         info['score_reward'], episode_active_mask, out=self._step_rewards)
@@ -596,9 +660,10 @@ class FootballPufferEnv(pufferlib.PufferEnv):
             self.truncations, infos)
 
   def close(self):
-    if self._env is not None:
-      self._env.close()
-      self._env = None
+    for engine in (self._env, self._bot_env):
+      if engine is not None:
+        engine.close()
+    self._env = self._bot_env = self._engine = None
 
 
 def make_vector_env(num_envs=None, num_workers=None, batch_size=None,

@@ -19,10 +19,10 @@ training env and its evaluation pools play.  The bot is the engine's own AI
 aiming), like the policies.  Its team has no agents at all: players handed
 to the AI with the builtin_ai action do not defend when the magnet is off
 (they walk to the halfway line, 2026-10-14), while uncontrolled players do.
-Agents always control the left team, so bot matches play only scenes where
-the left team attacks: the scene is rebuilt with the same ADR values until
-it does.  Bot episodes therefore share the other defences' ADR values but
-not their random placements (which side, blocker lanes, spawn jitter).
+Agents then control only the left team, so in bot matches the left team
+attacks every scene (adr.ATTACKING_TEAM).  Bot episodes share the other
+defences' ADR values but not their placements (which side, blocker lanes,
+spawn jitter), since the other defences alternate sides.
 Scenes (--scene):
   adr:difficulty:D   every ADR setting uniform over its range at test
                      difficulty D (adr set_difficulty; what the trainer's
@@ -126,6 +126,7 @@ def main():
       'physics_steps_per_frame': 10, 'real_time': False}
   if bot is not None:
     options[adr.BOT_DIFFICULTY] = bot
+    options[adr.ATTACKING_TEAM] = 'left'
   if video:
     options.update({'display_game_stats': True, 'render_resolution_x': 1280,
                     'render_resolution_y': 720, 'video_format': 'webm'})
@@ -158,13 +159,9 @@ def main():
             scene_rng, adr.PARAMETER_INDEX[pinned[0]], int(pinned[1]))
       else:
         values = ranges.sample(scene_rng)
-      while True:
-        env.unwrapped._config[adr.VALUES] = values
-        raw = env.reset()
-        scene = adr.read_scene(env.unwrapped._config)
-        # The bot plays the right team, so it has to be the one defending.
-        if bot is None or scene.attacking_left:
-          break
+      env.unwrapped._config[adr.VALUES] = values
+      raw = env.reset()
+      scene = adr.read_scene(env.unwrapped._config)
       sticky.fill(0)
       held = scene.held_directions
       attacking_side.start_episode()

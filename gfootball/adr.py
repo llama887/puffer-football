@@ -36,10 +36,17 @@ VALUES = 'adr_values'
 HELD_DIRECTIONS = 'held_directions'
 LOOSE_BALL = 'loose_ball'
 # Optional config value: the engine AI's skill (0-1) for both teams, which
-# only matters for players handed to it with the builtin_ai action (the
-# built-in bot defence of scripts/attack_vs_defence.py).  Unset, the engine
-# defaults stay (left 1.0, right 0.6).
+# only matters for a team with no agents, the built-in bot (ADR probes and
+# scripts/attack_vs_defence.py).  Unset, the engine defaults stay (left 1.0,
+# right 0.6).
 BOT_DIFFICULTY = 'bot_difficulty'
+# Optional config value: 'left' or 'right' fixes which team attacks every
+# episode.  Unset, the attacking side alternates.  The bot engine, where
+# agents control only the left team, fixes it to 'left'.
+ATTACKING_TEAM = 'attacking_team'
+# The bot's difficulties, easiest first (GRF's stock easy / medium / hard
+# scenarios use 0.05 / 0.6 / 0.95).  BotLadder moves up one at a time.
+BOT_LADDER = (0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95)
 
 # What the scenario built for an episode (read_scene).
 Scene = collections.namedtuple(
@@ -223,6 +230,16 @@ class AutomaticDomainRandomization:
     self._ranges[index] = (low, high)
     return moved
 
+  def clear_probe_results(self):
+    """Drop every edge's unfinished tally of probe results.
+
+    For when the probe defence changes (BotLadder): results against the old
+    one say nothing about the new one, so each edge starts a fresh tally.
+    """
+    for edges in self._buffers:
+      for buffer in edges:
+        buffer.clear()
+
   def entropy(self):
     """ADR entropy: mean log range width (nats per setting)."""
     widths = np.maximum(self._ranges[:, 1] - self._ranges[:, 0],
@@ -244,6 +261,77 @@ class AutomaticDomainRandomization:
       self.set_range(parameter.name,
                      metrics['adr/{}/low'.format(parameter.name)],
                      metrics['adr/{}/high'.format(parameter.name)])
+
+
+def shared_bot_difficulty():
+  """The bot's current difficulty in shared memory, starting at the easiest
+  rung of BOT_LADDER: the trainer's BotLadder writes it, every env worker
+  reads it when it starts a bot episode."""
+  return multiprocessing.RawValue('d', BOT_LADDER[0])
+
+
+class BotLadder:
+  """Which built-in bot defends the ADR probes, and when to make it harder.
+
+  ADR moves its edges by how often the attack scores against the probe
+  defence, so that defence is the check every edge is judged by.  A defence
+  that no longer costs the attack anything is a bad check: every edge
+  passes and the ranges widen whatever the defence settings.  `check`
+  measures the bot's bite, 1 - goals against the bot / goals against idle
+  defenders on the same scenes (the run's current ADR ranges): 0 means the
+  bot is no better than standing still.  After `toothless_checks` checks in
+  a row with bite below `saturation_bite`, the ladder moves to the next
+  difficulty of BOT_LADDER and writes it to `shared` for the env workers;
+  the trainer then clears the probe tallies (clear_probe_results).  A check
+  whose idle goal rate is zero or below `minimum_idle_rate` is too noisy to
+  judge and changes nothing.  The ladder never steps back down.
+  """
+
+  def __init__(self, shared, levels=BOT_LADDER, saturation_bite=0.2,
+               toothless_checks=2, minimum_idle_rate=0.15):
+    if list(levels) != sorted(levels) or not levels:
+      raise ValueError('levels must be non-empty and increasing')
+    if toothless_checks < 1:
+      raise ValueError('toothless_checks must be positive')
+    self._shared = shared
+    self._levels = tuple(float(level) for level in levels)
+    self._saturation_bite = float(saturation_bite)
+    self._needed = int(toothless_checks)
+    self._minimum_idle_rate = float(minimum_idle_rate)
+    self._level = 0
+    self._toothless = 0
+    self._shared.value = self._levels[0]
+
+  @property
+  def difficulty(self):
+    return self._levels[self._level]
+
+  def check(self, vs_bot, vs_idle):
+    """Judge one check's goal rates; step up when the bot has saturated.
+
+    Returns the metrics to log: `bot/difficulty` (after any step),
+    `bot/level`, `bot/bite` (NaN when skipped), both goal rates, the count
+    of toothless checks in a row and whether this check raised the bot.
+    """
+    bite = float('nan')
+    raised = False
+    if vs_idle > 0 and vs_idle >= self._minimum_idle_rate:
+      bite = 1.0 - vs_bot / vs_idle
+      self._toothless = self._toothless + 1 if (
+          bite < self._saturation_bite) else 0
+      if (self._toothless >= self._needed and
+          self._level + 1 < len(self._levels)):
+        self._level += 1
+        self._toothless = 0
+        self._shared.value = self.difficulty
+        raised = True
+    return {'bot/difficulty': self.difficulty,
+            'bot/level': float(self._level),
+            'bot/bite': bite,
+            'bot/vs_bot': float(vs_bot),
+            'bot/vs_idle': float(vs_idle),
+            'bot/toothless_checks': float(self._toothless),
+            'bot/raised': float(raised)}
 
 
 def read_scene(config):
