@@ -86,7 +86,9 @@ PARAMETERS = (
     # Attackers placed between the ball and the goal, onside and clear of
     # the shooting lane; fractional values add one more by chance.
     ADRParameter('attackers_ahead', 0.0, 3.0, 0.0, 0.25),
-    # 0: both teams packed around the ball; 1: real match formations.
+    # The attackers other than the carriers: 0 rings them round the ball, 1
+    # puts them in a real match formation.  Defenders always start in their
+    # kick-off formation (the blockers and the race for the ball aside).
     ADRParameter('formation', 0.0, 1.0, 0.0, 0.05),
     # Share of outfield players that start holding a random direction.
     ADRParameter('held_share', 0.0, 1.0, 0.0, 0.1),
