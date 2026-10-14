@@ -325,6 +325,11 @@ def build_scenario(builder):
   builder.config().offsides = offsides
   builder.config().end_episode_on_score = True
   builder.config().end_episode_on_out_of_play = True
+  if values.get(adr.BOT_DIFFICULTY) is not None:
+    # Both teams: which one defends changes from episode to episode.
+    difficulty = float(values[adr.BOT_DIFFICULTY])
+    builder.config().left_team_difficulty = difficulty
+    builder.config().right_team_difficulty = difficulty
 
   attacking_team = Team.e_Left if attack_right else Team.e_Right
   goalside = max(0, min(10, _chance_count(float(settings['blockers']), rng)))

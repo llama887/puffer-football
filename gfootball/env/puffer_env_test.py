@@ -591,6 +591,26 @@ class PufferEnvTest(absltest.TestCase):
     for attack_right, seen in sides.items():
       self.assertEqual(seen, {True, False}, attack_right)
 
+  def test_bot_difficulty_sets_both_teams_built_in_ai(self):
+    """A bot_difficulty config value sets the engine AI's skill for both
+    teams, so a side handed to the built-in AI (action builtin_ai) plays at
+    that difficulty whichever side attacks; without it the engine defaults
+    stay, so training scenes are unchanged."""
+    cfg = _scene_config()
+    cfg.NewScenario()
+    default = cfg.ScenarioConfig()
+    self.assertAlmostEqual(default.left_team_difficulty, 1.0)
+    self.assertAlmostEqual(default.right_team_difficulty, 0.6)
+    for seed in range(4):
+      cfg = _scene_config(seed=seed)
+      cfg._values[adr.BOT_DIFFICULTY] = 0.05
+      for _ in range(3):
+        cfg.NewScenario()
+        self.assertAlmostEqual(cfg.ScenarioConfig().left_team_difficulty,
+                               0.05, places=6)
+        self.assertAlmostEqual(cfg.ScenarioConfig().right_team_difficulty,
+                               0.05, places=6)
+
   def test_second_blocker_mirrors_the_first_and_the_third_fills_the_middle(self):
     """Two blockers must leave the shot line open; only the third closes it."""
     cfg = _scene_config(values=dict(START, ball_distance=0.55, blockers=2.0))

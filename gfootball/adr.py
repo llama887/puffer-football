@@ -35,6 +35,11 @@ SCENARIO = '11_vs_11_adr'
 VALUES = 'adr_values'
 HELD_DIRECTIONS = 'held_directions'
 LOOSE_BALL = 'loose_ball'
+# Optional config value: the engine AI's skill (0-1) for both teams, which
+# only matters for players handed to it with the builtin_ai action (the
+# built-in bot defence of scripts/attack_vs_defence.py).  Unset, the engine
+# defaults stay (left 1.0, right 0.6).
+BOT_DIFFICULTY = 'bot_difficulty'
 
 # What the scenario built for an episode (read_scene).
 Scene = collections.namedtuple(
