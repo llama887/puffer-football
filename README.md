@@ -360,14 +360,16 @@ evaluation scenes.  Once the learner scores at least
 current weights replace it (copies are kept as
 `adr_probe_defence_epoch<N>.pt`); the env workers reload it at their next
 probe.  `FROZEN_DEFENCE_HORIZON` sets the memory window a probe defence
-trained by another run used (0: whole episodes).
+trained by another run used (0: whole episodes).  Only a policy file is ever
+refreshed: `random` and `idle` stay random and idle for the whole run, so a
+run whose probe defence should grow with it has to start from a file.
 
 To run with a snapshot probe defence, starting it from the October 4 ADR
-seed-0 final:
+seed-0 final (`defences/adr_probe_defence_init.pt`), from the repo root:
 
 ```shell
 sbatch --array=0-2 --account=<account> --job-name=football-tf-adr-probe \
-  --export=ALL,TOTAL_TIMESTEPS=5000000000,SEED_BASE=20261002,ADR_PROBE_DEFENCE=/scratch/fyy2003/experiments/football-adr-probe-snapshot-20261007/probe_defence_init.pt \
+  --export=ALL,TOTAL_TIMESTEPS=5000000000,SEED_BASE=20261002,ADR_PROBE_DEFENCE=$PWD/defences/adr_probe_defence_init.pt \
   sbatch/train_selfplay.sbatch
 ```
 
@@ -402,13 +404,13 @@ grew past about 0.06 (2026-10-09 analysis, outside this repo).
 `scripts/attack_vs_defence.py` plays a checkpoint's attack against a chosen
 defence on the same scenes every time, and `sbatch/attack_vs_defence.sbatch`
 runs one row of a config file per array task.  Runs are scored with 128
-episodes, seed 4242, against the fixed defender
-`/scratch/fyy2003/experiments/football-selfplay-18794847-1/checkpoints/yxu10gg8/model_153674.pt`
-(the September 29 simple115 MLP, seed 1, final).  For example, at the three
-test difficulties:
+episodes, seed 4242, against the fixed defender `defences/fixed_defender.pt`
+(the September 29 simple115 MLP, seed 1, final; on Torch it was
+`football-selfplay-18794847-1/checkpoints/yxu10gg8/model_153674.pt`).  For
+example, at the three test difficulties, from the repo root:
 
 ```shell
-FIXED=/scratch/fyy2003/experiments/football-selfplay-18794847-1/checkpoints/yxu10gg8/model_153674.pt
+FIXED=$PWD/defences/fixed_defender.pt
 RUN=/scratch/fyy2003/experiments/football-selfplay-19372742-0/checkpoints/pumwbkuo
 for D in 0.25 0.5 1.0; do
   echo "final_d$D $RUN/model_153663.pt $FIXED adr:difficulty:$D"
