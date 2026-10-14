@@ -345,27 +345,30 @@ rows are hidden from training.  After `ADR_BUFFER_SIZE` (64) probes at an
 edge, a success rate of at least `ADR_HIGH_THRESHOLD` (0.6) moves that edge
 outward one step and at most `ADR_LOW_THRESHOLD` (0.3) moves it inward.
 
-The probe defence matters.  With the default `ADR_PROBE_DEFENCE=random`
-(uniform random defenders, which score the same as defenders standing
-still), the October 4 runs pushed every defensive setting to its limit by
-epoch ~12k of 154k: against random defenders, five blockers cost the attack
-nothing (0.61 with 0 or 5) and real formations even look easier.  Against a
-trained defence the same edges separate (formation 0.55 vs 0.34, head start
-0.56 vs 0.25).  So `ADR_PROBE_DEFENCE` can be a policy file instead.  It is
-copied to `<run>/checkpoints/adr_probe_defence.pt` and, every
+The probe defence matters.  With `ADR_PROBE_DEFENCE=random` (uniform random
+defenders, which score the same as defenders standing still), the October 4
+runs pushed every defensive setting to its limit by epoch ~12k of 154k:
+against random defenders, five blockers cost the attack nothing (0.61 with 0
+or 5) and real formations even look easier.  Against a trained defence the
+same edges separate (formation 0.55 vs 0.34, head start 0.56 vs 0.25).  So
+the default, `ADR_PROBE_DEFENCE=self`, grows the probe defence with the run:
+the learner's starting weights are saved to
+`<run>/checkpoints/adr_probe_defence.pt` and, every
 `ADR_PROBE_REFRESH_INTERVAL` epochs (1000, a multiple of
 `EVALUATION_INTERVAL`), the learner attacks it and its own defence on the
 evaluation scenes.  Once the learner scores at least
 `ADR_PROBE_REFRESH_MARGIN` (0.1) more against the probe defence, the learner's
 current weights replace it (copies are kept as
 `adr_probe_defence_epoch<N>.pt`); the env workers reload it at their next
-probe.  `FROZEN_DEFENCE_HORIZON` sets the memory window a probe defence
-trained by another run used (0: whole episodes).  Only a policy file is ever
-refreshed: `random` and `idle` stay random and idle for the whole run, so a
-run whose probe defence should grow with it has to start from a file.
+probe.  `ADR_PROBE_DEFENCE` can also be a policy file, copied to the same
+place and refreshed the same way; `FROZEN_DEFENCE_HORIZON` sets the memory
+window such a defence trained by another run used (0: whole episodes).
+`random` and `idle` are never refreshed: they stay random and idle for the
+whole run.
 
-To run with a snapshot probe defence, starting it from the October 4 ADR
-seed-0 final (`defences/adr_probe_defence_init.pt`), from the repo root:
+To start the probe defence from the October 4 ADR seed-0 final
+(`defences/adr_probe_defence_init.pt`, as the October 7 runs did) instead,
+from the repo root:
 
 ```shell
 sbatch --array=0-2 --account=<account> --job-name=football-tf-adr-probe \
@@ -383,8 +386,8 @@ refresh epochs `adr_probe/vs_probe`, `adr_probe/vs_self` and
 from its start value out to `d` of the way to its valid limits
 (`set_difficulty` in `gfootball/adr.py`): the scenes depend on `d` and the
 seed alone, never on the ranges a run has reached, so the numbers compare
-across runs.  The snapshot probe defence costs about 5% of throughput (the
-transformer runs on the env workers' CPUs during probes).
+across runs.  A policy probe defence (`self` or a file) costs about 5% of
+throughput (the transformer runs on the env workers' CPUs during probes).
 
 Results of the October runs, against the fixed defender on the old level
 5 / 9 / 14 scenes (three seeds, mean of checkpoints 140k, 147k and final):

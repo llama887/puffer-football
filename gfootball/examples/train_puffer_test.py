@@ -372,7 +372,6 @@ def test_adr_probe_defence_is_replaced_only_when_clearly_weaker_than_self_play()
   from gfootball.env.puffer_policy import load_frozen_policy
   from gfootball.examples import train_puffer
   defaults = build_parser().parse_args([])
-  assert defaults.adr_probe_defence == 'random'
   assert defaults.adr_probe_refresh_interval == 1000
   assert defaults.adr_probe_refresh_margin == 0.1
   torch.manual_seed(0)
@@ -401,6 +400,39 @@ def test_adr_probe_defence_is_replaced_only_when_clearly_weaker_than_self_play()
       assert metrics['adr_probe/replaced'] == float(replaced)
       assert math.isclose(metrics['adr_probe/vs_probe'], vs_probe)
       assert math.isclose(metrics['adr_probe/vs_self'], vs_self)
+
+
+def test_adr_probe_defence_starts_from_the_learner_or_a_file():
+  """By default ('self') the probe defence starts as the learner's own
+  starting weights, so a run needs no probe file and the refresh grows the
+  defence from there; a given file is copied instead, and random or idle
+  write nothing (they are never refreshed)."""
+  import os
+  import tempfile
+  from gfootball.env.puffer_policy import load_frozen_policy
+  from gfootball.examples import train_puffer
+  defaults = build_parser().parse_args([])
+  assert defaults.adr_probe_defence == 'self'
+  torch.manual_seed(0)
+  learner = FootballPolicy(_env(), hidden_size=16).eval()
+  other = FootballPolicy(_env(), hidden_size=16).eval()
+  observations = torch.randn(4, 115)
+  with tempfile.TemporaryDirectory() as directory:
+    given = directory + '/given.pt'
+    save_policy_snapshot(other, given)
+    for spec, expected in (('self', learner), (given, other)):
+      path = directory + '/adr_probe_defence.pt'
+      args = build_parser().parse_args(['--adr-probe-defence', spec])
+      train_puffer.start_adr_probe_defence(args, learner, path)
+      restored = load_frozen_policy(path, _env())
+      with torch.no_grad():
+        assert torch.allclose(restored.forward_eval(observations, {})[0],
+                              expected.forward_eval(observations, {})[0])
+      os.remove(path)
+    for spec in ('random', 'idle'):
+      args = build_parser().parse_args(['--adr-probe-defence', spec])
+      train_puffer.start_adr_probe_defence(args, learner, path)
+      assert not os.path.exists(path)
 
 
 def test_evaluation_needs_two_workers():

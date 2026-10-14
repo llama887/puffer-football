@@ -76,14 +76,15 @@ PLAYER_POTENTIAL=${PLAYER_POTENTIAL:-0}
 PLAYER_POTENTIAL_FADE_SPEED=${PLAYER_POTENTIAL_FADE_SPEED:-0}
 # ADR (gfootball/adr.py): every episode draws its settings from ranges that
 # grow and shrink with probe episodes.  ADR_PROBE_DEFENCE defends the probes:
-# 'random' (uniform random defenders) or a policy file, which the learner
+# 'self' (the learner's starting weights) or a policy file, which the learner
 # replaces once it scores ADR_PROBE_REFRESH_MARGIN more against it than
-# against its own defence (checked every ADR_PROBE_REFRESH_INTERVAL epochs).
+# against its own defence (checked every ADR_PROBE_REFRESH_INTERVAL epochs),
+# or 'random' (uniform random defenders, never replaced).
 ADR_ARGS=(--adr-probe-fraction "${ADR_PROBE_FRACTION:-0.2}"
           --adr-buffer-size "${ADR_BUFFER_SIZE:-64}"
           --adr-low-threshold "${ADR_LOW_THRESHOLD:-0.3}"
           --adr-high-threshold "${ADR_HIGH_THRESHOLD:-0.6}"
-          --adr-probe-defence "${ADR_PROBE_DEFENCE:-random}"
+          --adr-probe-defence "${ADR_PROBE_DEFENCE:-self}"
           --adr-probe-refresh-interval "${ADR_PROBE_REFRESH_INTERVAL:-1000}"
           --adr-probe-refresh-margin "${ADR_PROBE_REFRESH_MARGIN:-0.1}")
 # Every EVALUATION_INTERVAL epochs the policy is scored against uniform random

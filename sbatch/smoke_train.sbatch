@@ -24,12 +24,14 @@ export GFOOTBALL_FONT="$REPO/third_party/fonts/AlegreyaSansSC-ExtraBold.ttf"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 PYTHONUNBUFFERED=1
 cd "$RUN_ROOT"
 # 8 workers x 22 agents x 32 horizon = 5632 steps per epoch; 7 epochs total,
-# an evaluation every 3 epochs -> ADR lines at epochs 0, 3, 6.  Probe
+# an evaluation every 3 epochs -> ADR lines at epochs 0, 3, 6, with a check
+# that may refresh the (default 'self') probe defence at 3 and 6.  Probe
 # results reach the trainer, so the ranges can already move.
 python -u -m gfootball.examples.train_puffer \
   --device cpu --num-workers 8 \
   --total-timesteps $((7 * 8 * 22 * 32)) \
   --evaluation-interval 3 --evaluation-episodes 16 --evaluation-workers 8 \
   --evaluation-difficulties 0.25,1.0 --adr-probe-fraction 0.5 \
+  --adr-probe-refresh-interval 3 \
   --adr-buffer-size 2 --no-gpu-filler \
   --seed 3 --no-wandb --data-dir "$RUN_ROOT/checkpoints" 2>&1 | grep -E "^ADR|Traceback|Error|error|Saved model|^\{" | cut -c1-2500

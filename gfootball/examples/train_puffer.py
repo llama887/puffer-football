@@ -39,6 +39,8 @@ from gfootball.env.puffer_policy import (  # noqa: F401
 ACTION_NAMES = tuple(
     str(action) for action in football_action_set.action_set_dict['default'])
 SHOT_ACTION = ACTION_NAMES.index('shot')
+# --adr-probe-defence: the probe defence starts as the learner's own weights.
+SELF_PROBE_DEFENCE = 'self'
 
 def generalized_advantages(values, rewards, terminals, gamma, gae_lambda):
   """Standard GAE for Puffer's next-step reward storage convention."""
@@ -1094,6 +1096,27 @@ def record_adr_probes(randomizer, infos):
   return recorded
 
 
+def start_adr_probe_defence(args, policy, probe_path):
+  """Write the run's first probe defence to `probe_path`.
+
+  'self' (the default) saves the learner's starting weights, so a run needs
+  no probe file: the probe defence begins as the learner's own defence and
+  refresh_adr_probe_defence replaces it as the learner outgrows it.  A
+  policy file is copied, so refreshes never touch the original.  'random'
+  and 'idle' write nothing; the env workers play them directly and they are
+  never refreshed.
+
+  Must run before the first env reset: the workers read the file at their
+  first probe episode.
+  """
+  if args.adr_probe_defence in (RANDOM_DEFENCE, IDLE_DEFENCE):
+    return
+  if args.adr_probe_defence == SELF_PROBE_DEFENCE:
+    save_policy_snapshot(policy, probe_path)
+  else:
+    shutil.copyfile(args.adr_probe_defence, probe_path)
+
+
 def refresh_adr_probe_defence(args, evaluator, policy, probe_path):
   """Replace the ADR probe defence with the learner once it outgrows it.
 
@@ -1184,13 +1207,15 @@ def build_parser():
   parser.add_argument('--adr-probe-fraction', type=float, default=0.2,
                       help='share of episodes that probe one setting edge '
                            'against the probe defence')
-  parser.add_argument('--adr-probe-defence', default=RANDOM_DEFENCE,
-                      help="who defends ADR probes: 'random' (uniform "
-                           "random defenders), 'idle' (no action) or a "
-                           'policy snapshot, copied to '
+  parser.add_argument('--adr-probe-defence', default=SELF_PROBE_DEFENCE,
+                      help="who defends ADR probes: 'self' (the learner's "
+                           "starting weights), a policy snapshot, 'random' "
+                           "(uniform random defenders) or 'idle' (no "
+                           "action).  'self' and a snapshot are written to "
                            '<data-dir>/adr_probe_defence.pt and replaced by '
-                           'the learner when it outgrows it '
-                           '(refresh_adr_probe_defence)')
+                           'the learner when it outgrows them '
+                           '(refresh_adr_probe_defence); random and idle '
+                           'never change')
   parser.add_argument('--adr-probe-refresh-interval', type=int, default=1000,
                       help='epochs between checks that may replace a '
                            'snapshot probe defence; 0 never replaces it')
@@ -1416,9 +1441,8 @@ def main():
       raise ValueError('refreshing a snapshot probe defence needs '
                        '--evaluation-difficulties (or '
                        '--adr-probe-refresh-interval 0)')
-    # A copy, so a refresh replaces it without touching the original.
+    # Written by start_adr_probe_defence once the policy exists.
     adr_probe_defence = os.path.join(args.data_dir, 'adr_probe_defence.pt')
-    shutil.copyfile(args.adr_probe_defence, adr_probe_defence)
   num_envs = args.num_workers * args.envs_per_worker
   env = make_vector_env(
       num_envs=num_envs, num_workers=args.num_workers, batch_size=num_envs,
@@ -1473,6 +1497,8 @@ def main():
 
   policy = FootballPolicy(env, hidden_size=args.hidden_size,
                           network=args.network).to(args.device)
+  # Before the trainer: building it resets the env workers.
+  start_adr_probe_defence(args, policy, adr_probe_defence)
   logger = None
   if args.wandb:
     logger = pufferl.WandbLogger({
