@@ -1,0 +1,7 @@
+side/
+proof/
+history/
+autopsy2/
+logs/
+*.json
+*.tgz
