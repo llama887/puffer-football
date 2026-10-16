@@ -10,12 +10,14 @@ edge outward one step and one at or below `low_threshold` moves it inward.
 Ranges therefore grow where the policy copes and shrink where it does not,
 each setting on its own.
 
-The ranges all start as single points, the start scene (a carrier at the
-ball 0.1 from the goal line, one blocker), and are clamped to each setting's
-valid limits.  They live in a shared-memory array (`shared_ranges`): the
-trainer's randomizer records probe results and moves edges, and every env
-worker's randomizer, built on the same array, samples from the current
-ranges with no message passing.  The scenario (SCENARIO) turns a sampled set
+The ranges all start at the start scene (a carrier at the ball 0.1 from the
+goal line, one blocker): single points, except ball_lateral, which starts
+wider than the goal posts so the carrier has to angle in from the first
+episode.  An edge moves outward no further than the setting's valid limits
+and inward no further than its start range.  The ranges live in a
+shared-memory array (`shared_ranges`): the trainer's randomizer records
+probe results and moves edges, and every env worker's randomizer, built on
+the same array, samples from the current ranges with no message passing.  The scenario (SCENARIO) turns a sampled set
 of values into a scene.  Evaluation scenes use fixed ranges instead
 (`set_difficulty`), the same for every run.
 """
@@ -33,20 +35,47 @@ SCENARIO = '11_vs_11_adr'
 VALUES = 'adr_values'
 HELD_DIRECTIONS = 'held_directions'
 LOOSE_BALL = 'loose_ball'
+# Optional config value: the engine AI's skill (0-1) for both teams, which
+# only matters for a team with no agents, the built-in bot (ADR probes and
+# scripts/attack_vs_defence.py).  Unset, the engine defaults stay (left 1.0,
+# right 0.6).
+BOT_DIFFICULTY = 'bot_difficulty'
+# Optional config value: 'left' or 'right' fixes which team attacks every
+# episode.  Unset, the attacking side alternates.  The bot engine, where
+# agents control only the left team, fixes it to 'left'.
+ATTACKING_TEAM = 'attacking_team'
+# The bot's difficulties, easiest first (GRF's stock easy / medium / hard
+# scenarios use 0.05 / 0.6 / 0.95).  BotLadder moves up one at a time.
+BOT_LADDER = (0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95)
 
 # What the scenario built for an episode (read_scene).
 Scene = collections.namedtuple(
     'Scene', ('attacking_left', 'held_directions', 'loose_ball'))
 
-ADRParameter = collections.namedtuple(
-    'ADRParameter', ('name', 'minimum', 'maximum', 'start', 'step'))
+
+class ADRParameter(collections.namedtuple(
+    'ADRParameter',
+    ('name', 'minimum', 'maximum', 'start', 'step', 'start_spread'),
+    defaults=(0.0,))):
+  """One randomized setting: valid limits, start value, step per edge move.
+
+  `start_spread` widens the start from a point to start +- start_spread.
+  """
+
+  @property
+  def start_range(self):
+    """(low, high) every run starts from; edges never shrink inside it."""
+    return (self.start - self.start_spread, self.start + self.start_spread)
+
 
 # Valid limits, the starting value and the step per edge move.
 PARAMETERS = (
     # Distance from the attacked goal line to the ball.
     ADRParameter('ball_distance', 0.05, 1.0, 0.10, 0.045),
-    # Ball y across the pitch.
-    ADRParameter('ball_lateral', -0.36, 0.36, 0.0, 0.02),
+    # Ball y across the pitch.  Starts at +-0.08, beyond the posts (|y|
+    # 0.044): from a point at 0, policies learned only a straight shot and
+    # the edge never got past the posts (2026-10-14 lateral analysis).
+    ADRParameter('ball_lateral', -0.36, 0.36, 0.0, 0.02, start_spread=0.08),
     # Goal-side blockers; fractional values add one more by chance.
     ADRParameter('blockers', 0.0, 5.0, 1.0, 0.2),
     # Distance from the still ball to the nearest attacker (0.03: the
@@ -57,7 +86,9 @@ PARAMETERS = (
     # Attackers placed between the ball and the goal, onside and clear of
     # the shooting lane; fractional values add one more by chance.
     ADRParameter('attackers_ahead', 0.0, 3.0, 0.0, 0.25),
-    # 0: both teams packed around the ball; 1: real match formations.
+    # The attackers other than the carriers: 0 rings them round the ball, 1
+    # puts them in a real match formation.  Defenders always start in their
+    # kick-off formation (the blockers and the race for the ball aside).
     ADRParameter('formation', 0.0, 1.0, 0.0, 0.05),
     # Share of outfield players that start holding a random direction.
     ADRParameter('held_share', 0.0, 1.0, 0.0, 0.1),
@@ -75,11 +106,12 @@ def _uniform_values(ranges, rng):
 
 
 def shared_ranges():
-  """A shared-memory array holding every range, initialised to the starts."""
+  """A shared-memory array holding every range, initialised to the start
+  ranges."""
   array = multiprocessing.RawArray('d', 2 * len(PARAMETERS))
   view = np.frombuffer(array, dtype=np.float64).reshape(len(PARAMETERS), 2)
   for i, parameter in enumerate(PARAMETERS):
-    view[i] = parameter.start
+    view[i] = parameter.start_range
   return array
 
 
@@ -125,7 +157,7 @@ class AutomaticDomainRandomization:
   def set_difficulty(self, difficulty):
     """Fix every range at a test difficulty, for evaluation scenes.
 
-    Difficulty d spans each setting from its start value out to d of the way
+    Difficulty d spans each setting from its start range out to d of the way
     to each valid limit: 0 is the start scene, 1 every limit.  Unlike the
     ranges training reaches, these depend on d alone, so a score at a given
     d compares across runs and over time.
@@ -133,9 +165,10 @@ class AutomaticDomainRandomization:
     if not 0 <= difficulty <= 1:
       raise ValueError('difficulty must be in [0, 1]')
     for i, parameter in enumerate(PARAMETERS):
+      start_low, start_high = parameter.start_range
       self._ranges[i] = (
-          parameter.start - difficulty * (parameter.start - parameter.minimum),
-          parameter.start + difficulty * (parameter.maximum - parameter.start))
+          start_low - difficulty * (start_low - parameter.minimum),
+          start_high + difficulty * (parameter.maximum - start_high))
 
   def sample(self, rng):
     """Values for a training episode: each setting uniform in its range."""
@@ -168,7 +201,9 @@ class AutomaticDomainRandomization:
   def record(self, index, edge, success):
     """Add one probe result at a setting's edge; move the edge when due.
 
-    Returns True when this result triggered a move.
+    An edge moves outward no further than the setting's limit and inward no
+    further than its start range, so every run keeps practising the start
+    scene.  Returns True when this result triggered a move.
     """
     buffer = self._buffers[index][edge]
     buffer.append(float(success))
@@ -183,16 +218,29 @@ class AutomaticDomainRandomization:
     else:
       return False
     parameter = PARAMETERS[index]
+    start_low, start_high = parameter.start_range
     low, high = self._ranges[index]
+    # Moving in stops at the start range; an edge already inside it (set by
+    # hand or loaded from an older run) stays put rather than jump out.
     if edge == UPPER:
       high = (min(parameter.maximum, high + parameter.step) if outward
-              else max(low, high - parameter.step))
+              else max(low, min(high, start_high), high - parameter.step))
     else:
       low = (max(parameter.minimum, low - parameter.step) if outward
-             else min(high, low + parameter.step))
+             else min(high, max(low, start_low), low + parameter.step))
     moved = (low, high) != tuple(self._ranges[index])
     self._ranges[index] = (low, high)
     return moved
+
+  def clear_probe_results(self):
+    """Drop every edge's unfinished tally of probe results.
+
+    For when the probe defence changes (BotLadder): results against the old
+    one say nothing about the new one, so each edge starts a fresh tally.
+    """
+    for edges in self._buffers:
+      for buffer in edges:
+        buffer.clear()
 
   def entropy(self):
     """ADR entropy: mean log range width (nats per setting)."""
@@ -215,6 +263,77 @@ class AutomaticDomainRandomization:
       self.set_range(parameter.name,
                      metrics['adr/{}/low'.format(parameter.name)],
                      metrics['adr/{}/high'.format(parameter.name)])
+
+
+def shared_bot_difficulty():
+  """The bot's current difficulty in shared memory, starting at the easiest
+  rung of BOT_LADDER: the trainer's BotLadder writes it, every env worker
+  reads it when it starts a bot episode."""
+  return multiprocessing.RawValue('d', BOT_LADDER[0])
+
+
+class BotLadder:
+  """Which built-in bot defends the ADR probes, and when to make it harder.
+
+  ADR moves its edges by how often the attack scores against the probe
+  defence, so that defence is the check every edge is judged by.  A defence
+  that no longer costs the attack anything is a bad check: every edge
+  passes and the ranges widen whatever the defence settings.  `check`
+  measures the bot's bite, 1 - goals against the bot / goals against idle
+  defenders on the same scenes (the run's current ADR ranges): 0 means the
+  bot is no better than standing still.  After `toothless_checks` checks in
+  a row with bite below `saturation_bite`, the ladder moves to the next
+  difficulty of BOT_LADDER and writes it to `shared` for the env workers;
+  the trainer then clears the probe tallies (clear_probe_results).  A check
+  whose idle goal rate is zero or below `minimum_idle_rate` is too noisy to
+  judge and changes nothing.  The ladder never steps back down.
+  """
+
+  def __init__(self, shared, levels=BOT_LADDER, saturation_bite=0.2,
+               toothless_checks=2, minimum_idle_rate=0.15):
+    if list(levels) != sorted(levels) or not levels:
+      raise ValueError('levels must be non-empty and increasing')
+    if toothless_checks < 1:
+      raise ValueError('toothless_checks must be positive')
+    self._shared = shared
+    self._levels = tuple(float(level) for level in levels)
+    self._saturation_bite = float(saturation_bite)
+    self._needed = int(toothless_checks)
+    self._minimum_idle_rate = float(minimum_idle_rate)
+    self._level = 0
+    self._toothless = 0
+    self._shared.value = self._levels[0]
+
+  @property
+  def difficulty(self):
+    return self._levels[self._level]
+
+  def check(self, vs_bot, vs_idle):
+    """Judge one check's goal rates; step up when the bot has saturated.
+
+    Returns the metrics to log: `bot/difficulty` (after any step),
+    `bot/level`, `bot/bite` (NaN when skipped), both goal rates, the count
+    of toothless checks in a row and whether this check raised the bot.
+    """
+    bite = float('nan')
+    raised = False
+    if vs_idle > 0 and vs_idle >= self._minimum_idle_rate:
+      bite = 1.0 - vs_bot / vs_idle
+      self._toothless = self._toothless + 1 if (
+          bite < self._saturation_bite) else 0
+      if (self._toothless >= self._needed and
+          self._level + 1 < len(self._levels)):
+        self._level += 1
+        self._toothless = 0
+        self._shared.value = self.difficulty
+        raised = True
+    return {'bot/difficulty': self.difficulty,
+            'bot/level': float(self._level),
+            'bot/bite': bite,
+            'bot/vs_bot': float(vs_bot),
+            'bot/vs_idle': float(vs_idle),
+            'bot/toothless_checks': float(self._toothless),
+            'bot/raised': float(raised)}
 
 
 def read_scene(config):

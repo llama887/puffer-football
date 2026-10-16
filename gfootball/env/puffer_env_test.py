@@ -451,6 +451,78 @@ class PufferEnvTest(absltest.TestCase):
       finally:
         env.close()
 
+  def test_adr_bot_probes_attack_from_the_left_against_the_built_in_ai(self):
+    """With adr_probe_defence 'bot' a probe is played in a second engine
+    whose right team has no agents, so the engine's own AI defends at the
+    shared bot difficulty (players handed to the AI with builtin_ai do not
+    defend with the magnet off).  Agents control the left team there, so
+    the left team always attacks.  The bot's rows are hidden and get no
+    reward, the bot really defends (its nearest player closes on the ball;
+    handed over with builtin_ai they walked away from it), and a new
+    difficulty applies from the next episode."""
+    shared = adr.shared_ranges()
+    bot = adr.shared_bot_difficulty()
+    for observation in ('entities', 'simple115'):
+      env = puffer_env.FootballPufferEnv(
+          frame_stack=1, seed=11, observation=observation, adr_shared=shared,
+          adr_probe_fraction=1.0, adr_probe_defence='bot', bot_difficulty=bot)
+      try:
+        bot.value = 0.05
+        observations, _ = env.reset()
+        self.assertEqual(env._defending_rows(), slice(11, 22))
+        self.assertFalse(np.any(observations[11:]))
+        self.assertTrue(np.all(np.any(observations[:11], axis=1)))
+        self.assertAlmostEqual(
+            env._engine.unwrapped._config[adr.BOT_DIFFICULTY], 0.05)
+        bot.value = 0.35
+        nearest, infos = [], []
+        for _ in range(800):
+          observations, rewards, _, _, infos = env.step(
+              np.zeros(22, dtype=np.int32))
+          self.assertFalse(np.any(rewards[11:]))
+          if infos:
+            break
+          self.assertFalse(np.any(observations[11:]))
+          if observation == 'entities':
+            view = env._raw_views[0]
+            nearest.append(np.linalg.norm(
+                np.asarray(view['right_team'])[1:] -
+                np.asarray(view['ball'][:2]), axis=1).min())
+        self.assertTrue(infos, 'episode must end')
+        self.assertEqual(infos[0]['adr_probe'], 1.0)
+        self.assertEqual(infos[0]['attacking_left'], 1.0)
+        if observation == 'entities':
+          self.assertLess(min(nearest), 0.5 * nearest[0],
+                          'the bot must close on the ball')
+        self.assertAlmostEqual(
+            env._engine.unwrapped._config[adr.BOT_DIFFICULTY], 0.35)
+      finally:
+        env.close()
+
+  def test_bot_defence_plays_every_episode_and_its_engine_starts_lazily(self):
+    """frozen_defence_path 'bot' (an evaluation pool) plays every episode
+    against the bot; a training env whose probes are bot probes builds the
+    second engine only when its first probe comes, so an env with no
+    probes never pays for it."""
+    env = puffer_env.FootballPufferEnv(
+        frame_stack=1, seed=5, observation='entities',
+        frozen_defence_path='bot', adr_probe_fraction=0.0)
+    try:
+      for _ in range(2):
+        observations, _ = env.reset()
+        self.assertEqual(env._defending_rows(), slice(11, 22))
+        self.assertFalse(np.any(observations[11:]))
+    finally:
+      env.close()
+    env = puffer_env.FootballPufferEnv(
+        frame_stack=1, seed=5, observation='entities',
+        adr_probe_fraction=0.0, adr_probe_defence='bot')
+    try:
+      env.reset()
+      self.assertIsNone(env._bot_env)
+    finally:
+      env.close()
+
   def test_adr_probe_defence_snapshot_plays_probes_and_reloads_when_replaced(
       self):
     """With adr_probe_defence set to a snapshot, probe episodes are defended
@@ -591,6 +663,45 @@ class PufferEnvTest(absltest.TestCase):
     for attack_right, seen in sides.items():
       self.assertEqual(seen, {True, False}, attack_right)
 
+  def test_bot_difficulty_sets_both_teams_built_in_ai(self):
+    """A bot_difficulty config value sets the engine AI's skill for both
+    teams, so a side handed to the built-in AI (action builtin_ai) plays at
+    that difficulty whichever side attacks; without it the engine defaults
+    stay, so training scenes are unchanged."""
+    cfg = _scene_config()
+    cfg.NewScenario()
+    default = cfg.ScenarioConfig()
+    self.assertAlmostEqual(default.left_team_difficulty, 1.0)
+    self.assertAlmostEqual(default.right_team_difficulty, 0.6)
+    for seed in range(4):
+      cfg = _scene_config(seed=seed)
+      cfg._values[adr.BOT_DIFFICULTY] = 0.05
+      for _ in range(3):
+        cfg.NewScenario()
+        self.assertAlmostEqual(cfg.ScenarioConfig().left_team_difficulty,
+                               0.05, places=6)
+        self.assertAlmostEqual(cfg.ScenarioConfig().right_team_difficulty,
+                               0.05, places=6)
+
+  def test_attacking_team_can_be_fixed_to_the_left(self):
+    """The attacking side normally alternates every few episodes; the
+    config value ATTACKING_TEAM 'left' makes the left team attack every
+    episode (the bot engine, where agents control only the left team)."""
+    sides = set()
+    for seed in range(3):
+      cfg = _scene_config(seed=seed)
+      for _ in range(17):
+        cfg.NewScenario()
+        sides.add(cfg.ScenarioConfig().ball_position[0] > 0)
+    self.assertEqual(sides, {True, False})
+    for seed in range(3):
+      cfg = _scene_config(seed=seed)
+      cfg._values[adr.ATTACKING_TEAM] = 'left'
+      for _ in range(17):
+        cfg.NewScenario()
+        self.assertGreater(cfg.ScenarioConfig().ball_position[0], 0)
+        self.assertFalse(cfg._values['reverse_team_processing'])
+
   def test_second_blocker_mirrors_the_first_and_the_third_fills_the_middle(self):
     """Two blockers must leave the shot line open; only the third closes it."""
     cfg = _scene_config(values=dict(START, ball_distance=0.55, blockers=2.0))
@@ -614,10 +725,10 @@ class PufferEnvTest(absltest.TestCase):
     This is the return identity required for policy invariance.
     """
     gamma, scale = 0.9, 2.0
-    self.assertEqual(puffer_env.ball_potential(1.0, scale), 2.0)
-    self.assertEqual(puffer_env.ball_potential(-1.0, scale), -2.0)
-    for advances in ([0.9, 0.95, 1.0], [0.9, 0.5, 0.2, 0.7], [0.3]):
-      potentials = [puffer_env.ball_potential(a, scale) for a in advances]
+    for path in ([(0.9, 0.1), (0.95, 0.05), (1.0, 0.0)],
+                 [(0.9, -0.2), (0.5, 0.0), (0.2, 0.3), (0.7, -0.1)],
+                 [(0.3, 0.1)]):
+      potentials = [puffer_env.ball_potential(a, y, scale) for a, y in path]
       total = 0.0
       for index in range(1, len(potentials)):
         total += gamma ** (index - 1) * puffer_env.potential_shaping(
@@ -628,23 +739,61 @@ class PufferEnvTest(absltest.TestCase):
       self.assertAlmostEqual(total, -potentials[0])
     # Progress toward the goal is paid for as it happens ...
     self.assertGreater(puffer_env.potential_shaping(
-        puffer_env.ball_potential(0.9, 1.0),
-        puffer_env.ball_potential(0.95, 1.0), 1.0, False), 0)
+        puffer_env.ball_potential(0.9, 0.0, 1.0),
+        puffer_env.ball_potential(0.95, 0.0, 1.0), 1.0, False), 0)
     # ... and moving away costs the same amount back.
     self.assertLess(puffer_env.potential_shaping(
-        puffer_env.ball_potential(0.95, 1.0),
-        puffer_env.ball_potential(0.9, 1.0), 1.0, False), 0)
+        puffer_env.ball_potential(0.95, 0.0, 1.0),
+        puffer_env.ball_potential(0.9, 0.0, 1.0), 1.0, False), 0)
+
+  def test_ball_potential_rises_toward_the_attacked_goal_centre(self):
+    """Phi = scale * (1 - distance from the ball to the attacked goal centre).
+
+    On the centre line it is the old x-only potential (scale * advance), so
+    straight attacks are shaped exactly as before.  Off the centre line it is
+    lower, so carrying the ball in from the wing pays and a straight run that
+    stays wide of the posts earns less than one between them.  y counts in
+    x-distance units (83.6 / 54.4), like the player potential.
+    """
+    for advance in (-1.0, -0.3, 0.0, 0.9, 1.0):
+      self.assertAlmostEqual(
+          puffer_env.ball_potential(advance, 0.0, 2.0), 2.0 * advance)
+    self.assertAlmostEqual(
+        puffer_env.ball_potential(0.9, 0.1, 1.0),
+        1.0 - np.hypot(0.1, 0.1 * 83.6 / 54.4), places=6)
+    self.assertEqual(puffer_env.ball_potential(0.6, 0.2, 1.0),
+                     puffer_env.ball_potential(0.6, -0.2, 1.0))
+    # Moving in along the goal line toward the centre is paid for ...
+    self.assertGreater(puffer_env.potential_shaping(
+        puffer_env.ball_potential(0.95, 0.1, 1.0),
+        puffer_env.ball_potential(0.95, 0.05, 1.0), 1.0, False), 0)
+    # ... and a straight run outside the posts reaches less than one inside.
+    self.assertLess(puffer_env.ball_potential(1.0, 0.06, 1.0),
+                    puffer_env.ball_potential(1.0, 0.0, 1.0))
 
   def test_ball_shaping_is_zero_sum_between_the_teams(self):
     """Each team's ball potential is the other's negative.
 
     The score is zero-sum across the 22 players, so the shaping must be too:
     on every step, including the terminal correction and across an episode
-    reset, all 22 rewards sum to zero.
+    reset, all 22 rewards sum to zero.  The defence's potential is the
+    attack's negated, wherever the ball is and whichever side attacks.
     """
-    for advance in (-1.0, -0.3, 0.0, 0.9, 1.0):
-      self.assertEqual(puffer_env.ball_potential(advance, 2.0) +
-                       puffer_env.ball_potential(-advance, 2.0), 0.0)
+    env = object.__new__(puffer_env.FootballPufferEnv)
+    env._ball_potential_scale = 2.0
+    env._player_potential_scale = 0.0
+    env._player_potential_fade_speed = 0.0
+    raw = np.zeros((22, 115), dtype=np.float32)
+    for attacking_left in (True, False):
+      env._attacking_left = attacking_left
+      for ball in ((-1.0, 0.0), (-0.3, 0.2), (0.0, -0.1), (0.9, 0.06)):
+        raw[0, 88:90] = ball
+        attack, defence = env._potentials(raw)
+        self.assertAlmostEqual(attack + defence, 0.0, places=6)
+        advance = ball[0] if attacking_left else -ball[0]
+        self.assertAlmostEqual(
+            attack, puffer_env.ball_potential(advance, ball[1], 2.0),
+            places=6)
     env = puffer_env.FootballPufferEnv(
         frame_stack=1, seed=7,
         ball_potential_scale=1.0,
@@ -727,7 +876,8 @@ class PufferEnvTest(absltest.TestCase):
     raw[0, :2] = (0.4, 0.1)
     raw[0, 44:46] = (0.9, 0.1)
     raw[0, 88:90] = (0.6, 0.1)
-    ball = (0.5 * 0.6, -0.5 * 0.6)
+    attack_ball = 0.5 * (1.0 - np.hypot(0.4, 0.1 * 83.6 / 54.4))
+    ball = (attack_ball, -attack_ball)
     np.testing.assert_allclose(
         env._potentials(raw), (ball[0] - 0.2, ball[1] - 0.3), atol=1e-6)
     raw[0, 91] = 1.0  # struck along the pitch: the player term vanishes

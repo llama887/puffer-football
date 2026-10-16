@@ -2,6 +2,9 @@
 
 A defence is named by a spec: RANDOM (uniform random actions, the base
 random policy), IDLE (no action at all) or the path of a policy snapshot.
+BOT, the engine's built-in AI, is a spec too, but no Defence plays it: its
+team must have no agents at all, so the env plays bot episodes in an engine
+of their own (puffer_env.FootballPufferEnv).
 It turns the defending side's rows of the latest observation into 11
 actions inside the env worker; the env hides those rows from the learner, so
 they are never trained.
@@ -29,6 +32,7 @@ import numpy as np
 
 RANDOM = 'random'
 IDLE = 'idle'
+BOT = 'bot'
 _SIMPLE115 = 115
 # The PolicyPlayer noise stream of a snapshot side: an evaluation pool's
 # match 0 has the evaluation seed, so its defence and the evaluated policy
@@ -44,6 +48,8 @@ class Defence:
                sort_players=True):
     if memory_window is not None and memory_window < 1:
       raise ValueError('memory_window must be positive or None')
+    if spec == BOT:
+      raise ValueError('the bot is played by the env, not by a Defence')
     self._spec = spec
     self._action_count = int(action_count)
     self._memory_window = memory_window

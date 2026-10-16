@@ -309,7 +309,15 @@ def build_scenario(builder):
   settings = values.get(adr.VALUES) or {
       parameter.name: parameter.start for parameter in adr.PARAMETERS}
   rng = random.Random('{}:{}:adr'.format(seed, episode))
-  attack_right = ((seed + episode) // _DIRECTION_PERIOD) % 2 == 0
+  attacking_team = values.get(adr.ATTACKING_TEAM)
+  if attacking_team is None:
+    attack_right = ((seed + episode) // _DIRECTION_PERIOD) % 2 == 0
+  elif attacking_team in ('left', 'right'):
+    # The left team attacks the goal on the right.
+    attack_right = attacking_team == 'left'
+  else:
+    raise ValueError('{} must be left or right, got {!r}'.format(
+        adr.ATTACKING_TEAM, attacking_team))
   builder._config['reverse_team_processing'] = not attack_right
   direction = 1.0 if attack_right else -1.0
   distance = float(settings['ball_distance'])
@@ -325,6 +333,11 @@ def build_scenario(builder):
   builder.config().offsides = offsides
   builder.config().end_episode_on_score = True
   builder.config().end_episode_on_out_of_play = True
+  if values.get(adr.BOT_DIFFICULTY) is not None:
+    # Both teams: which one defends changes from episode to episode.
+    difficulty = float(values[adr.BOT_DIFFICULTY])
+    builder.config().left_team_difficulty = difficulty
+    builder.config().right_team_difficulty = difficulty
 
   attacking_team = Team.e_Left if attack_right else Team.e_Right
   goalside = max(0, min(10, _chance_count(float(settings['blockers']), rng)))

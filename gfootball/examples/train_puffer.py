@@ -26,6 +26,7 @@ from pufferlib import pufferl
 import pufferlib.pytorch
 
 from gfootball import adr
+from gfootball.env.defence import BOT as BOT_DEFENCE
 from gfootball.env.defence import IDLE as IDLE_DEFENCE
 from gfootball.env.defence import RANDOM as RANDOM_DEFENCE
 from gfootball.env.puffer_env import make_vector_env
@@ -1012,7 +1013,11 @@ class Evaluator:
   A test difficulty d draws every setting from its adr set_difficulty range,
   so the scenes depend on d and the seed alone, never on the ranges training
   has reached, and the scores compare across runs.  The defence is None (the
-  policy itself), 'random' (uniform random actions) or a snapshot path.
+  policy itself), 'random' (uniform random actions), 'idle', 'bot' (the
+  engine's AI at the run's shared bot difficulty) or a snapshot path.  Every
+  pool has the left team attack, as the bot's engine must, so every defence
+  is scored on the same scenes for the same seed (score_ranges compares the
+  bot with idle defenders this way).
 
   One worker pool per defence is built on first use and kept until close():
   building one starts a game engine in every worker, 10-20 s apiece.  Each
@@ -1024,7 +1029,7 @@ class Evaluator:
   is built, so main builds it before any env worker starts.
   """
 
-  def __init__(self, args, make_pool=make_vector_env):
+  def __init__(self, args, make_pool=make_vector_env, bot_difficulty=None):
     # Pools run asynchronously, so at least one worker must be left out of
     # every batch (PufferLib needs 0 < batch workers < workers).
     if args.evaluation_workers < 2:
@@ -1038,10 +1043,35 @@ class Evaluator:
       raise ValueError('--evaluation-difficulties must lie in [0, 1]')
     self._memory_window = memory_window(args)
     self._defence_window = defence_memory_window(args)
+    # The bot difficulty the trainer's BotLadder sets (shared memory).
+    self._bot_difficulty = (adr.shared_bot_difficulty()
+                            if bot_difficulty is None else bot_difficulty)
 
   def score(self, policy, difficulty, defence=None):
     """_evaluation_metrics of at least --evaluation-episodes episodes at
     `difficulty` against `defence` (ceil(episodes / workers) per match)."""
+    pool, ranges = self._pool(defence)
+    # The workers read these ranges at every episode reset.
+    ranges.set_difficulty(difficulty)
+    return evaluate_episodes(
+        policy, pool, self._args.evaluation_episodes,
+        self._args.seed + 1000000 + int(round(1000 * difficulty)),
+        self._args.device, recurrent_horizon=self._memory_window)
+
+  def score_ranges(self, policy, ranges, defence, episodes):
+    """_evaluation_metrics of at least `episodes` episodes drawn from
+    `ranges` (one [low, high] row per ADR setting, e.g. the ranges training
+    has reached) against `defence`.  One seed whatever the defence, so two
+    defences are scored on the same scenes."""
+    pool, pool_ranges = self._pool(defence)
+    for parameter, (low, high) in zip(adr.PARAMETERS, ranges):
+      pool_ranges.set_range(parameter.name, low, high)
+    return evaluate_episodes(
+        policy, pool, episodes, self._args.seed + 2000000, self._args.device,
+        recurrent_horizon=self._memory_window)
+
+  def _pool(self, defence):
+    """The pool playing `defence` and its ADR ranges, built on first use."""
     args = self._args
     if defence not in self._pools:
       shared = adr.shared_ranges()
@@ -1054,15 +1084,17 @@ class Evaluator:
           sort_players=args.sort_players, observation=args.observation,
           frozen_defence_path=defence,
           frozen_defence_horizon=self._defence_window,
-          adr_shared=shared, adr_probe_fraction=0.0),
+          adr_shared=shared, adr_probe_fraction=0.0,
+          attacking_team='left', bot_difficulty=self._bot_difficulty),
           adr.AutomaticDomainRandomization(shared=shared))
-    pool, ranges = self._pools[defence]
-    # The workers read these ranges at every episode reset.
-    ranges.set_difficulty(difficulty)
-    return evaluate_episodes(
-        policy, pool, args.evaluation_episodes,
-        args.seed + 1000000 + int(round(1000 * difficulty)), args.device,
-        recurrent_horizon=self._memory_window)
+    return self._pools[defence]
+
+  def versus(self, policy, defence, name):
+    """Goal rate against `defence` at every test difficulty, logged as
+    `<name>/difficulty_<d>/success_rate`."""
+    return {'{}/difficulty_{}/success_rate'.format(name, difficulty):
+            self.score(policy, difficulty, defence)['success_rate']
+            for difficulty in self.difficulties}
 
   def baseline(self, policy):
     """Goal rate against the base random policy at every test difficulty.
@@ -1070,9 +1102,7 @@ class Evaluator:
     The opponent and the scenes never change, so the numbers compare across
     runs and over time.
     """
-    return {'vs_random/difficulty_{}/success_rate'.format(difficulty):
-            self.score(policy, difficulty, RANDOM_DEFENCE)['success_rate']
-            for difficulty in self.difficulties}
+    return self.versus(policy, RANDOM_DEFENCE, 'vs_random')
 
   def close(self):
     while self._pools:
@@ -1096,20 +1126,67 @@ def record_adr_probes(randomizer, infos):
   return recorded
 
 
+class BotCheck:
+  """When the built-in bot defends the ADR probes: is it still a good check?
+
+  ADR judges every range edge by how often the attack scores against the
+  probe defence, so a defence that no longer costs the attack anything
+  lets every edge pass.  Every --bot-check-interval epochs (on evaluation
+  epochs) this scores the learner's attack against the bot and against idle
+  defenders on the ranges training has reached, the same scenes for both,
+  and hands the two goal rates to an adr.BotLadder: once the bot's bite
+  (1 - vs bot / vs idle) stays below --bot-saturation-bite for
+  --bot-toothless-checks checks in a row, the ladder moves to the next bot
+  difficulty, which the env workers read from `shared` at their next bot
+  episode, and the probe tallies gathered against the old bot are dropped.
+  """
+
+  def __init__(self, args, evaluator, shared):
+    if args.bot_check_interval < 0:
+      raise ValueError('--bot-check-interval must be non-negative')
+    if args.bot_check_interval % args.evaluation_interval:
+      raise ValueError('--bot-check-interval must be a multiple of '
+                       '--evaluation-interval')
+    self._interval = args.bot_check_interval
+    self._episodes = args.bot_check_episodes
+    self._evaluator = evaluator
+    self.ladder = adr.BotLadder(
+        shared, saturation_bite=args.bot_saturation_bite,
+        toothless_checks=args.bot_toothless_checks,
+        minimum_idle_rate=args.bot_minimum_idle_rate)
+
+  def due(self, epoch):
+    """Whether `epoch` (an evaluation epoch) runs the check."""
+    return self._interval > 0 and epoch > 0 and epoch % self._interval == 0
+
+  def run(self, policy, randomizer):
+    """One check on `randomizer`'s current ranges; returns the ladder's
+    metrics (bot/difficulty, bot/bite, bot/raised, ...)."""
+    ranges = randomizer.ranges()
+    vs_bot, vs_idle = (
+        self._evaluator.score_ranges(policy, ranges, defence,
+                                     self._episodes)['success_rate']
+        for defence in (BOT_DEFENCE, IDLE_DEFENCE))
+    metrics = self.ladder.check(vs_bot, vs_idle)
+    if metrics['bot/raised']:
+      randomizer.clear_probe_results()
+    return metrics
+
+
 def start_adr_probe_defence(args, policy, probe_path):
   """Write the run's first probe defence to `probe_path`.
 
   'self' (the default) saves the learner's starting weights, so a run needs
   no probe file: the probe defence begins as the learner's own defence and
   refresh_adr_probe_defence replaces it as the learner outgrows it.  A
-  policy file is copied, so refreshes never touch the original.  'random'
-  and 'idle' write nothing; the env workers play them directly and they are
-  never refreshed.
+  policy file is copied, so refreshes never touch the original.  'bot',
+  'random' and 'idle' write nothing; the env workers play them directly and
+  they are never refreshed (the bot gets harder through BotCheck instead).
 
   Must run before the first env reset: the workers read the file at their
   first probe episode.
   """
-  if args.adr_probe_defence in (RANDOM_DEFENCE, IDLE_DEFENCE):
+  if args.adr_probe_defence in (BOT_DEFENCE, RANDOM_DEFENCE, IDLE_DEFENCE):
     return
   if args.adr_probe_defence == SELF_PROBE_DEFENCE:
     save_policy_snapshot(policy, probe_path)
@@ -1185,7 +1262,8 @@ def build_parser():
   parser.add_argument('--ball-potential', type=float, default=0.0,
                       help='potential-based shaping scale k: each side is '
                            'rewarded gamma*Phi(s\')-Phi(s) with Phi = k * '
-                           '(ball x toward the goal it attacks, in [-1, 1]); '
+                           '(1 - ball distance to the centre of the goal it '
+                           'attacks), ball x on the centre line; '
                            'the other team gets exactly the negative, so '
                            'shaping is zero-sum and leaves the optimal '
                            'policy unchanged (Ng, Harada & Russell 1999); '
@@ -1207,8 +1285,10 @@ def build_parser():
   parser.add_argument('--adr-probe-fraction', type=float, default=0.2,
                       help='share of episodes that probe one setting edge '
                            'against the probe defence')
-  parser.add_argument('--adr-probe-defence', default=SELF_PROBE_DEFENCE,
-                      help="who defends ADR probes: 'self' (the learner's "
+  parser.add_argument('--adr-probe-defence', default=BOT_DEFENCE,
+                      help="who defends ADR probes: 'bot' (the engine's "
+                           'built-in AI, made harder by the bot check), '
+                           "'self' (the learner's "
                            "starting weights), a policy snapshot, 'random' "
                            "(uniform random defenders) or 'idle' (no "
                            "action).  'self' and a snapshot are written to "
@@ -1223,6 +1303,22 @@ def build_parser():
                       help='replace the probe defence once the learner '
                            'scores at least this much more against it than '
                            'against its own defence')
+  parser.add_argument('--bot-check-interval', type=int, default=1000,
+                      help='epochs between bot checks (BotCheck: is the '
+                           'bot probe defence still costing the attack '
+                           'goals?); a multiple of --evaluation-interval; '
+                           '0 never raises the bot')
+  parser.add_argument('--bot-check-episodes', type=int, default=128,
+                      help='episodes per defence (bot and idle) per check')
+  parser.add_argument('--bot-saturation-bite', type=float, default=0.2,
+                      help='a check whose bite (1 - goals vs bot / goals vs '
+                           'idle) is below this counts toward a harder bot')
+  parser.add_argument('--bot-toothless-checks', type=int, default=2,
+                      help='checks in a row below --bot-saturation-bite '
+                           'before the bot gets harder')
+  parser.add_argument('--bot-minimum-idle-rate', type=float, default=0.15,
+                      help='checks with fewer goals than this against idle '
+                           'defenders are too noisy to judge and skipped')
   parser.add_argument('--adr-buffer-size', type=int, default=64,
                       help='probe results per edge before it may move')
   parser.add_argument('--adr-low-threshold', type=float, default=0.3,
@@ -1424,13 +1520,19 @@ def main():
   torch.manual_seed(args.seed)
   np.random.seed(args.seed)
 
-  # Built first: it checks its arguments before any env worker starts.
-  evaluator = Evaluator(args)
+  # The bot's difficulty lives in shared memory: the bot check raises it,
+  # env workers and evaluation pools read it.
+  bot_shared = adr.shared_bot_difficulty()
+  # Built first: they check their arguments before any env worker starts.
+  evaluator = Evaluator(args, bot_difficulty=bot_shared)
+  bot_check = (BotCheck(args, evaluator, bot_shared)
+               if args.adr_probe_defence == BOT_DEFENCE else None)
   # ADR ranges live in shared memory: env workers sample from them, the
   # trainer moves them from probe results.
   adr_shared = adr.shared_ranges()
   adr_probe_defence = args.adr_probe_defence
-  snapshot_probe = adr_probe_defence not in (RANDOM_DEFENCE, IDLE_DEFENCE)
+  snapshot_probe = adr_probe_defence not in (
+      BOT_DEFENCE, RANDOM_DEFENCE, IDLE_DEFENCE)
   if snapshot_probe:
     # Refreshes are checked on the evaluation epochs only, on the evaluation
     # difficulties.
@@ -1458,6 +1560,7 @@ def main():
       adr_shared=adr_shared,
       adr_probe_fraction=args.adr_probe_fraction,
       adr_probe_defence=adr_probe_defence,
+      bot_difficulty=bot_shared,
       frozen_defence_horizon=defence_memory_window(args))
   # The launcher exports OMP_NUM_THREADS=1 so the env workers do not each
   # spawn a thread per core and thrash.  PyTorch reads that at import, which
@@ -1490,6 +1593,11 @@ def main():
       'adr_probe_defence': args.adr_probe_defence,
       'adr_probe_refresh_interval': args.adr_probe_refresh_interval,
       'adr_probe_refresh_margin': args.adr_probe_refresh_margin,
+      'bot_check_interval': args.bot_check_interval,
+      'bot_check_episodes': args.bot_check_episodes,
+      'bot_saturation_bite': args.bot_saturation_bite,
+      'bot_toothless_checks': args.bot_toothless_checks,
+      'bot_minimum_idle_rate': args.bot_minimum_idle_rate,
       'overlap_collection': args.overlap_collection,
       'carry_lstm_memory': args.carry_lstm_memory,
       'frozen_defence_horizon': args.frozen_defence_horizon,
@@ -1540,6 +1648,14 @@ def main():
         started = time.time()
         metrics = trainer.adr.metrics()
         metrics.update(evaluator.baseline(trainer.uncompiled_policy))
+        if bot_check is not None:
+          if bot_check.due(trainer.epoch):
+            metrics.update(bot_check.run(trainer.uncompiled_policy,
+                                         trainer.adr))
+          # Against the bot the probes play now (after any raise).
+          metrics['bot/difficulty'] = bot_check.ladder.difficulty
+          metrics.update(evaluator.versus(trainer.uncompiled_policy,
+                                          BOT_DEFENCE, 'vs_bot'))
         if (snapshot_probe and trainer.epoch > 0 and
             args.adr_probe_refresh_interval > 0 and
             trainer.epoch % args.adr_probe_refresh_interval == 0):
